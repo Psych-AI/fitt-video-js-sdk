@@ -494,6 +494,8 @@ export function createSession(
     let discarding: Promise<void> | null = null;
     /** The host's reset in progress. */
     let resetting: Promise<void> | null = null;
+    /** True from a finalise() that passed its checks until it ends: a host reset() is refused meanwhile. */
+    let finalising = false;
     /** The take whose manifests stop() has posted: its checks poll may start (spec 6.7). */
     let sealedTake: number | null = null;
     let checksPoll: ChecksPoll | null = null;
@@ -1395,8 +1397,12 @@ export function createSession(
         // stopTake() released capture: the preview and the meter are live again (spec 6.5).
         try {
             await engine.prepare();
-            clearError(...CAPTURE_CODES);
         } catch (error) {
+            if (closed || discarding !== null) {
+                // The close released capture while the prompt was open: resetTake() reports the close.
+                return;
+            }
+
             const code = codeOf(error);
 
             if (code !== null && isErrorCode(code)) {
@@ -1404,7 +1410,31 @@ export function createSession(
             }
 
             reacquireError = error;
+
+            return;
         }
+
+        if (closed || discarding !== null) {
+            // Closed or discarded while the permission prompt was open: nothing is held for it.
+            engine.release();
+
+            return;
+        }
+
+        clearError(...CAPTURE_CODES);
+    };
+
+    /** A reset that landed while the session closed or a discard began: reset() never ends in ready then. */
+    const refuseIfClosing = (): Promise<void> => {
+        if (closed) {
+            return closedRefusal();
+        }
+
+        if (discarding !== null) {
+            return rejectWith('invalid_state', { reason: 'discarding' });
+        }
+
+        return Promise.resolve();
     };
 
     /**
@@ -1460,7 +1490,7 @@ export function createSession(
                 reacquire,
             );
 
-            return;
+            return refuseIfClosing();
         }
 
         const verdict = classify(answer);
@@ -1479,7 +1509,7 @@ export function createSession(
             // The server is already past that take: the reset landed, or another did.
             await applyReset(current, reacquire);
 
-            return;
+            return refuseIfClosing();
         }
 
         await clearIntent();
@@ -1564,6 +1594,12 @@ export function createSession(
         removeOnline = null;
         await token?.stop();
         await uploader?.stop();
+
+        if (closed || record === null) {
+            // The last flush or refresh closed the session: closeSession() deletes it, no tombstone comes back.
+            return;
+        }
+
         const tombstone: SessionRecord = {
             ...record,
             manifest_owed: {},
@@ -1574,6 +1610,11 @@ export function createSession(
         await writes;
         // deleteSession takes the runs, segments and batches with it; the record comes back as the tombstone.
         await store.deleteSession(sessionId);
+
+        if (closed) {
+            return;
+        }
+
         await store.putSession(tombstone);
         tombstoned = true;
         refreshUpload();
@@ -2351,6 +2392,74 @@ export function createSession(
         },
     };
 
+    /** finalise() once its refusals are passed: seal what was deferred, flush, close, then the checks wait. */
+    const finaliseNow = async (): Promise<void> => {
+        const life = lifecycle as Lifecycle;
+        const phase = life.phase();
+
+        if (phase === 'stopping') {
+            await life.stop();
+        } else if (phase === 'countdown' || phase === 'recording') {
+            return rejectWith('invalid_state', { phase });
+        }
+
+        const unsealed = life.unsealedEndMs();
+
+        if (unsealed !== null && !deferredSealed) {
+            deferredSealed = true;
+            await sealTracks(unsealed);
+            // The deferred manifests are posted: the take's checks poll may start.
+            maybeStartChecks();
+        }
+
+        await batcher?.flush();
+
+        if (closed || record === null) {
+            return closedRefusal();
+        }
+
+        // The take's real end, so a wait for checks never adds a black, silent tail (spec 4.4).
+        const endMs = Math.min(record.take_end_ms ?? clock.now(), cap);
+        const answer = await callWithRetry(
+            {
+                env,
+                token: token!,
+                onSuccess: () => ladder?.markSucceeded(),
+            },
+            () => api!.finalise(endMs),
+        );
+
+        if (!isOk(answer)) {
+            const verdict = classify(answer);
+            const closingCode = closingCodeOf(answer);
+
+            if (closingCode !== null) {
+                await closeSession(closingCode);
+            }
+
+            return rejectWith('invalid_state', {
+                reason: verdict.kind === 'terminal' ? verdict.code : 'refused',
+                status: answer.status,
+            });
+        }
+
+        finalised = true;
+
+        if (life.phase() !== 'stopped') {
+            // Finalised with no stopped take (from idle, ready or error):
+            // nothing more is recorded into it, and it becomes the tombstone.
+            await preparing?.catch(() => undefined);
+            life.setPhase('stopped');
+        }
+
+        refreshUpload();
+        void maybeTombstone();
+
+        if (settings.checksWait) {
+            await created.waitForChecks();
+        }
+    };
+
     const created: FittSession = {
         id: sessionId,
         get state(): SessionState {
@@ -2568,74 +2677,18 @@ export function createSession(
                 return closedRefusal();
             }
 
-            if (discarding !== null) {
-                return rejectWith('invalid_state', { reason: 'discarding' });
-            }
-
-            const life = lifecycle as Lifecycle;
-            const phase = life.phase();
-
-            if (phase === 'stopping') {
-                await life.stop();
-            } else if (phase === 'countdown' || phase === 'recording') {
-                return rejectWith('invalid_state', { phase });
-            }
-
-            const unsealed = life.unsealedEndMs();
-
-            if (unsealed !== null && !deferredSealed) {
-                deferredSealed = true;
-                await sealTracks(unsealed);
-                // The deferred manifests are posted: the take's checks poll may start.
-                maybeStartChecks();
-            }
-
-            await batcher?.flush();
-
-            if (closed || record === null) {
-                return closedRefusal();
-            }
-
-            // The take's real end, so a wait for checks never adds a black, silent tail (spec 4.4).
-            const endMs = Math.min(record.take_end_ms ?? clock.now(), cap);
-            const answer = await callWithRetry(
-                {
-                    env,
-                    token: token!,
-                    onSuccess: () => ladder?.markSucceeded(),
-                },
-                () => api!.finalise(endMs),
-            );
-
-            if (!isOk(answer)) {
-                const verdict = classify(answer);
-                const closingCode = closingCodeOf(answer);
-
-                if (closingCode !== null) {
-                    await closeSession(closingCode);
-                }
-
+            if (discarding !== null || resetting !== null) {
                 return rejectWith('invalid_state', {
-                    reason:
-                        verdict.kind === 'terminal' ? verdict.code : 'refused',
-                    status: answer.status,
+                    reason: discarding !== null ? 'discarding' : 'resetting',
                 });
             }
 
-            finalised = true;
+            finalising = true;
 
-            if (life.phase() !== 'stopped') {
-                // Finalised with no stopped take (from idle, ready or error):
-                // nothing more is recorded into it, and it becomes the tombstone.
-                await preparing?.catch(() => undefined);
-                life.setPhase('stopped');
-            }
-
-            refreshUpload();
-            void maybeTombstone();
-
-            if (settings.checksWait) {
-                await created.waitForChecks();
+            try {
+                await finaliseNow();
+            } finally {
+                finalising = false;
             }
         },
 
@@ -2687,6 +2740,11 @@ export function createSession(
 
             if (discarding !== null) {
                 return rejectWith('invalid_state', { reason: 'discarding' });
+            }
+
+            if (finalising) {
+                // A reset under a finalise could close the new, empty take with the old take's end.
+                return rejectWith('invalid_state', { reason: 'finalising' });
             }
 
             if (resetting !== null) {

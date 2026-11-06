@@ -899,3 +899,163 @@ test('a reset answered 401 token_expired that cannot be re-minted is no longer o
     );
     assert.equal(r.session.state.phase, 'stopped');
 });
+
+test('a discard while the reset re-acquires capture holds no camera, and reset() never ends in ready', async () => {
+    const r = sessionRig();
+    await recordTake(r, 1000);
+    const open = r.media.hold();
+    let answerDiscard!: () => void;
+    r.respond({
+        '/discard': () =>
+            new Promise<Response>((resolve) => {
+                answerDiscard = () =>
+                    resolve(
+                        json(200, {
+                            session: { id: 'x', status: 'discarded' },
+                        }),
+                    );
+            }),
+    });
+    const resetting = r.session.reset().catch((error: unknown) => error);
+    await until(() => r.media.calls() === 2);
+    const discarding = r.session.discard();
+    await until(() => r.calls(/\/discard$/).length === 1);
+    open();
+    const refusal = (await resetting) as {
+        code?: string;
+        detail?: { reason?: string };
+    };
+
+    assert.deepEqual(
+        [refusal.code, refusal.detail?.reason],
+        ['invalid_state', 'discarding'],
+    );
+    assert.notEqual(r.session.state.phase, 'ready');
+    assert.ok(r.media.acquired.flat().every((track) => track.stopped));
+    answerDiscard();
+    await discarding;
+    assert.deepEqual(await r.store.listSessions(), []);
+});
+
+test('a session closed while the reset re-acquires capture rejects reset() as closed', async () => {
+    const r = sessionRig();
+    await recordTake(r, 1000);
+    const open = r.media.hold();
+    const resetting = r.session.reset().catch((error: unknown) => error);
+    await until(() => r.media.calls() === 2);
+    await r.session.discard();
+    open();
+    const refusal = (await resetting) as {
+        code?: string;
+        detail?: { reason?: string };
+    };
+
+    assert.deepEqual(
+        [refusal.code, refusal.detail?.reason],
+        ['invalid_state', 'discarded'],
+    );
+    assert.equal(r.session.state.phase, 'stopped');
+    assert.ok(r.media.acquired.flat().every((track) => track.stopped));
+});
+
+test('a session closed while its tombstone is written stays deleted, with no unhandled rejection', async () => {
+    const r = sessionRig();
+    await recordTake(r, 1000);
+    let discardedElsewhere = false;
+    r.respond({
+        '/finalise': () => {
+            // The last flush carries this event, and is answered as discarded by another client.
+            r.session.event('marker');
+            discardedElsewhere = true;
+
+            return json(200, { session: { id: 'x', status: 'finalising' } });
+        },
+        '/events': () =>
+            discardedElsewhere
+                ? json(409, { error: { code: 'discarded', message: 'x' } })
+                : json(204),
+    });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+        unhandled.push(reason);
+    };
+    process.on('unhandledRejection', onUnhandled);
+
+    try {
+        await r.session.finalise();
+
+        for (let i = 0; i < 50; i++) {
+            await settle();
+        }
+    } finally {
+        process.off('unhandledRejection', onUnhandled);
+    }
+
+    assert.deepEqual(unhandled, []);
+    assert.deepEqual(await r.store.listSessions(), []);
+});
+
+test('finalise() is refused while a host reset() is in flight', async () => {
+    const r = sessionRig();
+    await recordTake(r, 1000);
+    let answerReset!: () => void;
+    r.respond({
+        '/reset': () =>
+            new Promise<Response>((resolve) => {
+                answerReset = () => resolve(json(200, { take: 2 }));
+            }),
+    });
+    const resetting = r.session.reset();
+    await until(() => r.calls(/\/reset$/).length === 1);
+
+    await assert.rejects(r.session.finalise(), (error: unknown) => {
+        const failure = error as {
+            code?: string;
+            detail?: { reason?: string };
+        };
+
+        return (
+            failure.code === 'invalid_state' &&
+            failure.detail?.reason === 'resetting'
+        );
+    });
+    answerReset();
+    await resetting;
+    assert.equal(r.calls(/\/finalise$/).length, 0);
+    assert.equal(r.session.state.phase, 'ready');
+});
+
+test('reset() is refused while finalise() is in flight', async () => {
+    const r = sessionRig();
+    await recordTake(r, 1000);
+    let answerFinalise!: () => void;
+    r.respond({
+        '/finalise': () =>
+            new Promise<Response>((resolve) => {
+                answerFinalise = () =>
+                    resolve(
+                        json(200, {
+                            session: { id: 'x', status: 'finalising' },
+                        }),
+                    );
+            }),
+    });
+    const finalising = r.session.finalise();
+    await until(() => r.calls(/\/finalise$/).length === 1);
+
+    await assert.rejects(r.session.reset(), (error: unknown) => {
+        const failure = error as {
+            code?: string;
+            detail?: { reason?: string };
+        };
+
+        return (
+            failure.code === 'invalid_state' &&
+            failure.detail?.reason === 'finalising'
+        );
+    });
+    answerFinalise();
+    await finalising;
+    assert.equal(r.calls(/\/reset$/).length, 0);
+    assert.equal(r.media.calls(), 1);
+});
