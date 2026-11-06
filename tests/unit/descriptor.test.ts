@@ -113,3 +113,32 @@ test('a bad field inside a track names its dotted path', () => {
         reason: 'type',
     });
 });
+
+/** Wraps a value the way a Vue reactive prop or an Inertia page prop reaches a host: a Proxy on every object, down the tree. */
+const reactive = (value: unknown): unknown =>
+    typeof value === 'object' && value !== null
+        ? new Proxy(value, {
+              get: (target, key) =>
+                  reactive(Reflect.get(target, key as string)),
+          })
+        : value;
+
+test('readDescriptor returns a plain copy, never the host object: a reactive Proxy reads, the copy is structured-cloneable and later host edits do not reach it', () => {
+    const input = fixture('answer');
+    const proxied = reactive(input);
+
+    const result = readDescriptor(proxied);
+
+    assert.ok(result.ok);
+    assert.notEqual(result.descriptor as unknown, proxied);
+    assert.notEqual(result.descriptor as unknown, input);
+    assert.doesNotThrow(() => structuredClone(result.descriptor));
+    assert.deepEqual(result.descriptor, fixture('answer'));
+
+    input.token.secret = 'changed-by-the-host-afterwards';
+
+    assert.equal(
+        result.descriptor.token.secret,
+        fixture('answer').token.secret,
+    );
+});

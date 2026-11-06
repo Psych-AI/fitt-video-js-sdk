@@ -348,7 +348,13 @@ function read(input: unknown): Descriptor {
 
     integers(input, 'queue', '', ['abandon_after_ms', 'buffer_budget_bytes']);
 
-    return input as unknown as Descriptor;
+    // A plain copy, never the host's object. A host hands over whatever it
+    // holds, and in Vue or Inertia that is a reactive Proxy; the session
+    // record is written to IndexedDB with structured clone, which refuses a
+    // Proxy ("#<Object> could not be cloned"), so nothing local would ever
+    // persist. A descriptor is JSON by contract, so a JSON round trip is the
+    // exact copy and also detaches the SDK from later edits by the host.
+    return JSON.parse(JSON.stringify(input)) as Descriptor;
 }
 
 /** Never throws. */

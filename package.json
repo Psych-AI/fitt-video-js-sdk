@@ -1,6 +1,6 @@
 {
     "name": "@fitt/video-sdk",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "description": "Records answers and proctoring sessions in the browser for Fitt Video.",
     "type": "module",
     "license": "UNLICENSED",

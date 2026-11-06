@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import type { Descriptor } from '../../src/core/descriptor.ts';
 import { resolveSettings } from '../../src/core/options.ts';
 import { resumeWith } from '../../src/core/resume.ts';
 import {
@@ -2249,4 +2250,37 @@ test('a resumed session that gets the lock later finalises only when the record 
         env.calls.filter((call) => call.url.endsWith('/finalise')),
         [],
     );
+});
+
+test('a reactive descriptor from the host (a Proxy, as a Vue prop arrives) persists: every local write is structured-cloneable and the stop is recorded', async () => {
+    const reactive = (value: unknown): unknown =>
+        typeof value === 'object' && value !== null
+            ? new Proxy(value, {
+                  get: (target, key) =>
+                      reactive(Reflect.get(target, key as string)),
+              })
+            : value;
+    const store = new MemoryQueueStore();
+    const failures: unknown[] = [];
+    const writes: SessionRecord[] = [];
+    const put = store.putSession.bind(store);
+    store.putSession = (record: SessionRecord) => {
+        try {
+            writes.push(structuredClone(record));
+        } catch (error) {
+            failures.push(error);
+        }
+
+        return put(record);
+    };
+    const r = sessionRig({
+        store,
+        chunks: true,
+        descriptor: reactive(descriptorFixture('monitor')) as Descriptor,
+    });
+
+    await recordTake(r, 2000);
+
+    assert.deepEqual(failures, []);
+    assert.ok(writes.some((write) => write.stop_completed));
 });

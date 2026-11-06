@@ -64,6 +64,9 @@ byte-for-byte mirrors of it. SDK version 1.x.
   and call `FittVideo.session(descriptor, options?)`. Calling it again
   with the same `session_id` returns the same object and takes a newer
   token from the new descriptor; an older token is ignored.
+- Pass the descriptor as you hold it: a Vue or Inertia reactive prop is
+  fine, the SDK keeps its own plain copy (1.0.1) and never reads your
+  object again, so later changes to it do nothing.
 - `options` can only narrow what the descriptor allows: fewer signal
   groups, lower bitrates, a shorter `enforce.stay_on_page.grace_ms`,
   `upload.transport: 'post'`, `checks: { wait, timeoutMs }`. A value that
