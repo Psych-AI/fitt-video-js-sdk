@@ -1,0 +1,13 @@
+{
+    "name": "@fitt/video-sdk",
+    "version": "1.0.0",
+    "description": "Records answers and proctoring sessions in the browser for Fitt Video.",
+    "type": "module",
+    "license": "UNLICENSED",
+    "sideEffects": false,
+    "scripts": {
+        "test": "node --test 'tests/unit/**/*.test.ts'",
+        "typecheck": "tsc -p tsconfig.json && tsc -p tests/tsconfig.json",
+        "test:browser": "playwright test -c playwright.config.ts"
+    }
+}
