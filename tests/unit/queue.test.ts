@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createQueue } from '../../src/core/queue.ts';
-import { MemoryQueueStore } from '../../src/core/store.ts';
+import {
+    MemoryQueueStore,
+    type SegmentKey,
+    type SegmentRecord,
+} from '../../src/core/store.ts';
 import { fakeEnvironment } from '../support/fake-env.ts';
 import { segmentRecord, SID } from '../support/records.ts';
 
@@ -128,5 +132,49 @@ test('after a reload a pending record ages from adopt(), not from when it was cu
     assert.deepEqual(
         (await queue.sweep(perf + 1)).map((s) => s.seq),
         [2],
+    );
+});
+
+/** An uploader answer that is stored just as the sweep reaches the record. */
+class AnswerLandsFirst extends MemoryQueueStore {
+    override async updateSegment(
+        key: SegmentKey,
+        change: (current: SegmentRecord) => SegmentRecord | undefined,
+    ): Promise<SegmentRecord | undefined> {
+        const current = await super.getSegment(key);
+
+        if (current !== undefined) {
+            await super.putSegment({
+                ...current,
+                state: 'delivered',
+                data: null,
+            });
+        }
+
+        return super.updateSegment(key, change);
+    }
+
+    override async getSegment(
+        key: SegmentKey,
+    ): Promise<SegmentRecord | undefined> {
+        const read = await super.getSegment(key);
+
+        if (read !== undefined) {
+            await super.putSegment({ ...read, state: 'delivered', data: null });
+        }
+
+        return read;
+    }
+}
+
+test('an answer that lands while the sweep reaches its record is never overwritten', async () => {
+    const store = new AnswerLandsFirst();
+    const queue = createQueue(store, POLICY);
+    await queue.add(segmentRecord({ seq: 1 }));
+
+    assert.deepEqual(await queue.sweep(600_001), []);
+    assert.deepEqual(
+        (await store.listSegments(SID)).map((s) => s.state),
+        ['delivered'],
     );
 });

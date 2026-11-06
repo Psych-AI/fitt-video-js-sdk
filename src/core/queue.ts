@@ -96,19 +96,16 @@ export function createQueue(store: QueueStore, policy: QueuePolicy): Queue {
             const abandoned: SegmentRecord[] = [];
 
             for (const entry of due) {
-                const record = await store.getSegment(entry.key);
+                /** One atomic step, so an answer stored meanwhile is never overwritten. */
+                const given = await store.updateSegment(entry.key, (current) =>
+                    current.state === 'pending'
+                        ? { ...current, state: 'abandoned', data: null }
+                        : undefined,
+                );
 
-                if (record === undefined || record.state !== 'pending') {
-                    continue;
+                if (given !== undefined) {
+                    abandoned.push(given);
                 }
-
-                const given: SegmentRecord = {
-                    ...record,
-                    state: 'abandoned',
-                    data: null,
-                };
-                await store.putSegment(given);
-                abandoned.push(given);
             }
 
             return abandoned;

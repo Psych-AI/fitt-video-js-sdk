@@ -189,4 +189,48 @@ export const STORE_CASES: StoreCase[] = [
             same(await store.storedBytes(), 0, 'after deleteSession');
         },
     },
+    {
+        name: 'updateSegment reads and writes in one step, so a second change sees the first',
+        async run(store) {
+            const key = {
+                session_id: SID,
+                track: 'camera',
+                take: 1,
+                run_index: 0,
+                seq: 1,
+            } as const;
+            await store.putSegment(segment({ seq: 1, bytes: 3 }));
+
+            const [delivered, abandoned, missing] = await Promise.all([
+                store.updateSegment(key, (current) => ({
+                    ...current,
+                    state: 'delivered',
+                    data: null,
+                })),
+                store.updateSegment(key, (current) =>
+                    current.state === 'pending'
+                        ? { ...current, state: 'abandoned', data: null }
+                        : undefined,
+                ),
+                store.updateSegment({ ...key, seq: 9 }, (current) => current),
+            ]);
+
+            same(delivered?.state, 'delivered', 'first change');
+            same(
+                [abandoned, missing],
+                [undefined, undefined],
+                'nothing written',
+            );
+            same(
+                (await store.listSegments(SID)).map((s) => [
+                    s.seq,
+                    s.state,
+                    s.data,
+                ]),
+                [[1, 'delivered', null]],
+                'stored',
+            );
+            same(await store.storedBytes(), 0, 'stored bytes');
+        },
+    },
 ];

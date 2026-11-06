@@ -35,3 +35,13 @@ test('storedBytes() after a reopen counts only the bytes still held', async ({
         5,
     );
 });
+
+test('a request that fails inside a transaction rejects with its own error, by name', async ({
+    page,
+}) => {
+    await openHarness(page);
+
+    expect(
+        await page.evaluate(() => window.internals.requestErrorProbe()),
+    ).toBe('ConstraintError');
+});

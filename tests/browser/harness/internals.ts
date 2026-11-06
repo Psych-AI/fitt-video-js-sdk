@@ -1,6 +1,7 @@
 /** What the browser specs call through `window.internals`. Later tasks add the functions their specs need. */
 import {
     openIdbStore,
+    transaction,
     type BatchRecord,
     type RunRecord,
     type SegmentRecord,
@@ -151,5 +152,43 @@ export async function reopenBytesProbe(): Promise<number> {
         return await second.storedBytes();
     } finally {
         second.close();
+    }
+}
+
+/**
+ * The name a transaction rejects with when one of its requests fails: a
+ * second add() of the same key fails on the request, before the
+ * transaction aborts and sets its own error.
+ */
+export async function requestErrorProbe(): Promise<string> {
+    const name = 'fitt-video-probe';
+    await new Promise<void>((resolve, reject) => {
+        const request = indexedDB.deleteDatabase(name);
+        request.onsuccess = () => resolve();
+        request.onerror = () => reject(request.error);
+    });
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open(name, 1);
+        request.onupgradeneeded = () =>
+            request.result.createObjectStore('rows', { keyPath: 'id' });
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+    });
+
+    try {
+        await transaction(db, ['rows'], 'readwrite', (tx) => {
+            tx.objectStore('rows').add({ id: 1 });
+            tx.objectStore('rows').add({ id: 1 });
+
+            return () => undefined;
+        });
+
+        return 'resolved';
+    } catch (error) {
+        return error === null
+            ? 'null'
+            : String((error as { name?: unknown }).name);
+    } finally {
+        db.close();
     }
 }

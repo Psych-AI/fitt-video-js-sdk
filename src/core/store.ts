@@ -112,6 +112,10 @@ export type SegmentKey = Pick<
     'session_id' | 'track' | 'take' | 'run_index' | 'seq'
 >;
 
+export type SegmentChange = (
+    current: SegmentRecord,
+) => SegmentRecord | undefined;
+
 export interface QueueStore {
     readonly kind: 'indexeddb' | 'memory';
     putSession(record: SessionRecord): Promise<void>;
@@ -125,6 +129,16 @@ export interface QueueStore {
     putSegment(record: SegmentRecord): Promise<void>;
     /** One segment by its key, so a caller never lists a session's bytes to read one record. */
     getSegment(key: SegmentKey): Promise<SegmentRecord | undefined>;
+    /**
+     * Reads one segment and writes `change(current)` in one atomic step, so no
+     * other write lands in between. Nothing is written when the segment is
+     * missing or `change` returns undefined. `change` must be synchronous and
+     * keep the key. Resolves with what was written.
+     */
+    updateSegment(
+        key: SegmentKey,
+        change: SegmentChange,
+    ): Promise<SegmentRecord | undefined>;
     /** In track, take, run_index, seq order. */
     listSegments(sessionId: string): Promise<SegmentRecord[]>;
     deleteSegment(key: SegmentKey): Promise<void>;
@@ -249,6 +263,28 @@ export class MemoryQueueStore implements QueueStore {
         return record === undefined ? undefined : { ...record };
     }
 
+    /** No await inside, so the read and the write are one step. */
+    async updateSegment(
+        key: SegmentKey,
+        change: SegmentChange,
+    ): Promise<SegmentRecord | undefined> {
+        const current = this.#segments.get(joined(key, SEGMENT_KEY));
+        const next = current === undefined ? undefined : change({ ...current });
+
+        if (next === undefined) {
+            return undefined;
+        }
+
+        this.#segments.set(joined(next, SEGMENT_KEY), { ...next });
+
+        return { ...next };
+    }
+
+    /** Synchronous, for resilientStore() to know where a row lives. */
+    hasSegment(key: SegmentKey): boolean {
+        return this.#segments.has(joined(key, SEGMENT_KEY));
+    }
+
     async listSegments(sessionId: string): Promise<SegmentRecord[]> {
         return this.#list(this.#segments, sessionId, SEGMENT_KEY);
     }
@@ -315,6 +351,33 @@ function sumHeld(rows: HeldRow[]): number {
 }
 
 /**
+ * Runs `body` in one transaction and resolves with its value once the
+ * transaction completes. A failed request rejects with the request's own
+ * error: its error event reaches the transaction before the abort sets
+ * `tx.error`, so `tx.error` is still null then.
+ */
+export function transaction<T>(
+    db: IDBDatabase,
+    names: string[],
+    mode: IDBTransactionMode,
+    body: (tx: IDBTransaction) => () => T,
+): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+        const tx = db.transaction(names, mode);
+        const read = body(tx);
+        tx.oncomplete = () => resolve(read());
+        tx.onerror = (event) =>
+            reject(
+                (event.target as IDBRequest | null)?.error ??
+                    tx.error ??
+                    new Error('A request failed.'),
+            );
+        tx.onabort = () =>
+            reject(tx.error ?? new Error('The transaction aborted.'));
+    });
+}
+
+/**
  * The IndexedDB store: database `fitt-video`, version 1. Every call is one
  * transaction. A running total of the bytes held is built at open from
  * `segment_bytes` and kept in step with every segment write.
@@ -362,20 +425,32 @@ function idbStore(db: IDBDatabase): IdbQueueStore & { load(): Promise<void> } {
     const range = (sessionId: string): IDBKeyRange =>
         IDBKeyRange.bound([sessionId], [sessionId, []]);
 
-    /** Runs `body` in one transaction and resolves with its value once the transaction completes. */
     const run = <T>(
         names: StoreName[],
         mode: IDBTransactionMode,
         body: (tx: IDBTransaction) => () => T,
-    ): Promise<T> =>
-        new Promise<T>((resolve, reject) => {
-            const tx = db.transaction(names, mode);
-            const read = body(tx);
-            tx.oncomplete = () => resolve(read());
-            tx.onerror = () => reject(tx.error);
-            tx.onabort = () =>
-                reject(tx.error ?? new Error('The transaction aborted.'));
-        });
+    ): Promise<T> => transaction(db, names, mode, body);
+
+    /** Puts a segment and its segment_bytes row in `tx`; resolves to the change in bytes held once `before` (the old segment_bytes row) is read. */
+    const writeSegment = (
+        tx: IDBTransaction,
+        record: SegmentRecord,
+        before: IDBRequest,
+    ): (() => number) => {
+        const held = heldBytesOf(record);
+        const sizes = tx.objectStore('segment_bytes');
+
+        if (held > 0) {
+            sizes.put({ ...segmentKeyOf(record), bytes: held });
+        } else {
+            sizes.delete(keyOf(record, SEGMENT_KEY));
+        }
+
+        tx.objectStore('segments').put(record);
+
+        return () =>
+            held - ((before.result as HeldRow | undefined)?.bytes ?? 0);
+    };
 
     const getAll = <T>(name: StoreName, query?: IDBKeyRange): Promise<T[]> =>
         run([name], 'readonly', (tx) => {
@@ -425,29 +500,70 @@ function idbStore(db: IDBDatabase): IdbQueueStore & { load(): Promise<void> } {
         putRun: (record) => put('runs', record),
         listRuns: (sessionId) => getAll<RunRecord>('runs', range(sessionId)),
         async putSegment(record: SegmentRecord): Promise<void> {
-            const held = heldBytesOf(record);
             const delta = await run(
                 ['segments', 'segment_bytes'],
                 'readwrite',
-                (tx) => {
-                    const sizes = tx.objectStore('segment_bytes');
-                    const key = keyOf(record, SEGMENT_KEY);
-                    const before = sizes.get(key);
-
-                    if (held > 0) {
-                        sizes.put({ ...segmentKeyOf(record), bytes: held });
-                    } else {
-                        sizes.delete(key);
-                    }
-
-                    tx.objectStore('segments').put(record);
-
-                    return () =>
-                        held -
-                        ((before.result as HeldRow | undefined)?.bytes ?? 0);
-                },
+                (tx) =>
+                    writeSegment(
+                        tx,
+                        record,
+                        tx
+                            .objectStore('segment_bytes')
+                            .get(keyOf(record, SEGMENT_KEY)),
+                    ),
             );
             heldBytes += delta;
+        },
+        /** One readwrite transaction: the write is placed from the read's success handler, so nothing lands in between. */
+        async updateSegment(
+            key: SegmentKey,
+            change: SegmentChange,
+        ): Promise<SegmentRecord | undefined> {
+            let thrown: { error: unknown } | null = null;
+
+            try {
+                const { next, delta } = await run(
+                    ['segments', 'segment_bytes'],
+                    'readwrite',
+                    (tx) => {
+                        const id = keyOf(key, SEGMENT_KEY);
+                        const before = tx.objectStore('segment_bytes').get(id);
+                        const current = tx.objectStore('segments').get(id);
+                        let written: SegmentRecord | undefined;
+                        let deltaOf = (): number => 0;
+
+                        current.onsuccess = () => {
+                            const found = current.result as
+                                SegmentRecord | undefined;
+
+                            try {
+                                written =
+                                    found === undefined
+                                        ? undefined
+                                        : change(found);
+                            } catch (error) {
+                                thrown = { error };
+                                tx.abort();
+
+                                return;
+                            }
+
+                            if (written !== undefined) {
+                                deltaOf = writeSegment(tx, written, before);
+                            }
+                        };
+
+                        return () => ({ next: written, delta: deltaOf() });
+                    },
+                );
+                heldBytes += delta;
+
+                return next;
+            } catch (error) {
+                throw thrown === null
+                    ? error
+                    : (thrown as { error: unknown }).error;
+            }
         },
         getSegment: (key) =>
             run(['segments'], 'readonly', (tx) => {
@@ -547,6 +663,20 @@ export function resilientStore(
 ): QueueStore {
     let memory: MemoryQueueStore | null = null;
 
+    /**
+     * The one memory store, made and reported on the first quota error.
+     * Writes that were in flight together and all hit the full disk land in
+     * this same store, so none of them is lost.
+     */
+    const split = (): MemoryQueueStore => {
+        if (memory === null) {
+            memory = new MemoryQueueStore();
+            onUnavailable('quota');
+        }
+
+        return memory;
+    };
+
     const write = async (
         toPrimary: () => Promise<void>,
         toMemory: (store: MemoryQueueStore) => Promise<void>,
@@ -560,13 +690,10 @@ export function resilientStore(
                 if (!isQuotaError(error)) {
                     throw error;
                 }
-
-                memory = new MemoryQueueStore();
-                onUnavailable('quota');
             }
         }
 
-        await toMemory(memory);
+        await toMemory(split());
     };
 
     /** A write that must also reach the primary after the switch: frees, deletes and the session record. */
@@ -633,6 +760,45 @@ export function resilientStore(
         },
         async getSegment(key: SegmentKey) {
             return (await memory?.getSegment(key)) ?? primary.getSegment(key);
+        },
+        /**
+         * Changes the row where it lives: in the primary while that takes
+         * writes or the row is not in memory, else in memory. A free also
+         * reaches the primary, as every free does after the switch.
+         */
+        async updateSegment(key: SegmentKey, change: SegmentChange) {
+            if (memory === null || !memory.hasSegment(key)) {
+                try {
+                    return await primary.updateSegment(key, change);
+                } catch (error) {
+                    if (!isQuotaError(error)) {
+                        throw error;
+                    }
+                }
+            }
+
+            const overflow = split();
+            const base = overflow.hasSegment(key)
+                ? undefined
+                : await primary.getSegment(key);
+            let next: SegmentRecord | undefined;
+
+            if (overflow.hasSegment(key)) {
+                next = await overflow.updateSegment(key, change);
+            } else {
+                next = base === undefined ? undefined : change(base);
+
+                if (next !== undefined) {
+                    await overflow.putSegment(next);
+                }
+            }
+
+            if (next !== undefined && isFree(next)) {
+                const freed = next;
+                await quietly(() => primary.putSegment(freed));
+            }
+
+            return next;
         },
         async listSegments(sessionId: string) {
             return merged(
