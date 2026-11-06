@@ -1201,3 +1201,121 @@ export async function mixedTake(options: {
         audioTrackRms: microphone === null ? null : mean(microphones),
     };
 }
+
+/** A mono 16-bit WAV of a sine: the interviewer a media element plays. */
+function toneWav(seconds: number, frequency: number, amplitude: number): Blob {
+    const rate = 48000;
+    const count = Math.round(seconds * rate);
+    const view = new DataView(new ArrayBuffer(44 + count * 2));
+    const text = (offset: number, value: string): void => {
+        for (let index = 0; index < value.length; index++) {
+            view.setUint8(offset + index, value.charCodeAt(index));
+        }
+    };
+
+    text(0, 'RIFF');
+    view.setUint32(4, 36 + count * 2, true);
+    text(8, 'WAVE');
+    text(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, rate, true);
+    view.setUint32(28, rate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    text(36, 'data');
+    view.setUint32(40, count * 2, true);
+
+    for (let index = 0; index < count; index++) {
+        const sample =
+            amplitude * Math.sin((2 * Math.PI * frequency * index) / rate);
+        view.setInt16(44 + index * 2, Math.round(sample * 0x7fff), true);
+    }
+
+    return new Blob([view.buffer], { type: 'audio/wav' });
+}
+
+/**
+ * The host's interviewer as an <audio> element (a 20 s 440 Hz tone at
+ * 0.5), mixed into two conversation graphs in a row, as a take, a stop and
+ * a second take do: prepare(), mix(element), resume(), read the right
+ * channel of cameraAudio() every 100 ms for 1.5 s after a 0.5 s settle,
+ * then release(), which closes the graph. Returns each graph's state while
+ * it was read, the mean right channel RMS of each, every console warning
+ * mix() gave, and whether the element still plays after the second
+ * release. No recorder is needed, so this runs in every engine.
+ */
+export async function elementMixTwice(): Promise<{
+    contexts: AudioContextState[];
+    rightRms: number[];
+    warnings: string[];
+    paused: boolean;
+    advancedS: number;
+    elementPlaying: boolean;
+}> {
+    // Longer than the whole probe, so currentTime never wraps around a loop between two reads.
+    const url = URL.createObjectURL(toneWav(20, 440, 0.5));
+    const element = new Audio(url);
+    document.body.append(element);
+    await Promise.race([element.play().catch(() => undefined), sleep(1000)]);
+    const contexts: AudioContextState[] = [];
+    const rightRms: number[] = [];
+    const warnings: string[] = [];
+    const warn = console.warn;
+
+    try {
+        for (let take = 0; take < 2; take++) {
+            const rig = recordingRig('conversation', { audio: true });
+            await rig.engine.prepare();
+            const graph = rig.engine.audio();
+
+            if (graph === null) {
+                throw new Error('prepare() built no audio graph.');
+            }
+
+            console.warn = (...args: unknown[]) => {
+                warnings.push(args.map(String).join(' '));
+            };
+            graph.mix(element);
+            console.warn = warn;
+            await graph.resume();
+            const splitter = graph.context.createChannelSplitter(2);
+            const right = analyserOn(graph.context);
+            graph.context
+                .createMediaStreamSource(new MediaStream(graph.cameraAudio()))
+                .connect(splitter);
+            splitter.connect(right, 1);
+            const buffer = new Float32Array(2048);
+            const rights: number[] = [];
+            await sleep(500);
+
+            for (let read = 0; read < 15; read++) {
+                await sleep(100);
+                rights.push(analyserRms(right, buffer));
+            }
+
+            contexts.push(graph.context.state);
+            rightRms.push(mean(rights));
+            rig.engine.release();
+            await stateAfterClose(graph.context, 2000);
+        }
+
+        const before = element.currentTime;
+        await sleep(1000);
+
+        return {
+            contexts,
+            rightRms,
+            warnings,
+            paused: element.paused,
+            advancedS: element.currentTime - before,
+            elementPlaying: !element.paused && element.currentTime !== before,
+        };
+    } finally {
+        console.warn = warn;
+        element.pause();
+        element.remove();
+        URL.revokeObjectURL(url);
+    }
+}

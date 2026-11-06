@@ -20,6 +20,8 @@ function engineRig(
         holdAdd?: (record: SegmentRecord) => Promise<void> | undefined;
         /** Gives the engine an audio graph on this context. */
         audioContext?: () => AudioContext;
+        /** The fixture descriptor the tracks come from (answer by default). */
+        recipe?: string;
     } = {},
 ) {
     const env = fakeEnvironment();
@@ -44,13 +46,16 @@ function engineRig(
     const streams: (MediaStream | null)[] = [];
     const runs = new Map<string, RunRecord>();
     const samples: [number, number][] = [];
+    /** Every stream a run was given, in order. */
+    const made: MediaStream[] = [];
     let runIndex = 0;
     const engine = createRecorderEngine({
         env,
         clock,
         sessionId: SID,
         take: () => 1,
-        tracks: descriptorFixture('answer').tracks as ChunkedTrack[],
+        tracks: descriptorFixture(options.recipe ?? 'answer')
+            .tracks as ChunkedTrack[],
         media,
         recorderFactory: options.noRecorder
             ? () => {
@@ -62,7 +67,12 @@ function engineRig(
         cameraAudio: (stream) => stream.getAudioTracks(),
         createAudioContext: options.audioContext ?? null,
         onSample: (level, tMs) => samples.push([level, tMs]),
-        makeStream: media.makeStream,
+        makeStream: (tracks) => {
+            const made_ = media.makeStream(tracks);
+            made.push(made_);
+
+            return made_;
+        },
         permissions: {
             query: async ({ name }: { name: string }) => ({
                 state: permission[name],
@@ -104,6 +114,7 @@ function engineRig(
         runs,
         added,
         samples,
+        made,
         cameraReasons,
         stop,
     };
@@ -130,10 +141,21 @@ class FakeAudioNode {
 }
 
 /** The AudioContext members the graph uses, recording each stream it was given. */
-function fakeAudioContext() {
+function fakeAudioContext(
+    options: {
+        state?: AudioContextState;
+        /** resume() never settles, as in Firefox with no audio output device. */
+        stuck?: boolean;
+    } = {},
+) {
     const sources: MediaStream[] = [];
+    /** The stereo destination's track: what a camera run records when the mix is live. */
+    const mixTrack = {
+        kind: 'audio',
+        id: 'mix',
+    } as unknown as MediaStreamTrack;
     const context = {
-        state: 'running' as AudioContextState,
+        state: options.state ?? ('running' as AudioContextState),
         createAnalyser: () => new FakeAudioNode(),
         createChannelMerger: () => new FakeAudioNode(),
         createGain: () => new FakeAudioNode(),
@@ -141,20 +163,21 @@ function fakeAudioContext() {
             Object.assign(new FakeAudioNode(), {
                 channelCount: 0,
                 channelCountMode: 'max',
-                stream: { getAudioTracks: () => [] },
+                stream: { getAudioTracks: () => [mixTrack] },
             }),
         createMediaStreamSource: (stream: MediaStream) => {
             sources.push(stream);
 
             return new FakeAudioNode();
         },
-        resume: async () => {},
+        resume: (): Promise<void> =>
+            options.stuck === true ? new Promise(() => {}) : Promise.resolve(),
         close: async () => {
             context.state = 'closed';
         },
     };
 
-    return { context: context as unknown as AudioContext, sources };
+    return { context: context as unknown as AudioContext, sources, mixTrack };
 }
 
 test('prepare reports the permission states as device.permission_granted', async () => {
@@ -583,4 +606,57 @@ test('without createAudioContext there is no graph and the camera run records th
 
     assert.deepEqual(r.samples, []);
     assert.deepEqual(r.cameraReasons(), ['stop']);
+});
+
+test('a stereo camera run records the interviewer mix while the audio context runs', async () => {
+    const audio = fakeAudioContext();
+    const r = engineRig({
+        recipe: 'conversation',
+        audioContext: () => audio.context,
+    });
+    await r.engine.startTake(0);
+    await r.stop();
+
+    assert.deepEqual(r.made[0].getAudioTracks(), [audio.mixTrack]);
+    assert.equal(
+        r.events.some(([type]) => type === 'recorder.mix_unavailable'),
+        false,
+    );
+});
+
+test('a stereo take whose audio context never resumes records the microphone as is and says so once', async () => {
+    const audio = fakeAudioContext({ state: 'suspended', stuck: true });
+    const r = engineRig({
+        recipe: 'conversation',
+        audioContext: () => audio.context,
+    });
+    const warn = console.warn;
+    const warnings: unknown[][] = [];
+    console.warn = (...args: unknown[]) => warnings.push(args);
+
+    try {
+        const starting = r.engine.startTake(0);
+        // resume() waits 1000 ms at most, then the take starts anyway.
+        await r.env.advance(1000);
+        await starting;
+        const microphone = r.media.acquired[0].find(
+            (track) => track.kind === 'audio',
+        );
+
+        // The mix of a suspended context is silence on both channels: the candidate's voice is kept instead.
+        assert.deepEqual(r.made[0].getAudioTracks(), [microphone]);
+        const restarting = r.engine.restartRuns('device_switch');
+        await r.env.advance(10);
+        await restarting;
+        assert.deepEqual(r.made[1].getAudioTracks(), [microphone]);
+        await r.stop();
+    } finally {
+        console.warn = warn;
+    }
+
+    assert.deepEqual(
+        r.events.filter(([type]) => type === 'recorder.mix_unavailable'),
+        [['recorder.mix_unavailable', { context_state: 'suspended' }]],
+    );
+    assert.equal(warnings.length, 1);
 });

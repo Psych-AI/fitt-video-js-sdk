@@ -49,6 +49,65 @@ const RESUME_WAIT_MS = 1000;
 
 const GESTURES = ['pointerdown', 'keydown'] as const;
 
+/**
+ * An interviewer media element's own context. createMediaElementSource()
+ * takes an element's sound for the rest of the page's life, and an element
+ * can feed only one MediaElementAudioSourceNode ever. So the element plays
+ * through a context of its own that no release() closes: to the speakers,
+ * so the candidate keeps hearing it after a take, and into a stream that
+ * each take's graph brings in. A second take mixes the same element again.
+ */
+interface ElementCarrier {
+    context: AudioContext;
+    stream: MediaStream;
+}
+
+const carriers = new WeakMap<HTMLMediaElement, ElementCarrier>();
+
+/** Resumes `context` now, and on the first pointerdown or keydown on `doc` when that is not enough. */
+function resumeOnGesture(context: AudioContext, doc: EventTarget): void {
+    context.resume().catch(() => undefined);
+
+    if (context.state === 'running') {
+        return;
+    }
+
+    const onGesture = (): void => {
+        for (const type of GESTURES) {
+            doc.removeEventListener(type, onGesture, { capture: true });
+        }
+
+        context.resume().catch(() => undefined);
+    };
+
+    for (const type of GESTURES) {
+        doc.addEventListener(type, onGesture, { capture: true });
+    }
+}
+
+function carrierFor(
+    element: HTMLMediaElement,
+    createContext: () => AudioContext,
+    doc: EventTarget,
+): ElementCarrier {
+    const known = carriers.get(element);
+
+    if (known !== undefined) {
+        return known;
+    }
+
+    const context = createContext();
+    const source = context.createMediaElementSource(element);
+    const bridge = context.createMediaStreamDestination();
+    source.connect(context.destination);
+    source.connect(bridge);
+    const carrier = { context, stream: bridge.stream };
+    carriers.set(element, carrier);
+    resumeOnGesture(context, doc);
+
+    return carrier;
+}
+
 function rms(samples: Float32Array): number {
     let sum = 0;
 
@@ -83,6 +142,8 @@ export function createAudioGraph(deps: AudioGraphDeps): AudioGraph {
     const listeners = new Set<(level: number) => void>();
     /** Bridges from other contexts, disconnected at close(). */
     const bridges: (() => void)[] = [];
+    /** The element carriers this graph mixes, resumed with it. */
+    const mixed = new Set<ElementCarrier>();
     let microphone = deps.microphone;
     let source: MediaStreamAudioSourceNode | null = null;
     let current = 0;
@@ -204,13 +265,15 @@ export function createAudioGraph(deps: AudioGraphDeps): AudioGraph {
             );
         }
 
-        // A media element plays through the graph from now on, so it goes to the speakers too.
-        const element = context.createMediaElementSource(
+        // A media element plays through its own context, which outlives this graph.
+        const carrier = carrierFor(
             input as HTMLMediaElement,
+            deps.createContext,
+            deps.doc,
         );
-        element.connect(context.destination);
+        mixed.add(carrier);
 
-        return element;
+        return context.createMediaStreamSource(carrier.stream);
     }
 
     attach(microphone);
@@ -238,7 +301,16 @@ export function createAudioGraph(deps: AudioGraphDeps): AudioGraph {
         },
 
         resume(): Promise<void> {
-            if (closed || context.state === 'running') {
+            if (closed) {
+                return Promise.resolve();
+            }
+
+            // The start gesture lets the interviewer's own context run too.
+            for (const carrier of mixed) {
+                carrier.context.resume().catch(() => undefined);
+            }
+
+            if (context.state === 'running') {
                 return Promise.resolve();
             }
 
@@ -269,7 +341,15 @@ export function createAudioGraph(deps: AudioGraphDeps): AudioGraph {
                 return;
             }
 
-            nodeFor(input).connect(interviewer);
+            try {
+                nodeFor(input).connect(interviewer);
+            } catch (error) {
+                // A host mistake must never break the page: an element another graph already took, a closed context.
+                console.warn(
+                    'Fitt Video: mix() could not bring this source in.',
+                    error,
+                );
+            }
         },
 
         cameraAudio(): MediaStreamTrack[] {

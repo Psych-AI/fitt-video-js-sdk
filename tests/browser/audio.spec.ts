@@ -99,8 +99,12 @@ test('a conversation take records a stereo camera track, a mono audio track, and
     }
 
     if (audioMeasured(testInfo, browserName, take.context)) {
-        // Owner decision 1: every check here needs a running AudioContext, which Firefox cannot start without a device.
+        // Owner decision 1: the stereo camera track, device.no_audio and the three levels need a running AudioContext.
         expect(['running', 'suspended']).toContain(take.context);
+        // Firefox still records from its native fake devices: both inits and the mono audio track stand.
+        expect(take.cameraInit).not.toBeNull();
+        expect(take.audioInit).not.toBeNull();
+        expect(audioChannels(bytes(take.audioInit!))).toBe(1);
         expect(take.contextState).toBe('closed');
 
         return;
@@ -120,4 +124,38 @@ test('a conversation take records a stereo camera track, a mono audio track, and
     expect(take.leftRms).toBeLessThan(0.01);
     expect(take.rightRms).toBeGreaterThan(0.01);
     expect(take.audioTrackRms).toBeLessThan(0.01);
+});
+
+test('an interviewer media element mixed into a take, a stop and a second take reaches the right channel both times', async ({
+    page,
+    browserName,
+}, testInfo) => {
+    await installMedia(page, browserName, { prefer: 'synthetic' });
+    const errors = await openHarness(page);
+    await page.click('#gesture');
+    const result = await page.evaluate(() =>
+        window.internals.elementMixTwice(),
+    );
+    testInfo.annotations.push({
+        type: 'element-mix',
+        description: JSON.stringify(result),
+    });
+
+    // createMediaElementSource() binds an element once for good: the second mix() must neither throw nor warn.
+    expect(errors).toEqual([]);
+    expect(result.warnings).toEqual([]);
+    expect(result.contexts).toHaveLength(2);
+
+    if (audioMeasured(testInfo, browserName, result.contexts[0])) {
+        // Owner decision 1: the levels need a running AudioContext.
+        expect(['running', 'suspended']).toContain(result.contexts[1]);
+
+        return;
+    }
+
+    expect(result.contexts).toEqual(['running', 'running']);
+    expect(result.rightRms[0]).toBeGreaterThan(0.01);
+    expect(result.rightRms[1]).toBeGreaterThan(0.01);
+    // The element still plays after both graphs closed, so the candidate keeps hearing the interviewer.
+    expect(result.elementPlaying).toBe(true);
 });

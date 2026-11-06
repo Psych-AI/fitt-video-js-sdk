@@ -121,6 +121,8 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
     let lastSettings: VideoSettings | null = null;
     /** The meter and the mix, built at the first acquire of a capture and closed at release(). */
     let graph: AudioGraph | null = null;
+    /** Whether this take already reported a stereo mix it could not record. */
+    let mixUnavailable = false;
     const stereo = deps.tracks.some(
         (track) =>
             track.track === 'camera' && track.capture.audio.channels === 2,
@@ -527,10 +529,38 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
 
         return deps.makeStream([
             ...source.getVideoTracks(),
-            ...(graph === null
-                ? deps.cameraAudio(source)
-                : graph.cameraAudio()),
+            ...cameraAudioOf(source),
         ]);
+    }
+
+    /**
+     * The graph's camera audio, while its context runs. A stereo mix whose
+     * context is not running (resume() refused, or a browser with no audio
+     * output device) carries silence on both channels and passes no level
+     * to the dead microphone detector, so the candidate's voice would be
+     * lost without a word. Such a run records the microphone as is, and the
+     * take reports the missing D20 mix once.
+     */
+    function cameraAudioOf(source: MediaStream): MediaStreamTrack[] {
+        if (graph === null) {
+            return deps.cameraAudio(source);
+        }
+
+        const state = graph.context.state;
+
+        if (!stereo || state === 'running') {
+            return graph.cameraAudio();
+        }
+
+        if (!mixUnavailable) {
+            mixUnavailable = true;
+            console.warn(
+                `Fitt Video: the audio context is ${state}, so this camera run records the microphone without the interviewer mix.`,
+            );
+            deps.emit('recorder.mix_unavailable', { context_state: state });
+        }
+
+        return deps.cameraAudio(source);
     }
 
     /**
@@ -814,6 +844,7 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
 
             currentTake = deps.take();
             recording = true;
+            mixUnavailable = false;
 
             try {
                 // A device that went away before the take: its runs start when it comes back.
