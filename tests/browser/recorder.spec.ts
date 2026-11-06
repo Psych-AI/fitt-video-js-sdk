@@ -107,3 +107,58 @@ test('stop ends every track', async ({ page, browserName }) => {
     expect(states.length).toBeGreaterThanOrEqual(2);
     expect(new Set(states)).toEqual(new Set(['ended']));
 });
+
+test('a camera switch mid-take ends the run and starts another, each with its own seq 0', async ({
+    page,
+    browserName,
+}, testInfo) => {
+    test.skip(measured(testInfo, browserName), 'recorded in the first test');
+    await installMedia(page, browserName, { prefer: 'synthetic' });
+    await openHarness(page);
+    await skipWithoutRecorder(page);
+    await page.click('#gesture');
+    const take = await page.evaluate(() =>
+        window.internals.recordTake({
+            recipe: 'monitor',
+            seconds: 10,
+            switchCameraAt: 6000,
+        }),
+    );
+
+    expect(take.runs.map((r) => r.ended_reason)).toEqual([
+        'device_switch',
+        'stop',
+    ]);
+    expect(new Set(take.runs.map((r) => r.run_id)).size).toBe(2);
+
+    for (const run of take.runs) {
+        expect(
+            take.segments.filter(
+                (s) =>
+                    s.run_id === run.run_id && s.seq === 0 && s.kind === 'init',
+            ),
+        ).toHaveLength(1);
+    }
+});
+
+test('an ended track is device_disconnected, and the device coming back starts a new run', async ({
+    page,
+    browserName,
+}, testInfo) => {
+    test.skip(measured(testInfo, browserName), 'recorded in the first test');
+    await installMedia(page, browserName, { prefer: 'synthetic' });
+    await openHarness(page);
+    await skipWithoutRecorder(page);
+    await page.click('#gesture');
+    const take = await page.evaluate(() =>
+        window.internals.recordTake({
+            recipe: 'monitor',
+            seconds: 10,
+            endTrackAt: 4000,
+            deviceBackAt: 6000,
+        }),
+    );
+
+    expect(take.errors).toEqual(['device_disconnected', null]);
+    expect(take.runs).toHaveLength(2);
+});

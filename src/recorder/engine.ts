@@ -3,13 +3,18 @@ import type { ChunkedTrack } from '../core/descriptor.ts';
 import type { Environment } from '../core/env.ts';
 import { FittVideoError, type ErrorCode } from '../core/errors.ts';
 import type { TakeEngine } from '../core/lifecycle.ts';
-import type { RunRecord, SegmentRecord } from '../core/store.ts';
+import type {
+    RunEndedReason,
+    RunRecord,
+    SegmentRecord,
+} from '../core/store.ts';
 import {
     acquire,
     permissionState,
     type MediaDevicesLike,
     type Selection,
 } from './capture.ts';
+import { createDeviceList, type DevicesView } from './devices.ts';
 import { chooseMime } from './mime.ts';
 import { createRun, type RecorderFactory, type Run } from './run.ts';
 
@@ -18,6 +23,9 @@ export interface RecorderEngine extends TakeEngine {
     readonly stream: MediaStream | null;
     /** Stops every track it acquired (Task 13 adds the audio graph). stopTake() calls it too. */
     release(): void;
+    devices(): DevicesView;
+    /** End every open run with this reason and start new ones on the same take (clock jump, device change). */
+    restartRuns(reason: RunEndedReason): Promise<void>;
 }
 
 export interface RecorderEngineDeps {
@@ -43,6 +51,30 @@ export interface RecorderEngineDeps {
     /** null clears it (a device came back). */
     onError(code: ErrorCode | null): void;
     ua: string;
+    /** The document, for visibilityState and visibilitychange. */
+    doc: { visibilityState: string } & EventTarget;
+    /** The new stream after every acquire (prepare, select, a backgrounded return, a device coming back), and null after release(); the session's previews follow it. */
+    onStream?(stream: MediaStream | null): void;
+}
+
+/** The camera track's settings are read this often while a stream is held. */
+const SETTINGS_POLL_MS = 2000;
+
+/**
+ * Why the runs are not recording although a take is open: the tab was
+ * hidden (iOS stops capture there), a device went away, or a permission
+ * was revoked.
+ */
+type Suspended = 'backgrounded' | 'disconnected' | 'permission_lost' | null;
+
+interface VideoSettings {
+    width: number | null;
+    height: number | null;
+    frame_rate: number | null;
+}
+
+function kindOf(track: MediaStreamTrack): 'camera' | 'microphone' {
+    return track.kind === 'video' ? 'camera' : 'microphone';
 }
 
 /**
@@ -52,6 +84,11 @@ export interface RecorderEngineDeps {
  * (the microphone alone, in its own stream); stopTake() stops every run and
  * releases capture, so the camera light goes off after stop() (spec 6.3).
  * The session acquires again with prepare() after a reset (spec 6.5).
+ *
+ * Within a take, a run ends and a new one starts on the same take when the
+ * candidate picks another device, the recorder fails, the tab comes back
+ * from the background, or a device that went away comes back. Every such
+ * change goes through one queue, so two of them never interleave.
  */
 export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
     const selection: Selection = {};
@@ -62,6 +99,43 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
     let pending: Promise<void> | null = null;
     /** Counts releases, so a capture that lands after one is stopped, never kept. */
     let generation = 0;
+    /** A take is open: from startTake() until stopTake(). */
+    let recording = false;
+    let currentTake = 0;
+    let suspended: Suspended = null;
+    /** Device changes, restarts and the stop, one at a time. */
+    let ops: Promise<void> = Promise.resolve();
+    /** Removes the listeners on the current stream's tracks. */
+    let unwatchTracks: () => void = () => {};
+    let watchingPage = false;
+    let settingsTimer: number | null = null;
+    let lastSettings: VideoSettings | null = null;
+    const permissions: Record<
+        'camera' | 'microphone',
+        PermissionState | 'unknown'
+    > = { camera: 'unknown', microphone: 'unknown' };
+    const deviceList = createDeviceList({
+        media: deps.media,
+        emit: (type, payload) => deps.emit(type, payload),
+    });
+
+    /** Runs `step` after every queued step; a failed step never blocks the next. */
+    function serial<T>(step: () => Promise<T>): Promise<T> {
+        const result = ops.then(step);
+        ops = result.then(
+            () => undefined,
+            () => undefined,
+        );
+
+        return result;
+    }
+
+    /** For listeners: queue the step and keep its failure from becoming an unhandled rejection. */
+    function background(step: () => Promise<void>): void {
+        void serial(step).catch(() => undefined);
+    }
+
+    const hidden = (): boolean => deps.doc.visibilityState === 'hidden';
 
     function stopAll(held: MediaStream): void {
         for (const track of held.getTracks()) {
@@ -69,7 +143,223 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
         }
     }
 
-    async function acquireOnce(): Promise<void> {
+    function holds(track: MediaStreamTrack): boolean {
+        return stream?.getTracks().includes(track) ?? false;
+    }
+
+    function onTrackMute(track: MediaStreamTrack, muted: boolean): void {
+        if (!holds(track)) {
+            return;
+        }
+
+        // A hint only: mute does not reliably mean another app took the device (spec 6.6).
+        deps.emit('device.track_muted', { kind: track.kind, muted });
+
+        if (muted && hidden() && recording && suspended === null) {
+            backgrounded();
+        }
+    }
+
+    function onTrackEnded(track: MediaStreamTrack): void {
+        if (!holds(track) || suspended !== null) {
+            return;
+        }
+
+        if (hidden() && recording) {
+            backgrounded();
+
+            return;
+        }
+
+        const kind = kindOf(track);
+        // Claimed now, so the other track ending too is not handled twice.
+        suspended = 'disconnected';
+        const asked = generation;
+        background(async () => {
+            const state = await permissionState(deps.permissions, kind);
+
+            if (asked !== generation) {
+                // Released while the permission was read: nothing is held any more.
+                return;
+            }
+
+            if (state === 'denied') {
+                permissions[kind] = 'denied';
+                suspended = 'permission_lost';
+                const stopping = stopRuns('device_switch');
+                permissionLost(kind);
+                await stopping;
+
+                return;
+            }
+
+            const stopping = stopRuns('device_switch');
+            deps.onError('device_disconnected');
+            await stopping;
+        });
+    }
+
+    /** spec 6.3: a revoked permission is device.permission_lost and permission_denied. */
+    function permissionLost(kind: 'camera' | 'microphone'): void {
+        deps.emit('device.permission_lost', { kind });
+        deps.onError('permission_denied');
+    }
+
+    /** spec 6.9: iOS stops capture in a backgrounded tab. The runs end; new ones start on return. */
+    function backgrounded(): void {
+        suspended = 'backgrounded';
+        background(() => stopRuns('backgrounded'));
+    }
+
+    function watchTracks(held: MediaStream): void {
+        const removers: (() => void)[] = [];
+
+        for (const track of held.getTracks()) {
+            const ended = (): void => onTrackEnded(track);
+            const mute = (): void => onTrackMute(track, true);
+            const unmute = (): void => onTrackMute(track, false);
+            track.addEventListener('ended', ended);
+            track.addEventListener('mute', mute);
+            track.addEventListener('unmute', unmute);
+            removers.push(() => {
+                track.removeEventListener('ended', ended);
+                track.removeEventListener('mute', mute);
+                track.removeEventListener('unmute', unmute);
+            });
+        }
+
+        unwatchTracks = () => {
+            for (const remove of removers) {
+                remove();
+            }
+        };
+    }
+
+    function readSettings(): VideoSettings | null {
+        const video = stream?.getVideoTracks()[0];
+
+        if (video === undefined || typeof video.getSettings !== 'function') {
+            return null;
+        }
+
+        const settings = video.getSettings();
+
+        return {
+            width: settings.width ?? null,
+            height: settings.height ?? null,
+            frame_rate: settings.frameRate ?? null,
+        };
+    }
+
+    function pollSettings(): void {
+        settingsTimer = deps.env.timers.setTimeout(() => {
+            settingsTimer = null;
+            const read = readSettings();
+
+            if (
+                read !== null &&
+                lastSettings !== null &&
+                (read.width !== lastSettings.width ||
+                    read.height !== lastSettings.height ||
+                    read.frame_rate !== lastSettings.frame_rate)
+            ) {
+                deps.emit('device.track_settings_changed', {
+                    kind: 'video',
+                    ...read,
+                });
+            }
+
+            lastSettings = read ?? lastSettings;
+            pollSettings();
+        }, SETTINGS_POLL_MS);
+    }
+
+    function stopPolling(): void {
+        if (settingsTimer !== null) {
+            deps.env.timers.clearTimeout(settingsTimer);
+            settingsTimer = null;
+        }
+    }
+
+    function onDeviceChange(): void {
+        background(async () => {
+            await deviceList.refresh();
+            await recover();
+        });
+    }
+
+    function onVisibility(): void {
+        if (hidden()) {
+            return;
+        }
+
+        background(async () => {
+            // Chrome holds devicechange back while hidden (spec 6.6), so list again here.
+            await deviceList.refresh();
+            const lost = await recheckPermissions();
+
+            if (suspended === 'backgrounded') {
+                if (lost) {
+                    suspended = 'permission_lost';
+                    await stopRuns('device_switch');
+
+                    return;
+                }
+
+                await returnFromBackground();
+
+                return;
+            }
+
+            await recover();
+        });
+    }
+
+    /** A permission that was granted and is now denied is device.permission_lost. True when one was. */
+    async function recheckPermissions(): Promise<boolean> {
+        const [camera, microphone] = await Promise.all([
+            permissionState(deps.permissions, 'camera'),
+            permissionState(deps.permissions, 'microphone'),
+        ]);
+        let lost = false;
+
+        for (const [kind, state] of [
+            ['camera', camera],
+            ['microphone', microphone],
+        ] as const) {
+            if (permissions[kind] === 'granted' && state === 'denied') {
+                lost = true;
+                permissionLost(kind);
+            }
+
+            permissions[kind] = state;
+        }
+
+        return lost;
+    }
+
+    function watchPage(): void {
+        if (watchingPage) {
+            return;
+        }
+
+        watchingPage = true;
+        deps.media.addEventListener('devicechange', onDeviceChange);
+        deps.doc.addEventListener('visibilitychange', onVisibility);
+    }
+
+    function unwatchPage(): void {
+        if (!watchingPage) {
+            return;
+        }
+
+        watchingPage = false;
+        deps.media.removeEventListener('devicechange', onDeviceChange);
+        deps.doc.removeEventListener('visibilitychange', onVisibility);
+    }
+
+    /** One getUserMedia with the current choice; a release while it is open wins. */
+    async function capture(): Promise<MediaStream> {
         const asked = generation;
         const next = await acquire(deps.media, deps.tracks, selection);
 
@@ -80,14 +370,50 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
             throw new FittVideoError('invalid_state', { reason: 'released' });
         }
 
+        return next;
+    }
+
+    /** Makes `next` the stream, tells the previews, then stops the stream it replaces (if any). */
+    function adopt(next: MediaStream): MediaStream | null {
+        const previous = stream;
+        unwatchTracks();
         stream = next;
         acquired.push(next);
+        watchTracks(next);
+        watchPage();
+        deps.onStream?.(next);
+
+        return previous;
+    }
+
+    function retire(previous: MediaStream | null): void {
+        if (previous === null) {
+            return;
+        }
+
+        stopAll(previous);
+        acquired = acquired.filter((held) => held !== previous);
+    }
+
+    async function acquireOnce(): Promise<void> {
+        const asked = generation;
+        const next = await capture();
+        adopt(next);
 
         const [camera, microphone] = await Promise.all([
             permissionState(deps.permissions, 'camera'),
             permissionState(deps.permissions, 'microphone'),
         ]);
+        permissions.camera = camera;
+        permissions.microphone = microphone;
         deps.emit('device.permission_granted', { camera, microphone });
+        await deviceList.refresh();
+
+        if (asked === generation && stream === next) {
+            lastSettings = readSettings();
+            stopPolling();
+            pollSettings();
+        }
     }
 
     function prepare(): Promise<void> {
@@ -110,13 +436,23 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
     function release(): void {
         generation++;
         pending = null;
+        const held = stream;
 
-        for (const held of acquired) {
-            stopAll(held);
+        for (const each of acquired) {
+            stopAll(each);
         }
 
+        unwatchTracks();
+        unwatchTracks = () => {};
+        unwatchPage();
+        stopPolling();
         acquired = [];
         stream = null;
+        suspended = null;
+
+        if (held !== null) {
+            deps.onStream?.(null);
+        }
     }
 
     /** The stream a track's run records: video plus the camera audio, or the microphone alone. */
@@ -131,16 +467,56 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
         ]);
     }
 
+    /**
+     * The recorder of `run` fired `error` while it was recording. The run
+     * stops itself with recorder_error (run.ts); the replacement starts at
+     * once on the same take and stream, without waiting for the failed
+     * run's last data to be stored, so the gap is as short as it can be.
+     */
+    function onRunError(
+        run: Run,
+        track: ChunkedTrack,
+        replacing: boolean,
+    ): void {
+        if (!runs.includes(run)) {
+            // Already stopping (a stop, a restart): the run ignores the error too.
+            return;
+        }
+
+        runs = runs.filter((other) => other !== run);
+        deps.onError('recorder_error');
+
+        // Loop guard: a replacement that fails before it cut a media segment is not replaced again.
+        if (replacing && run.mediaSegmentsCut() === 0) {
+            return;
+        }
+
+        background(async () => {
+            if (!recording || suspended !== null || stream === null) {
+                return;
+            }
+
+            const next = runFor(track, stream, true);
+            await next.start();
+            runs.push(next);
+        });
+    }
+
+    /**
+     * A run for one track. A run that replaces one the recorder failed
+     * (`replacing`) clears the error at its start event, and is not
+     * replaced again if it fails before it cut a media segment.
+     */
     function runFor(
         track: ChunkedTrack,
         source: MediaStream,
-        take: number,
+        replacing: boolean,
     ): Run {
         const run: Run = createRun({
             env: deps.env,
             clock: deps.clock,
             sessionId: deps.sessionId,
-            take,
+            take: currentTake,
             runIndex: deps.nextRunIndex(track.track),
             track,
             stream: streamFor(track, source),
@@ -149,15 +525,26 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
                 (type) => deps.isTypeSupported(type),
             ),
             bitrates: deps.bitrates(track),
-            recorderFactory: deps.recorderFactory,
+            recorderFactory: (recorderStream, options) => {
+                const made = deps.recorderFactory(recorderStream, options);
+                // Added before the run's own listener, so the run is still recording when it runs.
+                made.addEventListener('error', () =>
+                    onRunError(run, track, replacing),
+                );
+
+                return made;
+            },
             add: (record) => deps.add(record),
             putRun: (record) => deps.putRun(record),
-            emit: (type, payload) => deps.emit(type, payload),
-            onRecorderError: () => {
-                // Task 12b starts the next run on the same take and stream.
-                runs = runs.filter((other) => other !== run);
-                deps.onError('recorder_error');
+            emit: (type, payload) => {
+                deps.emit(type, payload);
+
+                if (replacing && type === 'recorder.started') {
+                    deps.onError(null);
+                }
             },
+            // onRunError() has already handed the track to a replacement.
+            onRecorderError: () => undefined,
             ua: deps.ua,
         });
 
@@ -165,7 +552,7 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
     }
 
     /** Stops every open run with this reason; the first failure is thrown after all have stopped. */
-    async function stopRuns(reason: 'stop' | 'recorder_error'): Promise<void> {
+    async function stopRuns(reason: RunEndedReason): Promise<void> {
         const stopping = runs;
         runs = [];
         const results = await Promise.allSettled(
@@ -181,6 +568,137 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
         }
     }
 
+    /** Starts a run for every recorded track on the current stream and take. */
+    async function startRuns(): Promise<void> {
+        const source = stream;
+
+        if (source === null) {
+            // Released while the permission states were read.
+            throw new FittVideoError('invalid_state', { reason: 'released' });
+        }
+
+        // A screen track needs its own capture, which no recipe asks for yet.
+        const recorded = deps.tracks.filter(
+            (track) => track.track === 'camera' || track.track === 'audio',
+        );
+
+        for (const track of recorded) {
+            const run = runFor(track, source, false);
+
+            try {
+                await run.start();
+            } catch (error) {
+                // No MediaRecorder, or one that refuses this stream or type (owner decision 2).
+                await stopRuns('recorder_error').catch(() => undefined);
+                deps.onError('recorder_unsupported');
+
+                throw new FittVideoError('recorder_unsupported', {
+                    track: track.track,
+                    name:
+                        typeof (error as { name?: unknown })?.name === 'string'
+                            ? (error as { name: string }).name
+                            : null,
+                });
+            }
+
+            runs.push(run);
+        }
+    }
+
+    async function restart(reason: RunEndedReason): Promise<void> {
+        await stopRuns(reason);
+
+        if (recording && suspended === null && stream !== null) {
+            await startRuns();
+        }
+    }
+
+    /** On return to visible after the runs ended as backgrounded: capture again and go on. */
+    async function returnFromBackground(): Promise<void> {
+        const asked = generation;
+        let next: MediaStream;
+
+        try {
+            next = await capture();
+        } catch {
+            if (asked !== generation) {
+                // Released while the capture was open: a release always wins.
+                return;
+            }
+
+            suspended = 'disconnected';
+            deps.onError('device_disconnected');
+
+            return;
+        }
+
+        retire(adopt(next));
+        suspended = null;
+
+        if (recording) {
+            await startRuns();
+        }
+    }
+
+    /** After a device change: when a device went away, try to capture again, and go on if it works. */
+    async function recover(): Promise<void> {
+        if (suspended !== 'disconnected' || stream === null) {
+            return;
+        }
+
+        let next: MediaStream;
+
+        try {
+            next = await capture();
+        } catch {
+            // Still no usable device: wait for the next devicechange.
+            return;
+        }
+
+        retire(adopt(next));
+        suspended = null;
+
+        if (recording) {
+            await startRuns();
+        }
+
+        deps.onError(null);
+    }
+
+    async function select(
+        kind: 'camera' | 'microphone',
+        deviceId: string,
+    ): Promise<void> {
+        selection[kind] = deviceId;
+
+        if (stream === null) {
+            // The next acquire uses the choice.
+            return;
+        }
+
+        const next = await capture();
+        const previous = adopt(next);
+
+        if (suspended === 'disconnected') {
+            suspended = null;
+
+            if (recording) {
+                await startRuns();
+            }
+
+            retire(previous);
+            deps.onError(null);
+
+            return;
+        }
+
+        if (recording && suspended === null) {
+            await restart('device_switch');
+        }
+
+        retire(previous);
+    }
+
     return {
         get stream(): MediaStream | null {
             return stream;
@@ -190,52 +708,61 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
 
         async startTake(): Promise<void> {
             await prepare();
-            const source = stream;
 
-            if (source === null) {
+            if (stream === null) {
                 // Released while the permission states were read.
                 throw new FittVideoError('invalid_state', {
                     reason: 'released',
                 });
             }
-            const take = deps.take();
-            // A screen track needs its own capture, which no recipe asks for yet.
-            const recorded = deps.tracks.filter(
-                (track) => track.track === 'camera' || track.track === 'audio',
-            );
 
-            for (const track of recorded) {
-                const run = runFor(track, source, take);
+            currentTake = deps.take();
+            recording = true;
 
-                try {
-                    await run.start();
-                } catch (error) {
-                    // No MediaRecorder, or one that refuses this stream or type (owner decision 2).
-                    await stopRuns('recorder_error').catch(() => undefined);
-                    deps.onError('recorder_unsupported');
+            try {
+                // A device that went away before the take: its runs start when it comes back.
+                await serial(async () => {
+                    if (suspended === null) {
+                        await startRuns();
+                    }
+                });
+            } catch (error) {
+                recording = false;
 
-                    throw new FittVideoError('recorder_unsupported', {
-                        track: track.track,
-                        name:
-                            typeof (error as { name?: unknown })?.name ===
-                            'string'
-                                ? (error as { name: string }).name
-                                : null,
-                    });
-                }
-
-                runs.push(run);
+                throw error;
             }
         },
 
         async stopTake(): Promise<void> {
+            recording = false;
+
             try {
-                await stopRuns('stop');
+                await serial(() => stopRuns('stop'));
             } finally {
                 release();
             }
         },
 
         release,
+
+        devices(): DevicesView {
+            return {
+                get cameras(): MediaDeviceInfo[] {
+                    return deviceList.cameras;
+                },
+                get microphones(): MediaDeviceInfo[] {
+                    return deviceList.microphones;
+                },
+                get selected(): Selection {
+                    return { ...selection };
+                },
+                select: (kind, deviceId) =>
+                    serial(() => select(kind, deviceId)),
+            };
+        },
+
+        restartRuns(reason: RunEndedReason): Promise<void> {
+            return serial(() => restart(reason));
+        },
     };
 }

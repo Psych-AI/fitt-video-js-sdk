@@ -37,6 +37,7 @@ function engineRig(
     };
     const events: [string, Record<string, unknown>][] = [];
     const errors: (string | null)[] = [];
+    const streams: (MediaStream | null)[] = [];
     const runs = new Map<string, RunRecord>();
     let runIndex = 0;
     const engine = createRecorderEngine({
@@ -70,6 +71,8 @@ function engineRig(
         emit: (type, payload) => events.push([type, payload]),
         onError: (code) => errors.push(code),
         ua: 'Mozilla/5.0 (test)',
+        doc,
+        onStream: (stream) => streams.push(stream),
     });
     const cameraReasons = (): (string | null)[] =>
         [...runs.values()]
@@ -89,6 +92,7 @@ function engineRig(
         engine,
         events,
         errors,
+        streams,
         runs,
         added,
         cameraReasons,
@@ -219,4 +223,181 @@ test('a prepare after that release acquires again and keeps its own capture', as
     assert.ok(r.media.acquired[0].every((track) => track.stopped));
     assert.ok(r.media.acquired[1].every((track) => !track.stopped));
     assert.notEqual(r.engine.stream, null);
+});
+
+test('a backgrounded tab ends the run and a new one starts on return', async () => {
+    const r = engineRig();
+    await r.engine.prepare();
+    await r.engine.startTake(0);
+    await r.env.advance(10);
+    r.doc.visibilityState = 'hidden';
+    r.media.videoTrack().end();
+    await r.env.advance(10);
+    r.doc.visibilityState = 'visible';
+    r.doc.dispatchEvent(new Event('visibilitychange'));
+    await r.env.advance(10);
+    await r.stop();
+
+    assert.deepEqual(r.cameraReasons(), ['backgrounded', 'stop']);
+    assert.equal(r.media.calls(), 2);
+    assert.deepEqual(r.errors, []);
+});
+
+test('track mute and unmute are device.track_muted hints', async () => {
+    const r = engineRig();
+    await r.engine.prepare();
+    r.media.videoTrack().setMuted(true);
+    r.media.videoTrack().setMuted(false);
+
+    assert.deepEqual(
+        r.events
+            .filter(([type]) => type === 'device.track_muted')
+            .map(([, payload]) => payload),
+        [
+            { kind: 'video', muted: true },
+            { kind: 'video', muted: false },
+        ],
+    );
+});
+
+test('an ended track whose permission is now denied is device.permission_lost and permission_denied', async () => {
+    const r = engineRig();
+    await r.engine.prepare();
+    await r.engine.startTake(0);
+    await r.env.advance(10);
+    r.permission.camera = 'denied';
+    r.media.videoTrack().end();
+    await r.env.advance(10);
+
+    assert.deepEqual(
+        r.events.find(([type]) => type === 'device.permission_lost')?.[1],
+        { kind: 'camera' },
+    );
+    assert.ok(r.errors.includes('permission_denied'));
+});
+
+test('a recorder error mid-take ends that run and starts a new one on the same take and stream', async () => {
+    const r = engineRig({ chunks: true });
+    await r.engine.prepare();
+    await r.engine.startTake(0);
+    await r.env.advance(10);
+    r.media.recorders[0].dispatchEvent(new Event('error'));
+    await r.env.advance(10);
+    await r.stop();
+    const cameraRuns = [...r.runs.values()].filter(
+        (run) => run.track === 'camera',
+    );
+
+    assert.deepEqual(r.cameraReasons(), ['recorder_error', 'stop']);
+    assert.deepEqual(r.errors, ['recorder_error', null]);
+    assert.equal(new Set(cameraRuns.map((run) => run.run_id)).size, 2);
+    assert.deepEqual(
+        r.added
+            .filter((s) => s.run_id === cameraRuns[1].run_id)
+            .map((s) => s.seq)[0],
+        0,
+    );
+    assert.equal(r.media.calls(), 1);
+});
+
+test('a change in the camera track settings is device.track_settings_changed, read on a 2 s poll', async () => {
+    const r = engineRig();
+    await r.engine.prepare();
+    r.media.videoTrack().settings = { width: 320, height: 240, frameRate: 15 };
+    await r.env.advance(4000);
+
+    assert.deepEqual(
+        r.events
+            .filter(([type]) => type === 'device.track_settings_changed')
+            .map(([, payload]) => payload),
+        [{ kind: 'video', width: 320, height: 240, frame_rate: 15 }],
+    );
+});
+
+test('a virtual camera label is device.virtual_camera_suspected', async () => {
+    const r = engineRig({ labels: ['OBS Virtual Camera'] });
+    await r.engine.prepare();
+
+    assert.deepEqual(
+        r.events.find(
+            ([type]) => type === 'device.virtual_camera_suspected',
+        )?.[1],
+        { label: 'OBS Virtual Camera' },
+    );
+});
+
+test('a replacement run that fails before it cut a media segment is not replaced again, and the error stays', async () => {
+    const r = engineRig({ chunks: true });
+    await r.engine.prepare();
+    await r.engine.startTake(0);
+    await r.env.advance(10);
+    r.media.recorders[0].dispatchEvent(new Event('error'));
+    await r.env.advance(10);
+    r.media.recorders[2].dispatchEvent(new Event('error'));
+    await r.env.advance(10);
+    await r.stop();
+
+    assert.deepEqual(r.cameraReasons(), ['recorder_error', 'recorder_error']);
+    assert.deepEqual(r.errors, ['recorder_error', null, 'recorder_error']);
+    assert.equal(r.media.recorders.length, 3);
+});
+
+test('an unplugged camera is device_disconnected, and a devicechange that brings it back starts a new run', async () => {
+    const r = engineRig();
+    await r.engine.prepare();
+    await r.engine.startTake(0);
+    await r.env.advance(10);
+    r.media.videoTrack().end();
+    await r.env.advance(10);
+    assert.deepEqual(r.errors, ['device_disconnected']);
+
+    r.media.dispatchEvent(new Event('devicechange'));
+    await r.env.advance(10);
+    await r.stop();
+
+    assert.deepEqual(r.cameraReasons(), ['device_switch', 'stop']);
+    assert.deepEqual(r.errors, ['device_disconnected', null]);
+    assert.equal(r.media.calls(), 2);
+    assert.ok(r.media.acquired.flat().every((track) => track.stopped));
+});
+
+test('a camera chosen mid-take ends the run as device_switch, hands the new stream on and stops the old tracks', async () => {
+    const r = engineRig();
+    await r.engine.prepare();
+    await r.engine.startTake(0);
+    await r.env.advance(10);
+    const switching = r.engine.devices().select('camera', 'cam-2');
+    await r.env.advance(10);
+    await switching;
+
+    assert.deepEqual(r.engine.devices().selected, { camera: 'cam-2' });
+    assert.deepEqual(
+        r.engine.devices().cameras.map((camera) => camera.deviceId),
+        ['cam-1'],
+    );
+    assert.ok(r.media.acquired[0].every((track) => track.stopped));
+    assert.ok(r.media.acquired[1].every((track) => !track.stopped));
+    await r.stop();
+
+    assert.deepEqual(r.cameraReasons(), ['device_switch', 'stop']);
+    assert.deepEqual(r.errors, []);
+    assert.deepEqual(
+        r.streams.map((stream) => stream?.getTracks()[0] ?? null),
+        [r.media.acquired[0][0], r.media.acquired[1][0], null],
+    );
+});
+
+test('a release while the permission of an ended track is read reports nothing afterwards', async () => {
+    const r = engineRig();
+    await r.engine.prepare();
+    r.media.videoTrack().end();
+    r.engine.release();
+    await r.env.advance(10);
+
+    assert.deepEqual(r.errors, []);
+    assert.equal(r.engine.stream, null);
+    assert.equal(
+        r.events.filter(([type]) => type === 'device.permission_lost').length,
+        0,
+    );
 });

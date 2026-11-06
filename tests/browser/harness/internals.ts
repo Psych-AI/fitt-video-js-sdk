@@ -761,6 +761,7 @@ function recordingRig(recipe: string): RecordingRig {
         emit: (type) => events.push(type),
         onError: (code) => errors.push(code),
         ua: navigator.userAgent,
+        doc: document,
     });
 
     return { engine, clock, runs, segments, recorderOptions, errors, events };
@@ -785,12 +786,50 @@ async function startTake(rig: RecordingRig): Promise<boolean> {
 }
 
 /**
+ * Gecko delivers a script-dispatched (untrusted) event to a MediaStreamTrack listener only when
+ * the listener was added with its non-standard fourth argument, `wantsUntrusted` (an `on*`
+ * handler always gets it; probe in the Task 12b PR notes). A real unplug fires a trusted `ended`,
+ * which every listener gets, so the SDK adds its listeners the standard way and only this test
+ * shim, installed while a spec fakes an unplug, asks for untrusted events too. Other engines
+ * ignore the extra argument. Returns the function that puts the original back.
+ */
+function hearScriptTrackEvents(): () => void {
+    const prototype = MediaStreamTrack.prototype;
+    const original = prototype.addEventListener;
+
+    prototype.addEventListener = function (
+        this: MediaStreamTrack,
+        type: string,
+        listener: EventListenerOrEventListenerObject | null,
+        options?: boolean | AddEventListenerOptions,
+    ): void {
+        (original as (...args: unknown[]) => void).call(
+            this,
+            type,
+            listener,
+            options,
+            true,
+        );
+    };
+
+    return () => {
+        prototype.addEventListener = original;
+    };
+}
+
+/**
  * Prepares, records one take for `seconds` and stops it. A take the engine refuses as
  * recorder_unsupported (Linux WebKit, owner decision 2) is stopped at once and records nothing.
+ * Each `...At` is milliseconds after the take started: `switchCameraAt` picks `fake-camera-2`
+ * (the synthetic stream's second camera), `endTrackAt` fires `ended` on the video track (an
+ * unplug), and `deviceBackAt` fires `devicechange` on navigator.mediaDevices.
  */
 export async function recordTake(options: {
     recipe: string;
     seconds: number;
+    switchCameraAt?: number;
+    endTrackAt?: number;
+    deviceBackAt?: number;
 }): Promise<{
     runs: RunRecord[];
     segments: {
@@ -805,13 +844,49 @@ export async function recordTake(options: {
     errors: (ErrorCode | null)[];
     events: string[];
 }> {
+    const restore =
+        options.endTrackAt === undefined ? () => {} : hearScriptTrackEvents();
+
+    try {
+        return await recordWith(options);
+    } finally {
+        restore();
+    }
+}
+
+async function recordWith(
+    options: Parameters<typeof recordTake>[0],
+): ReturnType<typeof recordTake> {
     const rig = recordingRig(options.recipe);
     await rig.engine.prepare();
 
     if (await startTake(rig)) {
+        const actions: Promise<unknown>[] = [];
+        const at = (ms: number | undefined, action: () => unknown): void => {
+            if (ms === undefined) {
+                return;
+            }
+
+            actions.push(
+                new Promise((resolve) => setTimeout(resolve, ms)).then(action),
+            );
+        };
+
+        at(options.switchCameraAt, () =>
+            rig.engine.devices().select('camera', 'fake-camera-2'),
+        );
+        at(options.endTrackAt, () =>
+            rig.engine.stream
+                ?.getVideoTracks()[0]
+                ?.dispatchEvent(new Event('ended')),
+        );
+        at(options.deviceBackAt, () =>
+            navigator.mediaDevices.dispatchEvent(new Event('devicechange')),
+        );
         await new Promise((resolve) =>
             setTimeout(resolve, options.seconds * 1000),
         );
+        await Promise.all(actions);
     }
 
     await rig.engine.stopTake();
