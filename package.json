@@ -24,6 +24,7 @@
         "test": "node --test 'tests/unit/**/*.test.ts'",
         "typecheck": "tsc -p tsconfig.json && tsc -p tests/tsconfig.json",
         "test:browser": "playwright test -c playwright.config.ts",
-        "test:build": "node --test 'tests/build/*.test.ts'"
+        "test:build": "node --test 'tests/build/*.test.ts'",
+        "test:contract": "npm run build && playwright test -c playwright.contract.config.ts"
     }
 }
