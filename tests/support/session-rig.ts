@@ -163,6 +163,20 @@ export function fakeLocks(heldElsewhere: string[] = []): Locks {
 }
 
 /**
+ * A Lock API that is there but refuses: request() and query() reject with a
+ * SecurityError before any callback runs, as in a sandboxed or opaque-origin
+ * frame.
+ */
+export function rejectingLocks(): Locks {
+    const refuse = (): Promise<never> =>
+        Promise.reject(
+            new DOMException('The request was denied.', 'SecurityError'),
+        );
+
+    return { request: refuse, query: refuse } as unknown as Locks;
+}
+
+/**
  * One in-memory BroadcastChannel bus shared by every channel it makes.
  * postMessage(data) delivers {data} on a later microtask to the message
  * listeners of every other open channel of the same name; close() stops a

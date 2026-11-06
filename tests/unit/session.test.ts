@@ -2,7 +2,13 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { resolveSettings } from '../../src/core/options.ts';
 import { resumeWith } from '../../src/core/resume.ts';
-import { createSession, sessionWith } from '../../src/core/session.ts';
+import {
+    createSession,
+    heldSession,
+    lockName,
+    ownsLock,
+    sessionWith,
+} from '../../src/core/session.ts';
 import { MemoryQueueStore, type SessionRecord } from '../../src/core/store.ts';
 import { FittVideo } from '../../src/index.ts';
 import { fakeEnvironment, json, settle, until } from '../support/fake-env.ts';
@@ -16,6 +22,7 @@ import {
     fakeChannels,
     fakeLocks,
     recordTake,
+    rejectingLocks,
     rigSeams,
     router,
     sessionRig,
@@ -1950,5 +1957,296 @@ test('a finalised owner releases the lock: a waiting tab becomes the tombstone',
         (error: unknown) =>
             (error as { detail?: { reason?: string } }).detail?.reason ===
             'finalised',
+    );
+});
+
+test('a hidden owner that is finalised with segments still draining keeps the lock when a visible tab asks', async () => {
+    const store = new MemoryQueueStore();
+    const locks = fakeLocks();
+    const { channel } = fakeChannels();
+    const r = sessionRig({ store, chunks: true, locks, channel });
+    (r.page.doc as { visibilityState: string }).visibilityState = 'hidden';
+    r.respond({
+        '/segments/': () =>
+            json(503, { error: { code: 'http_error', message: 'x' } }),
+    });
+    await recordTake(r, 1000);
+    const finalising = r.session.finalise();
+    await r.env.advance(10);
+    await finalising;
+    assert.ok(r.session.state.upload.backlog > 0);
+    const otherEnv = fakeEnvironment();
+    otherEnv.respond(router());
+    const second = createSession(
+        r.descriptor,
+        {},
+        rigSeams(
+            otherEnv,
+            store,
+            fakeMedia(otherEnv),
+            r.storage,
+            locks,
+            channel,
+        ),
+    );
+    await r.env.advance(100);
+
+    assert.equal(r.session.state.phase, 'stopped');
+    await assert.rejects(
+        second.reset(),
+        (error: unknown) =>
+            (error as { detail?: { reason?: string } }).detail?.reason ===
+            'other_tab',
+    );
+    assert.deepEqual(
+        otherEnv.calls.filter((call) => call.url.includes('/reset')),
+        [],
+    );
+});
+
+test('a page whose Lock API rejects every request owns its session: it sweeps, records and uploads', async () => {
+    const store = new MemoryQueueStore();
+    const idle = {
+        ...descriptorFixture('answer'),
+        session_id: '01jbz8q4w6x0k3m5n7p9r2t4zq',
+    };
+    await store.putSession(
+        sessionRecord({
+            session_id: idle.session_id,
+            descriptor: idle,
+            last_activity_ms: 1_762_400_000_000 - 600_001,
+        }),
+    );
+    const { channel } = fakeChannels();
+    const r = sessionRig({
+        store,
+        chunks: true,
+        locks: rejectingLocks(),
+        channel,
+    });
+    await recordTake(r, 1000);
+    await until(() => r.segmentCalls().length > 0);
+
+    assert.equal(r.session.state.phase, 'stopped');
+    assert.equal(await store.getSession(idle.session_id), undefined);
+    assert.ok(await store.getSession(r.descriptor.session_id));
+});
+
+test('resume() with a Lock API that rejects every request resumes as without locks', async () => {
+    const store = new MemoryQueueStore();
+    const env = fakeEnvironment();
+    env.respond(router());
+    const descriptor = {
+        ...descriptorFixture('monitor'),
+        session_id: '01jbz8q4w6x0k3m5n7p9r2t4zp',
+    };
+    await store.putSession(
+        sessionRecord({
+            session_id: descriptor.session_id,
+            descriptor,
+            take_open: true,
+            take_start_ms: 100,
+        }),
+    );
+    const entries = await resumeWith(
+        {},
+        rigSeams(env, store, fakeMedia(env), new Map(), rejectingLocks()),
+    );
+
+    assert.deepEqual(
+        entries.map((entry) => [entry.state, entry.session !== null]),
+        [['interrupted', true]],
+    );
+});
+
+/** A store whose list is stale: another tab writes `fresh` right after the list is taken, before any lock is granted. */
+class RacedStore extends MemoryQueueStore {
+    fresh: SessionRecord | null = null;
+
+    override async listSessions(): Promise<SessionRecord[]> {
+        const listed = await super.listSessions();
+
+        if (this.fresh !== null) {
+            await super.putSession(this.fresh);
+            this.fresh = null;
+        }
+
+        return listed;
+    }
+}
+
+test('the purge sweep plans from the record read inside the lock, not from the list taken before it', async () => {
+    const store = new RacedStore();
+    const other = {
+        ...descriptorFixture('monitor'),
+        session_id: '01jbz8q4w6x0k3m5n7p9r2t4zn',
+    };
+    const stale = sessionRecord({
+        session_id: other.session_id,
+        descriptor: other,
+        take_open: true,
+        take_start_ms: 100,
+        last_activity_ms: 1_762_400_000_000 - 600_001,
+    });
+    await store.putSession(stale);
+    await store.putSegment(
+        segmentRecord({ session_id: other.session_id, seq: 1 }),
+    );
+    store.fresh = { ...stale, last_activity_ms: 1_762_400_000_000 };
+    const r = sessionRig({ store, locks: fakeLocks() });
+    await r.session.prepare();
+
+    assert.equal(
+        (await store.getSession(other.session_id))?.last_activity_ms,
+        1_762_400_000_000,
+    );
+    assert.equal((await store.listSegments(other.session_id)).length, 1);
+});
+
+test('resume() plans from the record read inside the lock, not from the list taken before it', async () => {
+    const store = new RacedStore();
+    const env = fakeEnvironment();
+    env.respond(router());
+    const descriptor = {
+        ...descriptorFixture('monitor'),
+        session_id: '01jbz8q4w6x0k3m5n7p9r2t4zm',
+    };
+    const stale = sessionRecord({
+        session_id: descriptor.session_id,
+        descriptor,
+        take_open: true,
+        take_start_ms: 100,
+        last_activity_ms: 1_762_400_000_000 - 600_001,
+    });
+    await store.putSession(stale);
+    await store.putSegment(
+        segmentRecord({ session_id: descriptor.session_id, seq: 1 }),
+    );
+    store.fresh = { ...stale, last_activity_ms: 1_762_400_000_000 };
+    const entries = await resumeWith(
+        {},
+        rigSeams(env, store, fakeMedia(env), new Map(), fakeLocks()),
+    );
+
+    assert.deepEqual(
+        entries.map((entry) => entry.state),
+        ['interrupted'],
+    );
+    assert.equal((await store.listSegments(descriptor.session_id)).length, 1);
+});
+
+test('resume() reports owned_elsewhere when another tab takes the lock between the plan and the opening', async () => {
+    const store = new MemoryQueueStore();
+    const env = fakeEnvironment();
+    env.respond(router());
+    const descriptor = {
+        ...descriptorFixture('monitor'),
+        session_id: '01jbz8q4w6x0k3m5n7p9r2t4zk',
+    };
+    await store.putSession(
+        sessionRecord({
+            session_id: descriptor.session_id,
+            descriptor,
+            take_open: true,
+            take_start_ms: 100,
+        }),
+    );
+    const base = fakeLocks();
+    let requests = 0;
+    const locks = {
+        query: () => base.query(),
+        request: (...args: unknown[]) => {
+            requests += 1;
+
+            if (requests === 2) {
+                // Another tab, opened in the gap, takes the lock and keeps it.
+                void base.request(
+                    lockName(descriptor.session_id),
+                    () => new Promise(() => undefined),
+                );
+            }
+
+            return (base.request as (...a: unknown[]) => Promise<unknown>)(
+                ...args,
+            );
+        },
+    } as unknown as typeof base;
+    const entries = await resumeWith(
+        {},
+        rigSeams(env, store, fakeMedia(env), new Map(), locks),
+    );
+
+    assert.deepEqual(entries, [
+        {
+            session_id: descriptor.session_id,
+            state: 'owned_elsewhere',
+            session: null,
+        },
+    ]);
+});
+
+test('a resumed session that gets the lock later finalises only when the record it then reads still says so', async () => {
+    const store = new MemoryQueueStore();
+    const env = fakeEnvironment();
+    env.respond(router());
+    const descriptor = {
+        ...descriptorFixture('monitor'),
+        session_id: '01jbz8q4w6x0k3m5n7p9r2t4zj',
+    };
+    const stopped = sessionRecord({
+        session_id: descriptor.session_id,
+        descriptor,
+        take_start_ms: 100,
+        take_end_ms: 2000,
+        stop_completed: true,
+    });
+    await store.putSession(stopped);
+    const base = fakeLocks();
+    let requests = 0;
+    let releaseOther: () => void = () => undefined;
+    const locks = {
+        query: () => base.query(),
+        request: (...args: unknown[]) => {
+            requests += 1;
+
+            if (requests === 2) {
+                void base.request(
+                    lockName(descriptor.session_id),
+                    () =>
+                        new Promise<void>((release) => {
+                            releaseOther = release;
+                        }),
+                );
+            }
+
+            return (base.request as (...a: unknown[]) => Promise<unknown>)(
+                ...args,
+            );
+        },
+    } as unknown as typeof base;
+    const entries = await resumeWith(
+        {},
+        rigSeams(env, store, fakeMedia(env), new Map(), locks),
+    );
+    // The other tab reset the take and started recording again before it closed.
+    await store.putSession({
+        ...stopped,
+        take: 2,
+        take_open: true,
+        take_end_ms: null,
+        stop_completed: false,
+    });
+    releaseOther();
+    await env.advance(10_000);
+
+    assert.deepEqual(
+        entries.map((entry) => entry.state),
+        ['owned_elsewhere'],
+    );
+    const waiting = heldSession(descriptor.session_id);
+    assert.ok(waiting !== undefined && ownsLock(waiting));
+    assert.deepEqual(
+        env.calls.filter((call) => call.url.endsWith('/finalise')),
+        [],
     );
 });

@@ -8,6 +8,7 @@ import {
     browserSeams,
     epochKey,
     heldSession,
+    lockDecided,
     lockName,
     openResumed,
     ownsLock,
@@ -61,7 +62,19 @@ async function lockHeld(
         return false;
     }
 
-    const snapshot = await locks.query();
+    let snapshot: Awaited<
+        ReturnType<NonNullable<SessionSeams['locks']>['query']>
+    >;
+
+    try {
+        snapshot = await locks.query();
+    } catch (error) {
+        // The Lock API is there but refuses (a sandboxed or opaque-origin
+        // frame): as without locks, no other tab is known to hold it.
+        console.error(error);
+
+        return false;
+    }
 
     return (snapshot.held ?? []).some(
         (lock) => lock.name === lockName(sessionId),
@@ -203,7 +216,13 @@ export async function resumeWith(
             seams.locks,
             record.session_id,
             async () => {
-                opened = await planOne(env, store, seams.storage, record);
+                // Planned from the record read inside the lock: a tab that held
+                // it until now may have written the record since the list.
+                const fresh = await store.getSession(record.session_id);
+
+                if (fresh !== undefined) {
+                    opened = await planOne(env, store, seams.storage, fresh);
+                }
             },
         );
 
@@ -220,15 +239,20 @@ export async function resumeWith(
         const chosen = opened as Opened | null;
 
         if (chosen !== null) {
+            const session = openResumed(
+                chosen.descriptor,
+                options,
+                shared,
+                chosen.opening,
+            );
+            // The lock was free a moment ago, but the session asks for it again:
+            // a tab that took it in between owns the session, and this object
+            // waits as a bystander.
+            const owns = await lockDecided(session);
             entries.push({
                 session_id: record.session_id,
-                state: chosen.state,
-                session: openResumed(
-                    chosen.descriptor,
-                    options,
-                    shared,
-                    chosen.opening,
-                ),
+                state: owns ? chosen.state : 'owned_elsewhere',
+                session: owns ? session : null,
             });
         }
     }

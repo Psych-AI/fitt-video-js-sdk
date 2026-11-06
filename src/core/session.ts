@@ -274,18 +274,34 @@ export async function underLock(
     }
 
     let granted = false;
-    await locks.request(
-        lockName(sessionId),
-        { ifAvailable: true },
-        async (lock) => {
-            if (lock === null) {
-                return;
-            }
+    let entered = false;
 
-            granted = true;
-            await work();
-        },
-    );
+    try {
+        await locks.request(
+            lockName(sessionId),
+            { ifAvailable: true },
+            async (lock) => {
+                entered = true;
+
+                if (lock === null) {
+                    return;
+                }
+
+                granted = true;
+                await work();
+            },
+        );
+    } catch (error) {
+        if (entered) {
+            throw error;
+        }
+
+        // The Lock API is there but refuses every request (a sandboxed or
+        // opaque-origin frame rejects with SecurityError): as without locks.
+        await work();
+
+        return true;
+    }
 
     return granted;
 }
@@ -479,6 +495,14 @@ export function ownsLock(session: FittSession): boolean {
     return owners.get(session)?.() ?? true;
 }
 
+/** Each session object's first lock answer: true when it took the lock (or runs without locks). */
+const lockDecisions = new WeakMap<FittSession, Promise<boolean>>();
+
+/** Resolves once the session's first lock request is answered: true when it owns the session. */
+export function lockDecided(session: FittSession): Promise<boolean> {
+    return lockDecisions.get(session) ?? Promise.resolve(true);
+}
+
 /** The same-id map: one session object per session id in this page. */
 const sessions = new Map<string, FittSession>();
 
@@ -599,7 +623,8 @@ export function createSession(
     let pipelineStarted = false;
 
     // One owning tab (author's call 15).
-    const locks = seams.locks;
+    /** Set to null when the Lock API rejects its requests: the session then runs as without locks. */
+    let locks = seams.locks;
     /** This tab holds the session's Web Lock; without locks every session owns its id. */
     let owner = locks === null;
     /** Settles the promise the lock callback returned, which hands the lock to the next waiting request. */
@@ -773,21 +798,37 @@ export function createSession(
     const purgeSweep = async (): Promise<void> => {
         const nowMs = env.dateNow();
 
-        for (const stored of await store.listSessions()) {
-            const plan = planResume(stored, nowMs);
-            const keepOwed =
-                (plan === 'discard' || plan === 'reset') &&
-                nowMs - stored.last_activity_ms >
-                    stored.descriptor.queue.abandon_after_ms;
-
-            if (plan !== 'purge' && !keepOwed) {
+        for (const listed of await store.listSessions()) {
+            if (sweepPlan(listed, nowMs) === null) {
                 continue;
             }
 
-            await underLock(seams.locks, stored.session_id, () =>
-                sweepOne(stored, plan, nowMs),
-            );
+            await underLock(seams.locks, listed.session_id, async () => {
+                // Read again inside the lock: a tab that held it until now may
+                // have written the record since the list was taken.
+                const stored = await store.getSession(listed.session_id);
+                const plan =
+                    stored === undefined ? null : sweepPlan(stored, nowMs);
+
+                if (stored !== undefined && plan !== null) {
+                    await sweepOne(stored, plan, nowMs);
+                }
+            });
         }
+    };
+
+    /** What the purge sweep does with a stored session: null when it is left alone. */
+    const sweepPlan = (
+        stored: SessionRecord,
+        nowMs: number,
+    ): ReturnType<typeof planResume> | null => {
+        const plan = planResume(stored, nowMs);
+        const keepOwed =
+            (plan === 'discard' || plan === 'reset') &&
+            nowMs - stored.last_activity_ms >
+                stored.descriptor.queue.abandon_after_ms;
+
+        return plan === 'purge' || keepOwed ? plan : null;
     };
 
     /** One stored session the purge sweep deletes, or keeps as a record with no media. */
@@ -2589,6 +2630,12 @@ export function createSession(
             return;
         }
 
+        if (autoFinalise) {
+            // The record read now decides: a tab that held the lock until now
+            // may have reset or reopened the take resume() planned to finalise.
+            autoFinalise = planResume(held, env.dateNow()) === 'finalise';
+        }
+
         build();
 
         if (held.pending_discard) {
@@ -2662,8 +2709,11 @@ export function createSession(
     /** One ifAvailable request: true when this tab now holds the lock. The session never awaits a held lock's promise. */
     const requestLock = (): Promise<boolean> =>
         new Promise<boolean>((resolve) => {
+            let entered = false;
             (locks as NonNullable<SessionSeams['locks']>)
                 .request(lockName(sessionId), { ifAvailable: true }, (lock) => {
+                    entered = true;
+
                     if (lock === null) {
                         resolve(false);
 
@@ -2674,7 +2724,19 @@ export function createSession(
                 })
                 .catch((error: unknown) => {
                     console.error(error);
-                    resolve(false);
+
+                    if (entered) {
+                        return;
+                    }
+
+                    // The Lock API is there but refuses every request (a sandboxed
+                    // or opaque-origin frame rejects with SecurityError). No other
+                    // tab is involved, so this tab owns the session, as without locks.
+                    locks = null;
+                    owner = true;
+                    relay?.close();
+                    relay = null;
+                    resolve(true);
                 });
         });
 
@@ -2733,7 +2795,8 @@ export function createSession(
     /**
      * A visible tab asked for the lock. A hidden owner that is not counting
      * down, recording or stopping (and has no prepare, reset, discard,
-     * finalise or manifest in flight) freezes its waiting events, stops its
+     * finalise or manifest in flight, and is neither finalised nor owed a
+     * finalise) freezes its waiting events, stops its
      * keeper, uploader and batcher, and only then releases the lock and
      * queues a waiting request again, so the visible tab's request is first.
      */
@@ -2757,6 +2820,11 @@ export function createSession(
             discarding !== null ||
             resetting !== null ||
             finalising ||
+            // Finalised but not yet the tombstone (its backlog still drains), or
+            // owed a finalise by resume(): only this tab knows it, so it keeps the
+            // lock until the tombstone releases it.
+            finalised ||
+            autoFinalise ||
             preparing !== null ||
             manifestsInFlight.size > 0 ||
             phase === 'preparing' ||
@@ -2870,6 +2938,11 @@ export function createSession(
         }
     };
 
+    let decideLock: (owns: boolean) => void = () => undefined;
+    const lockDecision = new Promise<boolean>((resolve) => {
+        decideLock = resolve;
+    });
+
     let ready: Promise<void> = (async () => {
         if (seams.store !== undefined) {
             store = seams.store;
@@ -2895,14 +2968,21 @@ export function createSession(
 
             if (!(await requestLock())) {
                 becomeBystander();
+                decideLock(false);
 
                 return;
             }
         }
 
+        decideLock(true);
         await takeOwnership();
     })();
     ready.catch(reportReady);
+    // A ready that failed before the lock was asked for still answers (a no-op once answered).
+    void ready.then(
+        () => decideLock(owner),
+        () => decideLock(owner),
+    );
 
     /** Waits for the current ready promise, and again whenever a grant or a hand-over replaced it meanwhile. */
     async function whenReady(): Promise<void> {
@@ -3574,6 +3654,7 @@ export function createSession(
     });
 
     owners.set(created, () => owner);
+    lockDecisions.set(created, lockDecision);
 
     return created;
 }
