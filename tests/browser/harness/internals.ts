@@ -21,7 +21,11 @@ import {
 import { createTokenKeeper } from '../../../src/core/token.ts';
 import { ulid } from '../../../src/core/ulid.ts';
 import { createUploader } from '../../../src/core/uploader.ts';
-import { eventsRequest, jsonRequest } from '../../../src/core/wire.ts';
+import {
+    eventsRequest,
+    jsonRequest,
+    segmentPut,
+} from '../../../src/core/wire.ts';
 import { STORE_CASES } from '../../shared/store-suite.ts';
 
 export const ready = true;
@@ -208,8 +212,10 @@ export async function requestErrorProbe(): Promise<string> {
     }
 }
 
-export { segmentPost, segmentPut } from '../../../src/core/wire.ts';
-export { browserEnvironment, jsonRequest, send, sha256Hex };
+export { createSessionApi } from '../../../src/core/api.ts';
+export { buildManifest } from '../../../src/core/manifest.ts';
+export { segmentPost } from '../../../src/core/wire.ts';
+export { browserEnvironment, jsonRequest, segmentPut, send, sha256Hex };
 
 /** The bytes of a base64 string: a spec hands fixture bytes to the page as base64. */
 export function fromBase64(text: string): ArrayBuffer {
@@ -524,4 +530,129 @@ export async function runBatches(options: {
         await token.stop();
         store.close();
     }
+}
+
+/**
+ * PUTs small byte arrays as seq 0 (init) and media seqs on one new run of
+ * the descriptor's take, with the timing rule of runUploader(): seq 0 at
+ * start_ms 12 with duration 0 and the init headers, seq n at
+ * 12 + (n - 1) * 5000 for 5000 ms. Seqs in `skip` get a pending record but
+ * are never sent. Returns the records (sent ones delivered) with the run
+ * record they share as `run`; throws when a PUT is not answered 2xx.
+ */
+export async function putFixtureSegments(options: {
+    descriptor: Descriptor;
+    track: TrackName;
+    seqs: number[];
+    skip?: number[];
+}): Promise<SegmentRecord[] & { run: RunRecord }> {
+    const { descriptor, track } = options;
+    const env = browserEnvironment();
+    const target = descriptor.tracks.find(
+        (candidate) => candidate.track === track,
+    );
+
+    if (target === undefined) {
+        throw new Error(`The descriptor has no ${track} track.`);
+    }
+
+    const mime =
+        track === 'audio'
+            ? 'audio/webm;codecs=opus'
+            : 'video/webm;codecs=vp8,opus';
+    const run: RunRecord = {
+        session_id: descriptor.session_id,
+        track,
+        take: descriptor.take,
+        run_index: 0,
+        run_id: ulid(env),
+        anchor_ms: 12,
+        anchor_source: 'performance',
+        mime_type: mime,
+        started_ms: 10,
+        ended_ms: 12 + Math.max(0, ...options.seqs) * 5000,
+        ended_reason: 'stop',
+        segmenting: 'cluster',
+        keyframe_option_honoured: null,
+        ua: navigator.userAgent,
+    };
+    const token = { id: descriptor.token.id, secret: descriptor.token.secret };
+    const records: SegmentRecord[] = [];
+
+    for (const seq of options.seqs) {
+        const data = new Uint8Array(16).fill(seq + 1).buffer;
+        const sha256 = await sha256Hex(data);
+        const init =
+            seq === 0
+                ? {
+                      anchor_ms: 12,
+                      anchor_source: 'performance' as const,
+                      mime,
+                      started_ms: 10,
+                  }
+                : null;
+        const record: SegmentRecord = {
+            session_id: descriptor.session_id,
+            track,
+            take: descriptor.take,
+            run_index: 0,
+            run_id: run.run_id,
+            seq,
+            kind: seq === 0 ? 'init' : 'media',
+            start_ms: seq === 0 ? 12 : 12 + (seq - 1) * 5000,
+            duration_ms: seq === 0 ? 0 : 5000,
+            recorded_at: Date.now(),
+            bytes: data.byteLength,
+            sha256,
+            part_count: 1,
+            created_ms: 0,
+            state: 'pending',
+            failures: 0,
+            init,
+            data,
+        };
+
+        if (!(options.skip ?? []).includes(seq)) {
+            const answer = await send(
+                env,
+                segmentPut(
+                    target.upload.url,
+                    token,
+                    {
+                        take: record.take,
+                        run: record.run_id,
+                        seq,
+                        kind: record.kind,
+                        startMs: record.start_ms,
+                        durationMs: record.duration_ms,
+                        recordedAt: record.recorded_at,
+                        sha256,
+                        init:
+                            init === null
+                                ? undefined
+                                : {
+                                      anchorMs: init.anchor_ms,
+                                      anchorSource: init.anchor_source,
+                                      mime: init.mime,
+                                      startedMs: init.started_ms,
+                                  },
+                    },
+                    data,
+                ),
+            );
+
+            if (answer.status < 200 || answer.status >= 300) {
+                throw new Error(
+                    `PUT seq ${seq} answered ${answer.status}: ${JSON.stringify(answer.body)}`,
+                );
+            }
+
+            record.state = 'delivered';
+            record.data = null;
+        }
+
+        records.push(record);
+    }
+
+    return Object.assign(records, { run });
 }
