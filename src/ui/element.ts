@@ -1,5 +1,5 @@
 import type { ChecksResult } from '../core/checks.ts';
-import type { TrackName } from '../core/descriptor.ts';
+import type { RecordingLimits, TrackName } from '../core/descriptor.ts';
 import type { SdkEvent } from '../core/events.ts';
 import type { Milestone } from '../core/lifecycle.ts';
 import { takeView, type FittSession } from '../core/session.ts';
@@ -58,6 +58,51 @@ export function formatClock(ms: number, round: 'down' | 'up' = 'down'): string {
     return hours > 0
         ? `${hours}:${String(minutes).padStart(2, '0')}:${rest}`
         : `${minutes}:${rest}`;
+}
+
+/** Where the remaining time and the progress bar stand, as the element draws them. */
+export interface TakeClock {
+    remainingMs: number;
+    stage: 'normal' | 'warning' | 'grace';
+    fillPercent: number;
+    minPercent: number;
+    warningPercent: number;
+}
+
+/**
+ * The remaining time and the bar for a take `elapsedMs` in. The forced stop
+ * lands at the earlier of `max + extension` and `capStopAfterMs` (the cap's
+ * forced stop, measured from the take start; author's call 6), so the
+ * countdown reaches 0:00 and the bar fills when the forced stop lands, also
+ * when the cap wins.
+ */
+export function takeClock(
+    limits: RecordingLimits,
+    elapsedMs: number,
+    capStopAfterMs: number,
+): TakeClock {
+    const max = limits.max_duration_ms;
+    const warningMs = limits.warning_before_end_ms;
+    const forcedStop = Math.min(max + limits.extension_ms, capStopAfterMs);
+    // The bar runs to the limit, or to the cap's stop when that comes first.
+    const barEnd = Math.min(max, forcedStop);
+    const inGrace = max > 0 && elapsedMs >= max;
+    const remainingMs = (inGrace ? forcedStop : barEnd) - elapsedMs;
+    const stage = inGrace
+        ? 'grace'
+        : warningMs > 0 && barEnd > 0 && remainingMs <= warningMs
+          ? 'warning'
+          : 'normal';
+    const percent = (ms: number): number =>
+        barEnd > 0 ? Math.min(100, Math.max(0, (ms / barEnd) * 100)) : 100;
+
+    return {
+        remainingMs,
+        stage,
+        fillPercent: percent(elapsedMs),
+        minPercent: percent(limits.min_duration_ms),
+        warningPercent: percent(barEnd - warningMs),
+    };
 }
 
 function controlsOf(value: string | null): Controls {
@@ -707,30 +752,31 @@ function createRecorderClass(): CustomElementConstructor {
                 pieces.markerWarning !== null
             ) {
                 const max = limits?.max_duration_ms ?? 0;
-                const extension = limits?.extension_ms ?? 0;
                 const warningMs = limits?.warning_before_end_ms ?? 0;
                 const minMs = limits?.min_duration_ms ?? 0;
-                const inGrace = max > 0 && elapsed >= max;
-                const left = inGrace
-                    ? max + extension - elapsed
-                    : max - elapsed;
-                const stage = inGrace
-                    ? 'grace'
-                    : warningMs > 0 && max > 0 && left <= warningMs
-                      ? 'warning'
-                      : 'normal';
-                const shown = live && limits !== null && max > 0;
+                const capStopAfter =
+                    view !== null && takeStart !== null
+                        ? view.capStopMs - takeStart
+                        : Infinity;
+                const clock =
+                    limits !== null
+                        ? takeClock(limits, elapsed, capStopAfter)
+                        : null;
+                const shown = live && clock !== null && max > 0;
 
                 pieces.progress.hidden = !shown;
                 pieces.remaining.hidden = !shown;
-                pieces.progress.dataset.stage = stage;
-                pieces.remaining.dataset.stage = stage;
-                pieces.remainingDigits.textContent = formatClock(left, 'up');
-                pieces.fill.style.width = `${max > 0 ? Math.min(100, (elapsed / max) * 100) : 0}%`;
+                pieces.progress.dataset.stage = clock?.stage ?? 'normal';
+                pieces.remaining.dataset.stage = clock?.stage ?? 'normal';
+                pieces.remainingDigits.textContent = formatClock(
+                    clock?.remainingMs ?? 0,
+                    'up',
+                );
+                pieces.fill.style.width = `${max > 0 ? (clock?.fillPercent ?? 0) : 0}%`;
                 pieces.markerMin.hidden = minMs <= 0 || max <= 0;
-                pieces.markerMin.style.left = `${max > 0 ? Math.min(100, (minMs / max) * 100) : 0}%`;
+                pieces.markerMin.style.left = `${clock?.minPercent ?? 0}%`;
                 pieces.markerWarning.hidden = warningMs <= 0 || max <= 0;
-                pieces.markerWarning.style.left = `${max > 0 ? Math.max(0, ((max - warningMs) / max) * 100) : 0}%`;
+                pieces.markerWarning.style.left = `${clock?.warningPercent ?? 0}%`;
             }
 
             if (pieces.meter !== null) {

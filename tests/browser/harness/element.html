@@ -108,6 +108,7 @@
 
             window.mount = ({
                 recording,
+                clock,
                 controls,
                 mirror,
                 statusBody,
@@ -117,6 +118,7 @@
                 const descriptor = {
                     ...base,
                     recording: { ...base.recording, ...(recording ?? {}) },
+                    clock: { ...base.clock, ...(clock ?? {}) },
                 };
                 const session = FittVideo.session(descriptor, {
                     environment: { fetch: answer(statusBody) },

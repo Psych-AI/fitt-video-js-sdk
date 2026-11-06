@@ -72,7 +72,7 @@ export interface LifecycleDeps {
 }
 
 /** The forced stop comes this long before the session cap (author's call 6). */
-const CAP_MARGIN_MS = 1000;
+export const CAP_MARGIN_MS = 1000;
 
 /** One countdown step. */
 const SECOND_MS = 1000;

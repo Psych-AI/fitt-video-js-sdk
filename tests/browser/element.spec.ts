@@ -378,3 +378,54 @@ test('removing the element mid-take hands the stall watch back to the session', 
         ),
     ).toBe(1);
 });
+
+test('when the session cap stops the take, the remaining time and the bar run to the cap', async ({
+    page,
+    browserName,
+}) => {
+    await installMedia(page, browserName);
+    await openHarness(page, '/tests/browser/harness/element.html');
+    // Max equals the cap, as in monitor and conversation, so a take that starts late is stopped by the cap.
+    const recording = {
+        countdown_ms: 1000,
+        min_duration_ms: 1000,
+        max_duration_ms: 9000,
+        extension_ms: 0,
+        warning_before_end_ms: 0,
+    };
+    await page.evaluate(
+        (recording) =>
+            window.mount({
+                recording,
+                clock: { session_cap_ms: 9000 },
+                controls: 'full',
+            }),
+        recording,
+    );
+    const recorder = page.locator('fitt-recorder');
+    await expect(recorder).toHaveAttribute('data-phase', 'ready');
+    await page.waitForTimeout(3000); // time on the setup screen counts toward the cap
+    await recorder.locator('[part=record]').click();
+    await expect(recorder).toHaveAttribute('data-phase', 'recording');
+
+    // The take started at 4 s or later, so the cap's stop (8 s) is at most 4 s away, not the maximum's 9 s.
+    await expect(recorder.locator('[part=remaining]')).toHaveText(/^0:0[0-4]$/);
+    await expect(recorder.locator('[part=remaining]')).toHaveText('0:01', {
+        timeout: 5000,
+    });
+    const fill = await recorder.evaluate((el) =>
+        parseFloat(
+            (
+                el.shadowRoot!.querySelector(
+                    '[part=progress] .fill',
+                ) as HTMLElement | null
+            )?.style.width ?? '0',
+        ),
+    );
+    expect(fill).toBeGreaterThan(70);
+    await expect(recorder).toHaveAttribute(
+        'data-error',
+        'session_cap_reached',
+        { timeout: 5000 },
+    );
+});

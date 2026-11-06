@@ -13,6 +13,8 @@ interface Window {
     /** element.html: mounts one <fitt-recorder> over a session whose every API call is answered locally. */
     mount(options: {
         recording?: Record<string, number>;
+        /** Merged into the descriptor's clock, e.g. a short session_cap_ms. */
+        clock?: Record<string, number>;
         controls?: string;
         mirror?: string;
         statusBody?: unknown;

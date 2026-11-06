@@ -53,6 +53,7 @@ import { createEventBus, type SdkEvent } from './events.ts';
 import { send, type WireAnswer } from './http.ts';
 import { createLadder, type Ladder } from './ladder.ts';
 import {
+    CAP_MARGIN_MS,
     createLifecycle,
     type Lifecycle,
     type Milestone,
@@ -508,6 +509,8 @@ export interface TakeView {
     recording: RecordingLimits;
     /** Session time of the current take's `started` milestone, or null when no take is open. */
     takeStartMs: number | null;
+    /** Session time of the cap's forced stop: `session_cap_ms` less the lifecycle's margin (author's call 6). */
+    capStopMs: number;
 }
 
 /** Each session object's take view, for the element. */
@@ -3673,6 +3676,7 @@ export function createSession(
     takeViews.set(created, () => ({
         recording: recordingLimits(),
         takeStartMs: lifecycle?.takeStartMs() ?? null,
+        capStopMs: cap - CAP_MARGIN_MS,
     }));
 
     return created;
