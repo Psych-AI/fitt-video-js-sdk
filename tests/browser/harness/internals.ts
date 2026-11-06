@@ -1,12 +1,23 @@
 /** What the browser specs call through `window.internals`. Later tasks add the functions their specs need. */
+import { sha256Hex } from '../../../src/core/crypto.ts';
+import type { Descriptor, TrackName } from '../../../src/core/descriptor.ts';
+import { browserEnvironment } from '../../../src/core/env.ts';
+import { send } from '../../../src/core/http.ts';
+import { createLadder } from '../../../src/core/ladder.ts';
+import { createQueue } from '../../../src/core/queue.ts';
 import {
+    MemoryQueueStore,
     openIdbStore,
     transaction,
     type BatchRecord,
     type RunRecord,
     type SegmentRecord,
+    type SegmentState,
     type SessionRecord,
 } from '../../../src/core/store.ts';
+import { createTokenKeeper } from '../../../src/core/token.ts';
+import { createUploader } from '../../../src/core/uploader.ts';
+import { jsonRequest } from '../../../src/core/wire.ts';
 import { STORE_CASES } from '../../shared/store-suite.ts';
 
 export const ready = true;
@@ -193,10 +204,8 @@ export async function requestErrorProbe(): Promise<string> {
     }
 }
 
-export { sha256Hex } from '../../../src/core/crypto.ts';
-export { browserEnvironment } from '../../../src/core/env.ts';
-export { send } from '../../../src/core/http.ts';
 export { segmentPost, segmentPut } from '../../../src/core/wire.ts';
+export { browserEnvironment, jsonRequest, send, sha256Hex };
 
 /** The bytes of a base64 string: a spec hands fixture bytes to the page as base64. */
 export function fromBase64(text: string): ArrayBuffer {
@@ -208,4 +217,134 @@ export function fromBase64(text: string): ArrayBuffer {
     }
 
     return bytes.buffer;
+}
+
+/** One segment a contract spec hands the page: its bytes as base64. */
+export interface UploaderSegment {
+    track: TrackName;
+    take: number;
+    run: string;
+    seq: number;
+    kind: 'init' | 'media';
+    base64: string;
+}
+
+/**
+ * Runs the real uploader against the server for up to `seconds`: a memory
+ * store, the queue, a token keeper and a ladder over the browser's own
+ * environment. Each segment becomes a full SegmentRecord with the timing
+ * rule of tests/support/records.ts segmentRecord(), which a page cannot
+ * import. Returns what the uploader emitted and the stored states.
+ */
+export async function runUploader(options: {
+    descriptor: Descriptor;
+    segments: UploaderSegment[];
+    seconds: number;
+    currentTake?: number;
+}): Promise<{
+    events: [string, Record<string, unknown>][];
+    states: [TrackName, number, SegmentState][];
+    behind: number[];
+}> {
+    const { descriptor } = options;
+    const env = browserEnvironment();
+    const store = new MemoryQueueStore();
+    const queue = createQueue(store, {
+        abandonAfterMs: descriptor.queue.abandon_after_ms,
+        budgetBytes: descriptor.queue.buffer_budget_bytes,
+        perfNow: () => performance.now(),
+    });
+    const events: [string, Record<string, unknown>][] = [];
+    const behind: number[] = [];
+    const emit = (type: string, payload: Record<string, unknown>): void => {
+        events.push([type, payload]);
+    };
+    const token = createTokenKeeper({
+        env,
+        descriptor,
+        refresh: (used) =>
+            send(
+                env,
+                jsonRequest(
+                    `${descriptor.endpoints.api}/sessions/${descriptor.session_id}/refresh-upload`,
+                    used,
+                    'POST',
+                ),
+            ),
+        onDescriptor: () => {},
+        emit,
+        setError: () => {},
+    });
+    const ladder = createLadder({
+        rung: 'put',
+        everSucceeded: false,
+        persist: async () => {},
+        emit,
+    });
+    const uploader = createUploader({
+        env,
+        store,
+        queue,
+        now: () => Math.floor(performance.now()),
+        tracks: () => descriptor.tracks,
+        token,
+        ladder,
+        emit,
+        onAbandon: () => {},
+        currentTake: () => options.currentTake ?? descriptor.take,
+        onTakeBehind: (take) => behind.push(take),
+        warn: (message) => console.warn(message),
+    });
+
+    for (const segment of options.segments) {
+        const data = fromBase64(segment.base64);
+        const record: SegmentRecord = {
+            session_id: descriptor.session_id,
+            track: segment.track,
+            take: segment.take,
+            run_index: 0,
+            run_id: segment.run,
+            seq: segment.seq,
+            kind: segment.kind,
+            start_ms: segment.seq === 0 ? 12 : 12 + (segment.seq - 1) * 5000,
+            duration_ms: segment.seq === 0 ? 0 : 5000,
+            recorded_at: Date.now(),
+            bytes: data.byteLength,
+            sha256: await sha256Hex(data),
+            part_count: 1,
+            created_ms: 0,
+            state: 'pending',
+            failures: 0,
+            init:
+                segment.seq === 0
+                    ? {
+                          anchor_ms: 12,
+                          anchor_source: 'performance',
+                          mime: 'video/webm;codecs=vp8,opus',
+                          started_ms: 10,
+                      }
+                    : null,
+            data,
+        };
+        await queue.add(record);
+        uploader.enqueue(record);
+    }
+
+    uploader.start();
+    await Promise.race([
+        uploader.idle(),
+        new Promise<void>((resolve) =>
+            setTimeout(resolve, options.seconds * 1000),
+        ),
+    ]);
+    await uploader.stop();
+    await token.stop();
+
+    return {
+        events,
+        states: (await store.listSegments(descriptor.session_id)).map(
+            (record) => [record.track, record.seq, record.state],
+        ),
+        behind,
+    };
 }
