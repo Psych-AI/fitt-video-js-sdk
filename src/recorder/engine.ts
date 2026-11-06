@@ -8,6 +8,7 @@ import type {
     RunRecord,
     SegmentRecord,
 } from '../core/store.ts';
+import { createAudioGraph, type AudioGraph } from './audio.ts';
 import {
     acquire,
     permissionState,
@@ -21,8 +22,10 @@ import { createRun, type RecorderFactory, type Run } from './run.ts';
 export interface RecorderEngine extends TakeEngine {
     prepare(): Promise<void>;
     readonly stream: MediaStream | null;
-    /** Stops every track it acquired (Task 13 adds the audio graph). stopTake() calls it too. */
+    /** Stops every track it acquired and closes the audio graph. stopTake() calls it too. */
     release(): void;
+    /** The graph built by prepare(); null before it, after release(), and without createAudioContext. */
+    audio(): AudioGraph | null;
     devices(): DevicesView;
     /** End every open run with this reason and start new ones on the same take (clock jump, device change). */
     restartRuns(reason: RunEndedReason): Promise<void>;
@@ -38,8 +41,12 @@ export interface RecorderEngineDeps {
     recorderFactory: RecorderFactory;
     isTypeSupported(type: string): boolean;
     bitrates(track: ChunkedTrack): { video?: number; audio: number };
-    /** The camera track's audio: the microphone, or the mix (Task 13). */
+    /** The camera track's audio when there is no audio graph: the microphone as is. */
     cameraAudio(stream: MediaStream): MediaStreamTrack[];
+    /** `() => new AudioContext()` in the browser; absent or null means no graph (Node tests). */
+    createAudioContext?: (() => AudioContext) | null;
+    /** Every microphone sample of the graph, for the session's silence detector (Task 15). */
+    onSample?(level: number, tMs: number): void;
     /** `(tracks) => new MediaStream(tracks)` in the browser; the audio run gets its own stream. */
     makeStream(tracks: MediaStreamTrack[]): MediaStream;
     /** navigator.permissions, for device.permission_granted; undefined where it is missing. */
@@ -112,6 +119,12 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
     let watchingPage = false;
     let settingsTimer: number | null = null;
     let lastSettings: VideoSettings | null = null;
+    /** The meter and the mix, built at the first acquire of a capture and closed at release(). */
+    let graph: AudioGraph | null = null;
+    const stereo = deps.tracks.some(
+        (track) =>
+            track.track === 'camera' && track.capture.audio.channels === 2,
+    );
     const permissions: Record<
         'camera' | 'microphone',
         PermissionState | 'unknown'
@@ -383,9 +396,57 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
         acquired.push(next);
         watchTracks(next);
         watchPage();
+        follow(next);
         deps.onStream?.(next);
 
         return previous;
+    }
+
+    /**
+     * The graph listens to the stream just adopted: built on the first
+     * acquire after a release, pointed at the new microphone after a device
+     * switch or a return from the background.
+     */
+    function follow(next: MediaStream): void {
+        if (graph !== null) {
+            graph.setMicrophone(next);
+
+            return;
+        }
+
+        const createContext = deps.createAudioContext;
+
+        if (createContext === undefined || createContext === null) {
+            return;
+        }
+
+        try {
+            graph = createAudioGraph({
+                env: deps.env,
+                clock: deps.clock,
+                microphone: next,
+                stereo,
+                createContext,
+                doc: deps.doc,
+                onSample: (level, tMs) => deps.onSample?.(level, tMs),
+            });
+        } catch (error) {
+            // No meter is better than no recording: the camera run then records the microphone as is.
+            graph = null;
+            console.warn(
+                'Fitt Video: the audio graph could not be built.',
+                error,
+            );
+        }
+    }
+
+    function closeGraph(): void {
+        const closing = graph;
+        graph = null;
+
+        if (closing !== null) {
+            void closing.close().catch(() => undefined);
+        }
     }
 
     function retire(previous: MediaStream | null): void {
@@ -451,6 +512,7 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
         acquired = [];
         stream = null;
         suspended = null;
+        closeGraph();
 
         if (held !== null) {
             deps.onStream?.(null);
@@ -465,7 +527,9 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
 
         return deps.makeStream([
             ...source.getVideoTracks(),
-            ...deps.cameraAudio(source),
+            ...(graph === null
+                ? deps.cameraAudio(source)
+                : graph.cameraAudio()),
         ]);
     }
 
@@ -739,6 +803,15 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
                 });
             }
 
+            // The start gesture lets a suspended context run; never more than a short wait.
+            await graph?.resume();
+
+            if (stream === null) {
+                throw new FittVideoError('invalid_state', {
+                    reason: 'released',
+                });
+            }
+
             currentTake = deps.take();
             recording = true;
 
@@ -767,6 +840,10 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
         },
 
         release,
+
+        audio(): AudioGraph | null {
+            return graph;
+        },
 
         devices(): DevicesView {
             return {

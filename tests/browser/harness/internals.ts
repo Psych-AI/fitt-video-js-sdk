@@ -13,6 +13,7 @@ import { createEventBus } from '../../../src/core/events.ts';
 import { send } from '../../../src/core/http.ts';
 import { createLadder } from '../../../src/core/ladder.ts';
 import { createQueue } from '../../../src/core/queue.ts';
+import type { Phase } from '../../../src/core/state.ts';
 import {
     MemoryQueueStore,
     openIdbStore,
@@ -35,6 +36,7 @@ import {
     createRecorderEngine,
     type RecorderEngine,
 } from '../../../src/recorder/engine.ts';
+import { createSilenceDetector } from '../../../src/recorder/silence.ts';
 import answerDescriptor from '../../fixtures/descriptor-answer.json';
 import conversationDescriptor from '../../fixtures/descriptor-conversation.json';
 import monitorDescriptor from '../../fixtures/descriptor-monitor.json';
@@ -701,16 +703,32 @@ interface RecordingRig {
     events: string[];
 }
 
+/** What an audio spec adds to a recording rig. */
+interface RigAudio {
+    /** Builds the engine's audio graph on a new AudioContext. */
+    audio?: boolean;
+    onSample?(level: number, tMs: number): void;
+    /** Every stream a recorder is made for, with its options. */
+    onRecorder?(stream: MediaStream, options: MediaRecorderOptions): void;
+}
+
 /**
  * The real recorder engine over the browser: navigator.mediaDevices, MediaRecorder (each
  * constructor's options recorded), MediaStream and navigator.permissions, on a recipe's fixture
- * descriptor. Where MediaRecorder is missing, the factory throws as the real constructor would.
+ * descriptor (or a descriptor built by the spec). Where MediaRecorder is missing, the factory
+ * throws as the real constructor would.
  */
-function recordingRig(recipe: string): RecordingRig {
-    const descriptor = RECORDING_DESCRIPTORS[recipe];
+function recordingRig(
+    recipe: string | Descriptor,
+    extra: RigAudio = {},
+): RecordingRig {
+    const descriptor =
+        typeof recipe === 'string' ? RECORDING_DESCRIPTORS[recipe] : recipe;
 
     if (descriptor === undefined) {
-        throw new Error(`No recording descriptor is named "${recipe}".`);
+        throw new Error(
+            `No recording descriptor is named "${String(recipe)}".`,
+        );
     }
 
     const env = browserEnvironment();
@@ -733,6 +751,7 @@ function recordingRig(recipe: string): RecordingRig {
         media: navigator.mediaDevices,
         recorderFactory: (stream, options) => {
             recorderOptions.push({ ...options });
+            extra.onRecorder?.(stream, options);
 
             return new MediaRecorder(stream, options);
         },
@@ -744,6 +763,8 @@ function recordingRig(recipe: string): RecordingRig {
             audio: track.capture.audio.bitrate_bps,
         }),
         cameraAudio: (stream) => stream.getAudioTracks(),
+        createAudioContext: extra.audio ? () => new AudioContext() : null,
+        onSample: extra.onSample,
         makeStream: (streamTracks) => new MediaStream(streamTracks),
         permissions: navigator.permissions,
         nextRunIndex: (track) => {
@@ -920,4 +941,263 @@ export async function releaseCheck(): Promise<string[]> {
     await rig.engine.stopTake();
 
     return acquired.map((track) => track.readyState);
+}
+
+const sleep = (ms: number): Promise<void> =>
+    new Promise((resolve) => setTimeout(resolve, ms));
+
+function mean(values: number[]): number {
+    return values.length === 0
+        ? 0
+        : values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+/** Waits until `ready()` holds or `ms` have passed. */
+async function waitUntil(ready: () => boolean, ms: number): Promise<void> {
+    const until = performance.now() + ms;
+
+    while (!ready() && performance.now() < until) {
+        await sleep(50);
+    }
+}
+
+/** The state of `context` once it is closed, or after `ms` if it never closes. */
+async function stateAfterClose(
+    context: AudioContext,
+    ms: number,
+): Promise<AudioContextState> {
+    await waitUntil(() => context.state === 'closed', ms);
+
+    return context.state;
+}
+
+/**
+ * Resumes a host context without hanging: Firefox has no audio device in
+ * Sail or CI, so its resume() never settles (owner decision 1).
+ */
+async function resumeBriefly(context: AudioContext): Promise<void> {
+    await Promise.race([context.resume().catch(() => undefined), sleep(1000)]);
+}
+
+/** The time-domain RMS an analyser holds now. */
+function analyserRms(
+    analyser: AnalyserNode,
+    buffer: Float32Array<ArrayBuffer>,
+): number {
+    analyser.getFloatTimeDomainData(buffer);
+    let sum = 0;
+
+    for (const sample of buffer) {
+        sum += sample * sample;
+    }
+
+    return Math.sqrt(sum / buffer.length);
+}
+
+function analyserOn(context: AudioContext): AnalyserNode {
+    const analyser = context.createAnalyser();
+    analyser.fftSize = 2048;
+
+    return analyser;
+}
+
+/**
+ * Acquires through the engine with its audio graph, resumes it, reads the
+ * meter for 1 s, then sets the synthetic microphone's gain to 0 and waits up
+ * to 8 s for the silence detector (phase ready) to raise device.no_audio.
+ * `context` is the graph's state while the meter was read: a context that is
+ * not running passes no level on, so the wait is skipped there (Firefox,
+ * owner decision 1). `contextAfterClose` is read after release().
+ */
+export async function audioProbe(): Promise<{
+    level: number;
+    context: AudioContextState;
+    noAudioAfterMs: number | null;
+    contextAfterClose: AudioContextState;
+}> {
+    let noAudioAt: number | null = null;
+    const detector = createSilenceDetector({
+        emit: (type) => {
+            if (type === 'device.no_audio' && noAudioAt === null) {
+                noAudioAt = performance.now();
+            }
+        },
+        onState: () => {},
+    });
+    const rig = recordingRig('answer', {
+        audio: true,
+        onSample: (level, tMs) => detector.sample(level, tMs, 'ready'),
+    });
+    await rig.engine.prepare();
+    const graph = rig.engine.audio();
+
+    if (graph === null) {
+        throw new Error('prepare() built no audio graph.');
+    }
+
+    await graph.resume();
+    const levels: number[] = [];
+    const stopListening = graph.onLevel((level) => levels.push(level));
+    await sleep(1000);
+    stopListening();
+    const context = graph.context.state;
+    noAudioAt = null;
+    window.__fakeMicGain?.(0);
+    const changedAt = performance.now();
+
+    if (context === 'running') {
+        await waitUntil(() => noAudioAt !== null, 8000);
+    }
+
+    const heard: number | null = noAudioAt;
+    rig.engine.release();
+
+    return {
+        level: mean(levels),
+        context,
+        noAudioAfterMs: heard === null ? null : Math.round(heard - changedAt),
+        contextAfterClose: await stateAfterClose(graph.context, 2000),
+    };
+}
+
+/**
+ * One conversation take (a stereo camera track) plus the answer fixture's
+ * `audio` track, since conversation records the camera only unless the host
+ * lists both tracks. A host AudioContext plays a 440 Hz tone at gain 0.5
+ * into mix() before the take, and the synthetic microphone's gain is
+ * `micGain` from the start. Over the last 2 s of the take it reads, in the
+ * graph's context, the RMS of the left and right channels of cameraAudio()
+ * and of the audio run's own microphone stream, every 100 ms, and returns
+ * the means. Both inits come back in base64 (null when none was stored),
+ * `context` is the graph's state during the take and `contextState` its
+ * state after stopTake(). A take refused as recorder_unsupported (Linux
+ * WebKit, owner decision 2) still runs the graph for `seconds`.
+ */
+export async function mixedTake(options: {
+    seconds: number;
+    micGain: number;
+}): Promise<{
+    cameraInit: string | null;
+    audioInit: string | null;
+    events: string[];
+    errors: (ErrorCode | null)[];
+    context: AudioContextState;
+    contextState: AudioContextState;
+    leftRms: number;
+    rightRms: number;
+    audioTrackRms: number | null;
+}> {
+    const conversation = RECORDING_DESCRIPTORS.conversation;
+    const audioTrack = RECORDING_DESCRIPTORS.answer.tracks.find(
+        (track) => track.track === 'audio',
+    );
+
+    if (audioTrack === undefined) {
+        throw new Error('The answer fixture has no audio track.');
+    }
+
+    const descriptor: Descriptor = {
+        ...conversation,
+        tracks: [...conversation.tracks, audioTrack],
+    };
+    let phase: Phase = 'ready';
+    const audioStreams: MediaStream[] = [];
+    window.__fakeMicGain?.(options.micGain);
+    const events: string[] = [];
+    const detector = createSilenceDetector({
+        emit: (type) => events.push(type),
+        onState: () => {},
+    });
+    const rig = recordingRig(descriptor, {
+        audio: true,
+        onSample: (level, tMs) => detector.sample(level, tMs, phase),
+        onRecorder: (stream, recorderOptions) => {
+            if (recorderOptions.mimeType?.startsWith('audio/') === true) {
+                audioStreams.push(stream);
+            }
+        },
+    });
+    await rig.engine.prepare();
+    const graph = rig.engine.audio();
+
+    if (graph === null) {
+        throw new Error('prepare() built no audio graph.');
+    }
+
+    const host = new AudioContext();
+    const tone = host.createOscillator();
+    const toneGain = host.createGain();
+    tone.frequency.value = 440;
+    toneGain.gain.value = 0.5;
+    tone.connect(toneGain);
+    tone.start();
+    await resumeBriefly(host);
+    graph.mix(toneGain);
+
+    if (await startTake(rig)) {
+        phase = 'recording';
+    }
+
+    const meters = graph.context;
+    const splitter = meters.createChannelSplitter(2);
+    const left = analyserOn(meters);
+    const right = analyserOn(meters);
+    meters
+        .createMediaStreamSource(new MediaStream(graph.cameraAudio()))
+        .connect(splitter);
+    splitter.connect(left, 0);
+    splitter.connect(right, 1);
+    let microphone: AnalyserNode | null = null;
+
+    if (audioStreams.length > 0) {
+        microphone = analyserOn(meters);
+        meters.createMediaStreamSource(audioStreams[0]).connect(microphone);
+    }
+
+    const buffer = new Float32Array(2048);
+    const lefts: number[] = [];
+    const rights: number[] = [];
+    const microphones: number[] = [];
+    const startedAt = performance.now();
+    const endAt = startedAt + options.seconds * 1000;
+    const readFrom = endAt - 2000;
+
+    while (performance.now() < endAt) {
+        await sleep(100);
+
+        if (performance.now() >= readFrom) {
+            lefts.push(analyserRms(left, buffer));
+            rights.push(analyserRms(right, buffer));
+
+            if (microphone !== null) {
+                microphones.push(analyserRms(microphone, buffer));
+            }
+        }
+    }
+
+    const context = meters.state;
+    phase = 'stopping';
+    await rig.engine.stopTake();
+    const contextState = await stateAfterClose(meters, 2000);
+    tone.stop();
+    void host.close().catch(() => undefined);
+    const initOf = (track: TrackName): string | null => {
+        const init = rig.segments.find(
+            (segment) => segment.track === track && segment.kind === 'init',
+        );
+
+        return init?.data ? toBase64(init.data) : null;
+    };
+
+    return {
+        cameraInit: initOf('camera'),
+        audioInit: initOf('audio'),
+        events: [...rig.events, ...events],
+        errors: rig.errors,
+        context,
+        contextState,
+        leftRms: mean(lefts),
+        rightRms: mean(rights),
+        audioTrackRms: microphone === null ? null : mean(microphones),
+    };
 }

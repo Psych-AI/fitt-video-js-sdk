@@ -18,6 +18,8 @@ function engineRig(
         noRecorder?: boolean;
         /** Held before a segment is stored, when it returns a promise. */
         holdAdd?: (record: SegmentRecord) => Promise<void> | undefined;
+        /** Gives the engine an audio graph on this context. */
+        audioContext?: () => AudioContext;
     } = {},
 ) {
     const env = fakeEnvironment();
@@ -41,6 +43,7 @@ function engineRig(
     const errors: (string | null)[] = [];
     const streams: (MediaStream | null)[] = [];
     const runs = new Map<string, RunRecord>();
+    const samples: [number, number][] = [];
     let runIndex = 0;
     const engine = createRecorderEngine({
         env,
@@ -57,6 +60,8 @@ function engineRig(
         isTypeSupported: () => true,
         bitrates: () => ({ video: 300_000, audio: 32_000 }),
         cameraAudio: (stream) => stream.getAudioTracks(),
+        createAudioContext: options.audioContext ?? null,
+        onSample: (level, tMs) => samples.push([level, tMs]),
         makeStream: media.makeStream,
         permissions: {
             query: async ({ name }: { name: string }) => ({
@@ -98,9 +103,58 @@ function engineRig(
         streams,
         runs,
         added,
+        samples,
         cameraReasons,
         stop,
     };
+}
+
+/** A node that only remembers what it was connected to. */
+class FakeAudioNode {
+    connections: unknown[] = [];
+    fftSize = 0;
+
+    connect(target: unknown): unknown {
+        this.connections.push(target);
+
+        return target;
+    }
+
+    disconnect(): void {
+        this.connections = [];
+    }
+
+    getFloatTimeDomainData(buffer: Float32Array): void {
+        buffer.fill(0.5);
+    }
+}
+
+/** The AudioContext members the graph uses, recording each stream it was given. */
+function fakeAudioContext() {
+    const sources: MediaStream[] = [];
+    const context = {
+        state: 'running' as AudioContextState,
+        createAnalyser: () => new FakeAudioNode(),
+        createChannelMerger: () => new FakeAudioNode(),
+        createGain: () => new FakeAudioNode(),
+        createMediaStreamDestination: () =>
+            Object.assign(new FakeAudioNode(), {
+                channelCount: 0,
+                channelCountMode: 'max',
+                stream: { getAudioTracks: () => [] },
+            }),
+        createMediaStreamSource: (stream: MediaStream) => {
+            sources.push(stream);
+
+            return new FakeAudioNode();
+        },
+        resume: async () => {},
+        close: async () => {
+            context.state = 'closed';
+        },
+    };
+
+    return { context: context as unknown as AudioContext, sources };
 }
 
 test('prepare reports the permission states as device.permission_granted', async () => {
@@ -485,4 +539,48 @@ test('a release while the permission of an ended track is read reports nothing a
         r.events.filter(([type]) => type === 'device.permission_lost').length,
         0,
     );
+});
+
+test('the audio graph is built at prepare, follows a camera chosen mid-take, and closes at stopTake', async () => {
+    const audio = fakeAudioContext();
+    const r = engineRig({ audioContext: () => audio.context });
+    await r.engine.prepare();
+    const graph = r.engine.audio();
+
+    assert.ok(graph !== null);
+    await r.engine.startTake(0);
+    await r.env.advance(250);
+    assert.ok(r.samples.length >= 2);
+    assert.ok(r.samples.every(([level]) => level === 0.5));
+
+    const switching = r.engine.devices().select('camera', 'cam-2');
+    await r.env.advance(10);
+    await switching;
+    const microphones = r.media.acquired.map((tracks) =>
+        tracks.find((track) => track.kind === 'audio'),
+    );
+
+    // The meter and the camera run's audio follow the new capture; the old microphone is stopped.
+    assert.deepEqual(
+        audio.sources.map((stream) => stream.getAudioTracks()[0]),
+        microphones,
+    );
+    assert.deepEqual(graph.cameraAudio(), [microphones[1]]);
+    await r.stop();
+
+    assert.equal(r.engine.audio(), null);
+    assert.equal(audio.context.state, 'closed');
+});
+
+test('without createAudioContext there is no graph and the camera run records the microphone as is', async () => {
+    const r = engineRig();
+    await r.engine.prepare();
+
+    assert.equal(r.engine.audio(), null);
+    await r.engine.startTake(0);
+    await r.env.advance(250);
+    await r.stop();
+
+    assert.deepEqual(r.samples, []);
+    assert.deepEqual(r.cameraReasons(), ['stop']);
 });
