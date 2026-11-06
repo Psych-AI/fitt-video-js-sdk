@@ -37,6 +37,11 @@ import {
     type RecorderEngine,
 } from '../../../src/recorder/engine.ts';
 import { createSilenceDetector } from '../../../src/recorder/silence.ts';
+import {
+    requestFullscreen,
+    type ActionResult,
+} from '../../../src/signals/fullscreen.ts';
+import { startSignals } from '../../../src/signals/index.ts';
 import answerDescriptor from '../../fixtures/descriptor-answer.json';
 import conversationDescriptor from '../../fixtures/descriptor-conversation.json';
 import monitorDescriptor from '../../fixtures/descriptor-monitor.json';
@@ -1318,4 +1323,39 @@ export async function elementMixTwice(): Promise<{
         element.remove();
         URL.revokeObjectURL(url);
     }
+}
+
+/** The types the signals probe has collected, in order. */
+const probeEvents: string[] = [];
+
+/** Starts the page signals on the real window, document and navigator, collecting the event types. */
+export function startSignalsProbe(): void {
+    probeEvents.length = 0;
+    const env = browserEnvironment();
+    const clock = createClock(env);
+    startSignals({
+        page: { win: window, doc: document, nav: navigator },
+        env,
+        clock,
+        emit: (type) => {
+            probeEvents.push(type);
+
+            return null;
+        },
+    });
+}
+
+export function signalEvents(): string[] {
+    return [...probeEvents];
+}
+
+/**
+ * Asks for fullscreen once the transient user activation Playwright's
+ * evaluate grants (5 s in Chromium) has run out, so the request has no
+ * gesture behind it.
+ */
+export async function fullscreenOutsideGesture(): Promise<ActionResult> {
+    await new Promise<void>((resolve) => setTimeout(resolve, 6000));
+
+    return requestFullscreen(document.body, document);
 }
