@@ -32,6 +32,7 @@ import {
     jsonRequest,
     segmentPut,
 } from '../../../src/core/wire.ts';
+import { FittVideo } from '../../../src/index.ts';
 import {
     createRecorderEngine,
     type RecorderEngine,
@@ -1358,4 +1359,64 @@ export async function fullscreenOutsideGesture(): Promise<ActionResult> {
     await new Promise<void>((resolve) => setTimeout(resolve, 6000));
 
     return requestFullscreen(document.body, document);
+}
+
+/**
+ * FittVideo.session() over the monitor fixture with the real browser seams,
+ * prepare() with no attachPreview() call, then the synthetic camera freezes
+ * after 1000 ms. Returns the event types onEvent saw by 4000 ms later. The
+ * fixture's API (127.0.0.1:8123) is not running in test:browser, so every
+ * upload fails and stays local; nothing here needs it.
+ */
+export async function stallProbe(): Promise<string[]> {
+    const session = FittVideo.session(monitorDescriptor);
+    const types: string[] = [];
+    session.onEvent((event) => types.push(event.type));
+
+    try {
+        await session.prepare();
+        await sleep(1000);
+        window.__fakeFreezeCamera?.(true);
+        await sleep(4000);
+
+        return [...types];
+    } finally {
+        window.__fakeFreezeCamera?.(false);
+        session.destroy();
+    }
+}
+
+/**
+ * FittVideo.session() over the answer fixture: prepare(), 6000 ms of the
+ * synthetic tone, the meter and state.audio read, then the microphone's gain
+ * set to 0 and state.audio read again 6500 ms later, with the event types.
+ */
+export async function silenceProbe(): Promise<{
+    level: number;
+    before: 'ok' | 'silent';
+    after: 'ok' | 'silent';
+    events: string[];
+}> {
+    const session = FittVideo.session(answerDescriptor);
+    const types: string[] = [];
+    session.onEvent((event) => types.push(event.type));
+
+    try {
+        await session.prepare();
+        await sleep(6000);
+        const level = session.audioLevel;
+        const before = session.state.audio;
+        window.__fakeMicGain?.(0);
+        await sleep(6500);
+
+        return {
+            level,
+            before,
+            after: session.state.audio,
+            events: [...types],
+        };
+    } finally {
+        window.__fakeMicGain?.(0.08);
+        session.destroy();
+    }
 }
