@@ -53,6 +53,12 @@ export function readEnforce(
  * `enforce.left_page` and one forced stop, after which it disarms. Coming
  * back (visible and focused) cancels. Every time is read from the session
  * clock, so a throttled background tab still stops on time.
+ *
+ * Window events miss some focus changes: a click into a child frame raises
+ * `blur` on this window while `doc.hasFocus()` stays true, and a return may
+ * raise no `focus`. So while away and visible, the guard reads hasFocus()
+ * just after each blur, at each visibility change and before each tick, as
+ * the attention signal's poll does, and a true answer counts as back.
  */
 export function createStayOnPage(deps: {
     page: PageLike;
@@ -68,6 +74,14 @@ export function createStayOnPage(deps: {
     let focused = true;
     let leftAt: number | null = null;
     let timer: number | null = null;
+    let focusCheck: number | null = null;
+
+    /** A visible page whose document holds focus (a child frame counts) is focused. */
+    const readFocus = (): void => {
+        if (doc.visibilityState !== 'hidden' && doc.hasFocus()) {
+            focused = true;
+        }
+    };
 
     const cancel = (): void => {
         if (timer !== null) {
@@ -98,6 +112,13 @@ export function createStayOnPage(deps: {
             return;
         }
 
+        readFocus();
+        evaluate();
+
+        if (leftAt === null) {
+            return;
+        }
+
         const remaining = graceMs - (clock.now() - leftAt);
 
         if (remaining > 0) {
@@ -112,7 +133,7 @@ export function createStayOnPage(deps: {
         deps.forceStop();
     }
 
-    const evaluate = (): void => {
+    function evaluate(): void {
         if (!armed) {
             return;
         }
@@ -125,12 +146,24 @@ export function createStayOnPage(deps: {
         } else if (!away && leftAt !== null) {
             cancel();
         }
-    };
+    }
 
-    const onVisibility = (): void => evaluate();
+    const onVisibility = (): void => {
+        readFocus();
+        evaluate();
+    };
     const onBlur = (): void => {
         focused = false;
         evaluate();
+
+        // The new focus target is only settled once the blur has run.
+        if (focusCheck === null) {
+            focusCheck = env.timers.setTimeout(() => {
+                focusCheck = null;
+                readFocus();
+                evaluate();
+            }, 0);
+        }
     };
     const onFocus = (): void => {
         focused = true;
@@ -147,6 +180,11 @@ export function createStayOnPage(deps: {
         win.removeEventListener('blur', onBlur);
         win.removeEventListener('focus', onFocus);
         cancel();
+
+        if (focusCheck !== null) {
+            env.timers.clearTimeout(focusCheck);
+            focusCheck = null;
+        }
     }
 
     return {

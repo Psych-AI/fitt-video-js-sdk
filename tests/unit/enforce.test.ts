@@ -70,14 +70,51 @@ test('visible again at 4 s cancels', async () => {
 
 test('a blur while visible counts, and focus resets the grace', async () => {
     const r = rig();
+    // A real blur also leaves document.hasFocus() false, and a focus makes it true.
+    Object.assign(r.page.doc, { hasFocus: () => false });
     r.page.win.dispatchEvent(new Event('blur'));
     await r.env.advance(3000);
+    Object.assign(r.page.doc, { hasFocus: () => true });
     r.page.win.dispatchEvent(new Event('focus'));
     await r.env.advance(3000);
+    Object.assign(r.page.doc, { hasFocus: () => false });
     r.page.win.dispatchEvent(new Event('blur'));
     await r.env.advance(1000);
 
     assert.deepEqual(r.ticks(), [9000, 8000, 7000, 9000]);
+});
+
+test('a blur into a child frame, with hasFocus() still true, is not away', async () => {
+    const r = rig();
+    r.page.win.dispatchEvent(new Event('blur'));
+    await r.env.advance(20_000);
+
+    assert.deepEqual(r.ticks(), []);
+    assert.deepEqual(r.forced, []);
+});
+
+test('a return to focus that raised no focus event is found by hasFocus() and cancels', async () => {
+    const r = rig();
+    Object.assign(r.page.doc, { hasFocus: () => false });
+    r.page.win.dispatchEvent(new Event('blur'));
+    await r.env.advance(2500);
+    Object.assign(r.page.doc, { hasFocus: () => true });
+    await r.env.advance(20_000);
+
+    assert.deepEqual(r.ticks(), [9000, 8000]);
+    assert.deepEqual(r.forced, []);
+
+    Object.assign(r.page.doc, { hasFocus: () => false });
+    r.page.win.dispatchEvent(new Event('blur'));
+    await r.env.advance(1000);
+    r.hide();
+    await r.env.advance(1000);
+    Object.assign(r.page.doc, { hasFocus: () => true });
+    r.show();
+    await r.env.advance(20_000);
+
+    assert.deepEqual(r.ticks(), [9000, 8000, 9000, 8000]);
+    assert.deepEqual(r.forced, []);
 });
 
 test('a throttled timer reports the remaining grace from the real elapsed time', async () => {
