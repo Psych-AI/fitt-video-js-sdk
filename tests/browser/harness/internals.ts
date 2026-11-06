@@ -1,7 +1,10 @@
 /** What the browser specs call through `window.internals`. Later tasks add the functions their specs need. */
+import { createBatcher } from '../../../src/core/batcher.ts';
+import { createClock } from '../../../src/core/clock.ts';
 import { sha256Hex } from '../../../src/core/crypto.ts';
 import type { Descriptor, TrackName } from '../../../src/core/descriptor.ts';
 import { browserEnvironment } from '../../../src/core/env.ts';
+import { createEventBus } from '../../../src/core/events.ts';
 import { send } from '../../../src/core/http.ts';
 import { createLadder } from '../../../src/core/ladder.ts';
 import { createQueue } from '../../../src/core/queue.ts';
@@ -16,8 +19,9 @@ import {
     type SessionRecord,
 } from '../../../src/core/store.ts';
 import { createTokenKeeper } from '../../../src/core/token.ts';
+import { ulid } from '../../../src/core/ulid.ts';
 import { createUploader } from '../../../src/core/uploader.ts';
-import { jsonRequest } from '../../../src/core/wire.ts';
+import { eventsRequest, jsonRequest } from '../../../src/core/wire.ts';
 import { STORE_CASES } from '../../shared/store-suite.ts';
 
 export const ready = true;
@@ -347,4 +351,177 @@ export async function runUploader(options: {
         ),
         behind,
     };
+}
+
+/** Where runBatches() keeps its synchronous next_batch_seq copy. */
+function seqKey(sessionId: string): string {
+    return `fitt-video:${sessionId}:next_batch_seq`;
+}
+
+/** A session record for runBatches(), with the fields a later task fills left at their start values. */
+function batchSession(descriptor: Descriptor): SessionRecord {
+    const now = Date.now();
+
+    return {
+        session_id: descriptor.session_id,
+        descriptor,
+        epoch_ms: Math.floor(performance.timeOrigin + performance.now()),
+        take: descriptor.take,
+        take_start_ms: null,
+        take_open: false,
+        take_end_ms: null,
+        next_batch_seq: 0,
+        ladder_rung: 'put',
+        ever_succeeded: false,
+        stop_completed: false,
+        rejected_take: null,
+        pending_discard: false,
+        last_activity_ms: now,
+        token_expires_at_ms: now + descriptor.token.expires_in_s * 1000,
+        pending_reset_take: null,
+        manifest_owed: {},
+        max_session_ms: 0,
+        finalised: false,
+        expires_at_ms: null,
+    };
+}
+
+/**
+ * Sends one event batch per inner list through the real batcher, over
+ * IndexedDB and a token keeper, with the sync seq copy in localStorage.
+ * The session record (created at next_batch_seq 0) survives a reload, so a
+ * second call carries on the numbering. With `replayFirstWith`, batch 0 is
+ * then posted again by hand with other events, which the server must
+ * ignore. Ends with GET /status.
+ */
+export async function runBatches(options: {
+    descriptor: Descriptor;
+    batches: string[][];
+    replayFirstWith?: string[];
+}): Promise<{
+    statuses: number[];
+    batchSeqs: number[];
+    status: number;
+    rejected: { batch_seq: number; code: string; status: number }[];
+}> {
+    const { descriptor } = options;
+    const sid = descriptor.session_id;
+    const api = descriptor.endpoints.api;
+    const eventsUrl = `${api}/sessions/${sid}/events`;
+    const env = browserEnvironment();
+    const store = await openIdbStore(indexedDB);
+    let session = await store.getSession(sid);
+
+    if (session === undefined) {
+        session = batchSession(descriptor);
+        await store.putSession(session);
+    }
+
+    const clock = createClock(env, session.epoch_ms);
+    const statuses: number[] = [];
+    const batchSeqs: number[] = [];
+    const rejected: { batch_seq: number; code: string; status: number }[] = [];
+    const post = async (
+        body: string,
+        keepalive: boolean,
+        token: { id: string; secret: string },
+    ) => {
+        const answer = await send(
+            env,
+            eventsRequest(eventsUrl, token, body, keepalive),
+        );
+        statuses.push(answer.status);
+        batchSeqs.push((JSON.parse(body) as { batch_seq: number }).batch_seq);
+
+        return answer;
+    };
+    const token = createTokenKeeper({
+        env,
+        descriptor,
+        refresh: (used) =>
+            send(
+                env,
+                jsonRequest(
+                    `${api}/sessions/${sid}/refresh-upload`,
+                    used,
+                    'POST',
+                ),
+            ),
+        onDescriptor: () => {},
+        emit: () => {},
+        setError: () => {},
+    });
+    const stored = session;
+    const batcher = createBatcher({
+        env,
+        clock,
+        store,
+        sessionId: sid,
+        take: () => descriptor.take,
+        nextBatchSeq: stored.next_batch_seq,
+        batchMs: descriptor.events.batch_ms,
+        token,
+        send: post,
+        persistNextBatchSeq: async (next) => {
+            stored.next_batch_seq = next;
+            await store.putSession({ ...stored });
+        },
+        persistNextBatchSeqSync: (next) => {
+            localStorage.setItem(seqKey(sid), String(next));
+        },
+        readNextBatchSeqSync: () => {
+            const value = localStorage.getItem(seqKey(sid));
+
+            return value === null ? null : Number(value);
+        },
+        onClosed: () => {},
+        onRejected: (rejection) => rejected.push(rejection),
+    });
+    const bus = createEventBus({
+        env,
+        clock,
+        groups: descriptor.signals.groups,
+        onQueued: (event) => batcher.add(event),
+    });
+
+    try {
+        for (const types of options.batches) {
+            for (const type of types) {
+                bus.emit(type);
+            }
+
+            await batcher.flush();
+        }
+
+        if (options.replayFirstWith !== undefined) {
+            const body = JSON.stringify({
+                take: descriptor.take,
+                batch_seq: 0,
+                sent_at_ms: Date.now(),
+                clock_epoch_ms: clock.epochMs,
+                events: options.replayFirstWith.map((type) => ({
+                    id: ulid(env),
+                    t_ms: clock.now(),
+                    type,
+                    source: 'browser',
+                })),
+            });
+            await post(body, false, token.current());
+        }
+
+        const status = await send(
+            env,
+            jsonRequest(
+                `${api}/sessions/${sid}/status`,
+                token.current(),
+                'GET',
+            ),
+        );
+
+        return { statuses, batchSeqs, status: status.status, rejected };
+    } finally {
+        batcher.stop();
+        await token.stop();
+        store.close();
+    }
 }
