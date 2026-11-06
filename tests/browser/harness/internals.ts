@@ -1436,6 +1436,51 @@ export interface E2eCall {
 let e2eSession: FittSession | null = null;
 const e2eCalls: E2eCall[] = [];
 const e2eEvents: string[] = [];
+/** Sessions whose events e2eEvents already collects (the same-id map hands open() a resumed object again). */
+const e2eListened = new WeakSet<FittSession>();
+
+function e2eListen(session: FittSession): void {
+    if (!e2eListened.has(session)) {
+        e2eListened.add(session);
+        session.onEvent((event) => e2eEvents.push(event.type));
+    }
+}
+
+/** The sessions the last e2e.resume() returned, by lower-case session id. */
+const e2eResumed = new Map<string, FittSession>();
+
+/** The sessionStorage key open() keeps the descriptor under, for the reload specs. */
+const E2E_DESCRIPTOR_KEY = 'fitt-e2e:descriptor';
+
+/** options with a fetch that logs every API call into e2eCalls. */
+function e2eLogged(options: SessionOptions): SessionOptions {
+    const logged = (url: string, init: RequestInit): Promise<Response> => {
+        const entry: E2eCall = {
+            method: init.method ?? 'GET',
+            url,
+            status: 0,
+            at: performance.now(),
+            online: navigator.onLine,
+        };
+
+        if (/\/events$/.test(url) && typeof init.body === 'string') {
+            entry.body = init.body;
+        }
+
+        e2eCalls.push(entry);
+
+        return fetch(url, init).then((response) => {
+            entry.status = response.status;
+
+            return response;
+        });
+    };
+
+    return {
+        ...options,
+        environment: { ...options.environment, fetch: logged },
+    };
+}
 
 function e2eCurrent(): FittSession {
     if (e2eSession === null) {
@@ -1454,32 +1499,59 @@ export const e2e = {
     open(descriptor: Descriptor, options: SessionOptions = {}): void {
         e2eCalls.length = 0;
         e2eEvents.length = 0;
-        const logged = (url: string, init: RequestInit): Promise<Response> => {
-            const entry: E2eCall = {
-                method: init.method ?? 'GET',
-                url,
-                status: 0,
-                at: performance.now(),
-                online: navigator.onLine,
-            };
 
-            if (/\/events$/.test(url) && typeof init.body === 'string') {
-                entry.body = init.body;
+        try {
+            sessionStorage.setItem(
+                E2E_DESCRIPTOR_KEY,
+                JSON.stringify(descriptor),
+            );
+        } catch {
+            // The reload specs read it back; nothing else needs it.
+        }
+
+        // After resume(), the same-id map returns the resumed object and keeps its logging fetch.
+        e2eSession = FittVideo.session(descriptor, e2eLogged(options));
+        e2eListen(e2eSession);
+    },
+    /** FittVideo.resume() with the logging fetch: {session_id, state} per entry, since a session cannot cross page.evaluate. */
+    async resume(
+        options: SessionOptions = {},
+    ): Promise<{ session_id: string; state: string }[]> {
+        e2eCalls.length = 0;
+        e2eEvents.length = 0;
+        const entries = await FittVideo.resume(e2eLogged(options));
+        e2eResumed.clear();
+
+        for (const entry of entries) {
+            if (entry.session !== null) {
+                e2eResumed.set(entry.session_id.toLowerCase(), entry.session);
+                e2eListen(entry.session);
             }
+        }
 
-            e2eCalls.push(entry);
+        return entries.map(({ session_id, state }) => ({ session_id, state }));
+    },
+    /** finalise() on a session the last resume() returned, with no descriptor passed in. */
+    finaliseResumed(sessionId: string): Promise<void> {
+        const resumed = e2eResumed.get(sessionId.toLowerCase());
 
-            return fetch(url, init).then((response) => {
-                entry.status = response.status;
+        if (resumed === undefined) {
+            throw new Error(`e2e.resume() returned no session ${sessionId}.`);
+        }
 
-                return response;
-            });
-        };
-        e2eSession = FittVideo.session(descriptor, {
-            ...options,
-            environment: { ...options.environment, fetch: logged },
-        });
-        e2eSession.onEvent((event) => e2eEvents.push(event.type));
+        e2eSession = resumed;
+
+        return resumed.finalise();
+    },
+    /** The descriptor the last open() in this tab kept, or null. */
+    storedDescriptor(): Descriptor | null {
+        try {
+            const kept = sessionStorage.getItem(E2E_DESCRIPTOR_KEY);
+
+            return kept === null ? null : (JSON.parse(kept) as Descriptor);
+        } catch {
+            return null;
+        }
     },
     prepare: (): Promise<void> => e2eCurrent().prepare(),
     start: (): Promise<void> => e2eCurrent().start(),

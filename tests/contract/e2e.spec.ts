@@ -268,3 +268,107 @@ test('a page whose origin the space does not allow ends in network_blocked with 
             .segments.present,
     ).toBe(0);
 });
+
+test('a reload at 7 s is interrupted, and the take continues with a new run on the wall clock', async ({
+    page,
+    request,
+    browserName,
+}) => {
+    test.skip(
+        browserName !== 'chromium',
+        'one engine is enough for the reload path',
+    );
+    const { descriptor } = await createSession(request, { recipe: 'monitor' });
+    await installMedia(page, browserName);
+    await openHarness(page);
+    await page.evaluate((d) => window.internals.e2e.open(d, {}), descriptor);
+    await record(page, 7);
+    const batchesBefore = (
+        await page.evaluate(() => window.internals.e2e.calls())
+    ).filter((c) => c.url.endsWith('/events')).length;
+    await page.reload();
+    await page.waitForFunction(() => 'internals' in window);
+
+    expect(await page.evaluate(() => window.internals.e2e.resume())).toEqual([
+        { session_id: descriptor.session_id, state: 'interrupted' },
+    ]);
+    await page.evaluate((d) => window.internals.e2e.open(d, {}), descriptor);
+    await record(page, 6);
+    await page.evaluate(() => window.internals.e2e.stop());
+    const local = await page.evaluate(() => window.internals.e2e.local());
+
+    expect(local.runs.map((r) => [r.ended_reason, r.anchor_source])).toEqual([
+        ['reload', 'performance'],
+        ['stop', 'wall_clock'],
+    ]);
+    expect(local.firstBatchSeqAfterReload).toBeGreaterThanOrEqual(
+        batchesBefore,
+    );
+    await expect
+        .poll(
+            async () => (await status(request, descriptor)).tracks[0].sealed,
+            { timeout: 30_000 },
+        )
+        .toBe(true);
+});
+
+test('an interrupted session is finalised from resume() alone, with no descriptor passed in', async ({
+    page,
+    request,
+    browserName,
+}) => {
+    test.skip(
+        browserName !== 'chromium',
+        'one engine is enough for the reload path',
+    );
+    const { descriptor } = await createSession(request, { recipe: 'monitor' });
+    await installMedia(page, browserName);
+    await openHarness(page);
+    await page.evaluate((d) => window.internals.e2e.open(d, {}), descriptor);
+    await record(page, 4);
+    await page.reload();
+    await page.waitForFunction(() => 'internals' in window);
+
+    expect(await page.evaluate(() => window.internals.e2e.resume())).toEqual([
+        { session_id: descriptor.session_id, state: 'interrupted' },
+    ]);
+    await page.evaluate(
+        (id) => window.internals.e2e.finaliseResumed(id),
+        descriptor.session_id,
+    );
+    expect(
+        (await page.evaluate(() => window.internals.e2e.calls()))
+            .filter((c) => c.url.endsWith('/finalise'))
+            .map((c) => c.status),
+    ).toEqual([200]);
+});
+
+test('a session re-attached in a fresh tab continues on the same clock', async ({
+    page,
+    context,
+    request,
+    browserName,
+}) => {
+    test.skip(
+        browserName !== 'chromium',
+        'one engine is enough for the reload path',
+    );
+    const { descriptor } = await createSession(request, { recipe: 'monitor' });
+    await installMedia(page, browserName);
+    await openHarness(page);
+    await page.evaluate((d) => window.internals.e2e.open(d, {}), descriptor);
+    await record(page, 7);
+    await page.close();
+    const fresh = await context.newPage(); // shares IndexedDB and localStorage, not sessionStorage
+    await installMedia(fresh, browserName);
+    await openHarness(fresh);
+    await fresh.evaluate((d) => window.internals.e2e.open(d, {}), descriptor);
+    await record(fresh, 4);
+    await fresh.evaluate(() => window.internals.e2e.stop());
+    const runs = (await fresh.evaluate(() => window.internals.e2e.local()))
+        .runs;
+
+    expect(runs).toHaveLength(2);
+    expect(runs[1].anchor_source).toBe('wall_clock');
+    expect(runs[1].anchor_ms).toBeGreaterThan(runs[0].ended_ms ?? 0);
+});

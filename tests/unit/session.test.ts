@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { resolveSettings } from '../../src/core/options.ts';
+import { resumeWith } from '../../src/core/resume.ts';
 import { createSession, sessionWith } from '../../src/core/session.ts';
 import { MemoryQueueStore } from '../../src/core/store.ts';
 import { FittVideo } from '../../src/index.ts';
@@ -14,6 +15,7 @@ import {
 import {
     recordTake,
     rigSeams,
+    router,
     sessionRig,
     statusBody,
     type SessionRig,
@@ -1058,4 +1060,404 @@ test('reset() is refused while finalise() is in flight', async () => {
     await finalising;
     assert.equal(r.calls(/\/reset$/).length, 0);
     assert.equal(r.media.calls(), 1);
+});
+
+test('an owed manifest is posted after a reload by the passive session', async () => {
+    const descriptor = descriptorFixture('monitor');
+    const store = new MemoryQueueStore();
+    const first = sessionRig({ descriptor, store });
+    first.env.setOnline(false);
+    await first.session.prepare();
+    await first.session.start();
+    await first.env.advance(1000);
+    void first.session.stop();
+    await first.env.advance(10);
+    first.session.destroy();
+
+    const second = sessionRig({ descriptor, store, chunks: true });
+    await second.session.prepare();
+    await until(() => second.manifestCalls().length >= 1);
+
+    assert.deepEqual(
+        (await store.getSession(descriptor.session_id))?.manifest_owed,
+        {},
+    );
+});
+
+/** Each resume test has its own session id, because resumeWith() and sessionWith() share the module's same-id map. */
+const resumable = (n: number) => ({
+    ...descriptorFixture('monitor'),
+    session_id: `01jbz8q4w6x0k3m5n7p9r2t4r${n}`,
+});
+
+test('a completed stop is finalised by resume() with no host call', async () => {
+    const descriptor = resumable(1);
+    const store = new MemoryQueueStore();
+    const first = sessionRig({ descriptor, store, chunks: true });
+    await recordTake(first, 2000);
+    first.session.destroy();
+    const env = fakeEnvironment();
+    env.respond(router());
+    const entries = await resumeWith({}, rigSeams(env, store, fakeMedia(env)));
+    await until(() => env.calls.some((call) => call.url.endsWith('/finalise')));
+    await env.advance(5000);
+
+    assert.deepEqual(
+        entries.map(({ session_id, state }) => ({ session_id, state })),
+        [{ session_id: descriptor.session_id, state: 'finalising' }],
+    );
+    assert.equal(
+        env.calls.filter((call) => call.url.endsWith('/finalise')).length,
+        1,
+    );
+});
+
+test('a lapsed token is resume_expired, sends nothing, and recovers on a fresh descriptor', async () => {
+    const descriptor = resumable(2);
+    const store = new MemoryQueueStore();
+    const env = fakeEnvironment();
+    env.respond(router());
+    await store.putSession(
+        sessionRecord({
+            session_id: descriptor.session_id,
+            descriptor,
+            stop_completed: false,
+            last_activity_ms: env.dateNow() - 1000,
+            token_expires_at_ms: env.dateNow() - 1,
+        }),
+    );
+    const seams = rigSeams(env, store, fakeMedia(env));
+    const entries = await resumeWith({}, seams);
+    await env.advance(5000);
+
+    assert.deepEqual(
+        entries.map(({ state }) => state),
+        ['resume_expired'],
+    );
+    assert.equal(env.calls.length, 0);
+
+    const renewed = {
+        ...descriptor,
+        token: { ...descriptor.token, id: '01jbz8q4w6x0k3m5n7p9r2t4bc' },
+    };
+    assert.equal(sessionWith(renewed, {}, seams), entries[0].session);
+    await env.advance(descriptor.events.batch_ms);
+    await until(() => env.calls.some((call) => call.url.endsWith('/events')));
+    const events = env.calls
+        .filter((call) => call.url.endsWith('/events'))
+        .flatMap(
+            (call) =>
+                JSON.parse(call.body as string).events as {
+                    type: string;
+                    payload?: { session_id?: string };
+                }[],
+        );
+
+    assert.ok(
+        events.some(
+            (event) =>
+                event.type === 'session.resume_expired' &&
+                event.payload?.session_id === descriptor.session_id,
+        ),
+    );
+});
+
+test('a stop, a reset and a second take that a reload interrupts is never finalised by resume()', async () => {
+    const descriptor = resumable(3);
+    const store = new MemoryQueueStore();
+    const first = sessionRig({ descriptor, store, chunks: true });
+    await recordTake(first, 1000);
+    await first.session.reset();
+    await first.session.start();
+    await first.env.advance(30_000);
+    first.session.destroy();
+    const env = fakeEnvironment();
+    env.respond(router());
+    const entries = await resumeWith({}, rigSeams(env, store, fakeMedia(env)));
+    await env.advance(10_000);
+
+    assert.deepEqual(
+        entries.map(({ state }) => state),
+        ['interrupted'],
+    );
+    assert.equal(
+        env.calls.filter((call) => call.url.endsWith('/finalise')).length,
+        0,
+    );
+});
+
+test('a discard that never landed is sent by resume(), returned as discarding, and nothing else is sent', async () => {
+    const descriptor = resumable(4);
+    const store = new MemoryQueueStore();
+    const first = sessionRig({ descriptor, store, chunks: true });
+    await recordTake(first, 1000);
+    first.env.setOnline(false);
+    void first.session.discard().catch(() => null);
+    await settle();
+    first.session.destroy();
+    const env = fakeEnvironment();
+    env.respond(router());
+    const entries = await resumeWith({}, rigSeams(env, store, fakeMedia(env)));
+    await until(() => env.calls.some((call) => call.url.endsWith('/discard')));
+
+    for (let i = 0; i < 50 && (await store.listSessions()).length > 0; i++) {
+        await settle();
+    }
+
+    assert.deepEqual(
+        entries.map(({ state }) => state),
+        ['discarding'],
+    );
+    assert.deepEqual(
+        env.calls.map((call) => new URL(call.url).pathname.split('/').at(-1)),
+        ['discard'],
+    );
+    assert.deepEqual(await store.listSessions(), []);
+});
+
+test('resume_expired freezes a new batch and never edits a stored one', async () => {
+    const descriptor = resumable(5);
+    const store = new MemoryQueueStore();
+    const env = fakeEnvironment();
+    env.respond(router());
+    const body = JSON.stringify({
+        take: 1,
+        batch_seq: 0,
+        sent_at_ms: env.dateNow(),
+        clock_epoch_ms: 1_762_400_000_000,
+        events: [],
+    });
+    await store.putSession(
+        sessionRecord({
+            session_id: descriptor.session_id,
+            descriptor,
+            next_batch_seq: 1,
+            last_activity_ms: env.dateNow() - 1000,
+            token_expires_at_ms: env.dateNow() - 1,
+        }),
+    );
+    await store.putBatch({
+        session_id: descriptor.session_id,
+        batch_seq: 0,
+        take: 1,
+        body,
+        payload_bytes: 0,
+    });
+    await resumeWith({}, rigSeams(env, store, fakeMedia(env)));
+    const batches = await store.listBatches(descriptor.session_id);
+
+    assert.equal(batches[0].body, body);
+    assert.deepEqual(
+        batches
+            .slice(1)
+            .map((batch) => [
+                batch.batch_seq,
+                JSON.parse(batch.body).events.map(
+                    (event: { type: string }) => event.type,
+                ),
+            ]),
+        [[1, ['session.resume_expired']]],
+    );
+    assert.equal(
+        (await store.getSession(descriptor.session_id))?.next_batch_seq,
+        2,
+    );
+});
+
+test('an owed reset is sent by resume() first, and the session is returned as interrupted', async () => {
+    const descriptor = resumable(6);
+    const store = new MemoryQueueStore();
+    const env = fakeEnvironment();
+    env.respond(router());
+    await store.putSession(
+        sessionRecord({
+            session_id: descriptor.session_id,
+            descriptor,
+            pending_reset_take: 1,
+            stop_completed: true,
+            last_activity_ms: env.dateNow() - 1000,
+            token_expires_at_ms: env.dateNow() + 600_000,
+        }),
+    );
+    const entries = await resumeWith({}, rigSeams(env, store, fakeMedia(env)));
+    await until(() => env.calls.some((call) => call.url.endsWith('/reset')));
+    await env.advance(1000);
+
+    assert.deepEqual(
+        entries.map(({ state }) => state),
+        ['interrupted'],
+    );
+    assert.equal(
+        env.calls.filter((call) => call.url.endsWith('/finalise')).length,
+        0,
+    );
+    assert.equal(
+        (await store.getSession(descriptor.session_id))?.pending_reset_take,
+        null,
+    );
+});
+
+/**
+ * A take recorded for `recordMs` in a page that then goes away without a
+ * stop (its timers never run again). The fake recorder cuts only when it
+ * stops, so each open run is given the segments a live page would have cut:
+ * an init and seq 1 delivered, seq 2 still pending.
+ */
+async function interruptedTake(sessionId: string, recordMs: number) {
+    const descriptor = {
+        ...descriptorFixture('answer'),
+        session_id: sessionId,
+    };
+    const store = new MemoryQueueStore();
+    const first = sessionRig({ descriptor, store, chunks: true });
+    await first.session.prepare();
+    const starting = first.session.start();
+    await first.env.advance(descriptor.recording?.countdown_ms ?? 0);
+    await starting;
+    await first.env.advance(recordMs);
+
+    for (const run of await store.listRuns(sessionId)) {
+        for (const seq of [0, 1, 2]) {
+            await store.putSegment(
+                segmentRecord({
+                    session_id: sessionId,
+                    track: run.track,
+                    take: run.take,
+                    run_index: run.run_index,
+                    run_id: run.run_id,
+                    seq,
+                    start_ms:
+                        seq === 0
+                            ? run.anchor_ms
+                            : run.anchor_ms + (seq - 1) * 5000,
+                    state: seq === 2 ? 'pending' : 'delivered',
+                    ...(seq === 2 ? {} : { data: null }),
+                }),
+            );
+        }
+    }
+
+    const env = fakeEnvironment({ date: first.env.dateNow() + 5000 });
+    const second = sessionRig({ descriptor, store, env, chunks: true });
+
+    return { descriptor, store, first, second };
+}
+
+test('a reload into an open take ends its runs as reload, and start() continues it with no countdown on the wall clock', async () => {
+    const { store, second, descriptor } = await interruptedTake(
+        '01jbz8q4w6x0k3m5n7p9r2t4s1',
+        12_000,
+    );
+    await second.session.prepare();
+    const before = await store.listRuns(descriptor.session_id);
+    const segments = await store.listSegments(descriptor.session_id);
+
+    assert.ok(before.length > 0);
+    for (const run of before) {
+        const ends = segments
+            .filter(
+                (segment) =>
+                    segment.track === run.track &&
+                    segment.run_index === run.run_index,
+            )
+            .map((segment) => segment.start_ms + segment.duration_ms);
+        assert.deepEqual(
+            [run.ended_reason, run.ended_ms],
+            ['reload', Math.max(run.anchor_ms, ...ends)],
+        );
+    }
+
+    const milestones: string[] = [];
+    second.session.onMilestone((milestone) => milestones.push(milestone.name));
+    const starting = second.session.start();
+    await second.env.advance(10);
+    await starting;
+    const after = await store.listRuns(descriptor.session_id);
+
+    assert.equal(second.session.state.phase, 'recording');
+    assert.deepEqual(milestones, []);
+    assert.equal(after.length, before.length * 2);
+    assert.ok(
+        after
+            .filter((run) => run.ended_reason === null)
+            .every(
+                (run) => run.anchor_source === 'wall_clock' && run.take === 1,
+            ),
+    );
+    // The pending seq 2 of each interrupted run went back into the queue.
+    assert.deepEqual(
+        second
+            .segmentCalls()
+            .map((call) => call.url.split('/').slice(-3).join('/'))
+            .sort(),
+        ['audio/segments/2', 'camera/segments/2'],
+    );
+});
+
+test('finalise() of an interrupted take seals it where its last stored segment ends', async () => {
+    const { store, second, descriptor } = await interruptedTake(
+        '01jbz8q4w6x0k3m5n7p9r2t4s2',
+        12_000,
+    );
+    const segments = await store.listSegments(descriptor.session_id);
+    const end = Math.max(
+        ...segments.map((segment) => segment.start_ms + segment.duration_ms),
+    );
+    assert.ok(segments.length > 0);
+    const finalising = second.session.finalise();
+    await second.env.advance(10);
+    await finalising;
+
+    assert.deepEqual(
+        second
+            .manifestCalls()
+            .map((call) => JSON.parse(String(call.body)).end_ms),
+        [end, end],
+    );
+    assert.deepEqual(
+        second
+            .calls(/\/finalise$/)
+            .map((call) => JSON.parse(String(call.body)).end_ms),
+        [end],
+    );
+    assert.ok(end < second.session.now() - 5000);
+});
+
+test('reset() of an interrupted take resets it without continuing it', async () => {
+    const { second } = await interruptedTake(
+        '01jbz8q4w6x0k3m5n7p9r2t4s3',
+        12_000,
+    );
+    const resetting = second.session.reset();
+    await second.env.advance(10);
+    await resetting;
+    const starting = second.session.start();
+    const milestones: string[] = [];
+    second.session.onMilestone((milestone) => milestones.push(milestone.name));
+    await second.env.advance(3000);
+    await starting;
+
+    assert.equal(second.calls(/\/reset$/).length, 1);
+    assert.ok(milestones.includes('countdown_last'));
+    assert.equal(second.session.state.phase, 'recording');
+});
+
+test('a reload after a completed stop is stopped: start() needs reset() first', async () => {
+    const descriptor = {
+        ...descriptorFixture('monitor'),
+        session_id: '01jbz8q4w6x0k3m5n7p9r2t4s4',
+    };
+    const store = new MemoryQueueStore();
+    const first = sessionRig({ descriptor, store, chunks: true });
+    await recordTake(first, 2000);
+    first.session.destroy();
+    const second = sessionRig({ descriptor, store, chunks: true });
+    await second.session.prepare();
+
+    assert.equal(second.session.state.phase, 'stopped');
+    await assert.rejects(
+        second.session.start(),
+        (error: unknown) =>
+            (error as { code?: string }).code === 'invalid_state',
+    );
 });

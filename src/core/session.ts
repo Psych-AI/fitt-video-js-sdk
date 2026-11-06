@@ -68,6 +68,7 @@ import {
     MemoryQueueStore,
     openStore,
     type QueueStore,
+    type RunRecord,
     type SegmentRecord,
     type SessionRecord,
 } from './store.ts';
@@ -142,6 +143,20 @@ export interface SessionSeams {
 
 type StorageView = SessionSeams['storage'];
 
+/**
+ * How resume() opens a stored session (Task 15b, author's call 15). Not part
+ * of the public API. The session it opens is passive: it captures nothing
+ * and listens to no page until the host re-attaches with
+ * FittVideo.session(descriptor) or calls prepare().
+ */
+export interface ResumeOpening {
+    /** 'finalise' drains the queue, then finalises with the stored take end; 'drain' only drains. */
+    resume: 'drain' | 'finalise';
+}
+
+/** What build() starts: everything, the queue and the batches only, or nothing (an owed discard). */
+type BuildMode = 'full' | 'drain' | 'none';
+
 /** Errors that leave nothing to record with: only these enter phase 'error' (author's call 12). */
 const PHASE_ERRORS: ReadonlySet<string> = new Set([
     'permission_denied',
@@ -184,11 +199,14 @@ const MANIFEST_BLOCKED_AFTER = 2;
 const OWN_VIDEO_STYLE =
     'position:fixed;width:1px;height:1px;opacity:0;pointer-events:none';
 
-const epochKey = (sessionId: string): string => `fitt-video:${sessionId}:epoch`;
-const seqKey = (sessionId: string): string =>
+/** The storage key of a session's epoch copy (shared by every tab of the origin). */
+export const epochKey = (sessionId: string): string =>
+    `fitt-video:${sessionId}:epoch`;
+/** The storage key of a session's synchronous next_batch_seq copy. */
+export const seqKey = (sessionId: string): string =>
     `fitt-video:${sessionId}:next_batch_seq`;
 
-function readNumber(storage: StorageView, key: string): number | null {
+export function readNumber(storage: StorageView, key: string): number | null {
     try {
         const value = storage?.getItem(key) ?? null;
 
@@ -204,7 +222,11 @@ function readNumber(storage: StorageView, key: string): number | null {
     }
 }
 
-function writeItem(storage: StorageView, key: string, value: string): void {
+export function writeItem(
+    storage: StorageView,
+    key: string,
+    value: string,
+): void {
     try {
         storage?.setItem(key, value);
     } catch {
@@ -212,7 +234,7 @@ function writeItem(storage: StorageView, key: string, value: string): void {
     }
 }
 
-function removeItem(storage: StorageView, key: string): void {
+export function removeItem(storage: StorageView, key: string): void {
     try {
         storage?.removeItem(key);
     } catch {
@@ -400,6 +422,7 @@ export function createSession(
     input: unknown,
     options: SessionOptions,
     seams: SessionSeams,
+    opening: ResumeOpening | null = null,
 ): FittSession {
     const read = readDescriptor(input);
 
@@ -501,6 +524,14 @@ export function createSession(
     let checksPoll: ChecksPoll | null = null;
     /** The capture error of the re-acquire after the last reset, if it failed. */
     let reacquireError: unknown = null;
+    /** A take a reload interrupted, not yet continued, sealed or reset (step 8). */
+    let interrupted = false;
+    /** The end of the interrupted take's last stored segment: its end when it is finalised without being continued. */
+    let interruptedEndMs = 0;
+    /** resume() found a completed stop: finalise once the queue has drained (author's call 15). */
+    let autoFinalise = opening?.resume === 'finalise';
+    /** startPipeline() ran: the queue holds every pending segment, so a backlog of 0 means drained. */
+    let pipelineStarted = false;
 
     // Previews and the stall watch (item 13).
     const previews: HTMLVideoElement[] = [];
@@ -631,6 +662,8 @@ export function createSession(
         ) {
             state.patch({ upload: next });
         }
+
+        maybeAutoFinalise();
     };
 
     const reportStorage = (reason: 'open_failed' | 'quota'): void => {
@@ -1077,6 +1110,23 @@ export function createSession(
         }
 
         await persist();
+        await postOwedManifests(tracks, take, endMs);
+
+        if (take === localTake && !closed) {
+            // stop() has posted the manifests: the take's checks poll may start (spec 6.7).
+            sealedTake = take;
+        }
+    };
+
+    /**
+     * Posts the owed manifests of `take` and waits for each final answer, or
+     * until a network known to block preflights holds them up (item 5).
+     */
+    const postOwedManifests = async (
+        tracks: ChunkedTrack[],
+        take: number,
+        endMs: number,
+    ): Promise<void> => {
         const results = await Promise.all(
             tracks.map((track) => postManifest(track, take, endMs)),
         );
@@ -1091,11 +1141,6 @@ export function createSession(
             }
 
             setError('manifests_blocked', { tracks: [...blockedTracks] });
-        }
-
-        if (take === localTake && !closed) {
-            // stop() has posted the manifests: the take's checks poll may start (spec 6.7).
-            sealedTake = take;
         }
     };
 
@@ -1382,6 +1427,7 @@ export function createSession(
         clearError('manifests_blocked', 'manifest_rejected');
         activeTake = null;
         sealedTake = null;
+        interrupted = false;
         // Nothing of the old take is sealed later, not even by finalise().
         deferredSealed = true;
         checksPoll?.cancel();
@@ -1634,6 +1680,7 @@ export function createSession(
             void persist();
         }
 
+        maybeAutoFinalise();
         void maybeTombstone();
     };
 
@@ -1805,6 +1852,8 @@ export function createSession(
         state.patch({ phase });
 
         if (phase === 'recording') {
+            // The interrupted take is continued with a new run.
+            interrupted = false;
             stay?.arm();
         } else {
             stay?.disarm();
@@ -1928,10 +1977,10 @@ export function createSession(
 
     /**
      * Builds the pipeline over the stored record, in the plan's order (item
-     * 5). A passive build (an owed discard) starts no uploader, no batcher
-     * timer and no page listener: nothing but the discard is ever sent.
+     * 5). It starts nothing that sends: startPipeline() does, once the owed
+     * calls are done.
      */
-    const build = (passive: boolean): void => {
+    const build = (): void => {
         const held = record as SessionRecord;
         api = createSessionApi(
             env,
@@ -2235,17 +2284,168 @@ export function createSession(
             onlineTarget?.removeEventListener('online', onOnline);
 
         tickTimer = env.timers.setTimeout(tick, TICK_MS);
+    };
 
-        if (passive) {
+    /**
+     * Starts what sends. 'none' (an owed discard) starts nothing, so
+     * nothing but the discard is ever sent; 'drain' (a session resume()
+     * opened) uploads and sends batches but listens to no page until the
+     * host re-attaches; 'full' also attaches the page.
+     */
+    const startPipeline = (mode: BuildMode): void => {
+        if (
+            mode === 'none' ||
+            closed ||
+            uploader === null ||
+            batcher === null
+        ) {
             return;
         }
 
-        if (!destroyed) {
+        if (mode === 'full' && !destroyed) {
             attachPage();
         }
 
         uploader.start();
         batcher.startTimer({ emptyHeartbeats: false });
+        pipelineStarted = true;
+        maybeAutoFinalise();
+    };
+
+    /** A session resume() found stopped: once the queue has drained it finalises itself, with the stored take end. */
+    function maybeAutoFinalise(): void {
+        if (
+            !autoFinalise ||
+            !pipelineStarted ||
+            finalising ||
+            finalised ||
+            closed ||
+            tombstoned ||
+            discarding !== null ||
+            resetting !== null ||
+            uploader === null ||
+            uploader.stats().backlog > 0
+        ) {
+            return;
+        }
+
+        autoFinalise = false;
+        void created
+            .finalise()
+            .catch((error: unknown) =>
+                warn(
+                    `Fitt Video: the resumed finalise failed: ${String(error)}`,
+                ),
+            );
+    }
+
+    /** The end of the last stored segment of a run, or its anchor when it has none. */
+    const runEnd = (run: RunRecord, segments: SegmentRecord[]): number =>
+        segments
+            .filter(
+                (segment) =>
+                    segment.track === run.track &&
+                    segment.take === run.take &&
+                    segment.run_index === run.run_index,
+            )
+            .reduce(
+                (end, segment) =>
+                    Math.max(end, segment.start_ms + segment.duration_ms),
+                run.anchor_ms,
+            );
+
+    /**
+     * Step 8, after a reload over a stored record (Task 15b): the owed
+     * manifests first, a stop that was under way completed, the runs of an
+     * open take ended as `reload` and the take continued from its stored
+     * start (author's call 12), and every pending segment back in the queue.
+     */
+    const continueAfterReload = async (): Promise<void> => {
+        if (!recordExisted || record === null || closed) {
+            return;
+        }
+
+        const take = localTake;
+        const owedEndMs = record.take_end_ms;
+        const owedTracks = chunkedTracks(descriptor).filter(
+            (track) => record?.manifest_owed[track.track] === take,
+        );
+
+        if (owedTracks.length > 0 && owedEndMs !== null) {
+            // Each owed manifest goes before anything else is uploaded.
+            await postOwedManifests(owedTracks, take, owedEndMs);
+        }
+
+        const held = record as SessionRecord | null;
+
+        if (held === null || closed) {
+            return;
+        }
+
+        if (held.take_open && held.take_end_ms !== null) {
+            // stop() had posted its manifests when the page went: the stop is complete now.
+            held.take_open = false;
+            held.stop_completed = true;
+        }
+
+        if (held.take_open && held.take_start_ms === null) {
+            held.take_open = false;
+        }
+
+        const runs = await store.listRuns(sessionId);
+        const segments = await store.listSegments(sessionId);
+
+        if (held.take_open && held.take_start_ms !== null) {
+            for (const run of runs) {
+                if (run.take === take && run.ended_reason === null) {
+                    await store.putRun({
+                        ...run,
+                        ended_reason: 'reload',
+                        ended_ms: runEnd(run, segments),
+                    });
+                }
+            }
+
+            interruptedEndMs = segments
+                .filter((segment) => segment.take === take)
+                .reduce(
+                    (end, segment) =>
+                        Math.max(end, segment.start_ms + segment.duration_ms),
+                    held.take_start_ms,
+                );
+            interrupted = true;
+            activeTake = take;
+            lifecycle?.resumeTake(held.take_start_ms);
+        } else if (held.stop_completed) {
+            // A stopped take needs reset() before another, as in the page that stopped it.
+            if (held.take_end_ms !== null) {
+                for (const track of chunkedTracks(descriptor)) {
+                    if (
+                        runs.some(
+                            (run) =>
+                                run.track === track.track && run.take === take,
+                        )
+                    ) {
+                        // Its manifest was posted, so an abandon re-posts it (author's call 8).
+                        posted.add(`${track.track}:${take}`);
+                    }
+                }
+            }
+
+            lifecycle?.setPhase(
+                held.rejected_take === take ? 'rejected' : 'stopped',
+            );
+        }
+
+        await persist();
+        const pending = segments.filter(
+            (segment) => segment.state === 'pending' && segment.take === take,
+        );
+        queue?.adopt(pending);
+
+        for (const segment of pending) {
+            uploader?.enqueue(segment);
+        }
     };
 
     const ready: Promise<void> = (async () => {
@@ -2262,7 +2462,10 @@ export function createSession(
             }
         }
 
-        await purgeSweep();
+        if (opening === null) {
+            // resume() swept every stored session before it opened this one.
+            await purgeSweep();
+        }
 
         if (await loadRecord()) {
             becomeTombstone();
@@ -2277,11 +2480,11 @@ export function createSession(
             return;
         }
 
-        const owedDiscard = held.pending_discard;
-        build(owedDiscard);
+        build();
 
-        if (owedDiscard) {
+        if (held.pending_discard) {
             // A discard that never landed is finished before anything else, and nothing else is sent.
+            startPipeline('none');
             void runDiscard().catch((error: unknown) =>
                 warn(
                     `Fitt Video: the owed discard was refused: ${String(error)}`,
@@ -2300,6 +2503,9 @@ export function createSession(
                     ),
             );
         }
+
+        await continueAfterReload();
+        startPipeline(opening === null ? 'full' : 'drain');
     })();
     ready.catch((error: unknown) =>
         console.error('Fitt Video: the session could not start.', error),
@@ -2403,6 +2609,14 @@ export function createSession(
             return rejectWith('invalid_state', { phase });
         }
 
+        if (interrupted) {
+            // A take a reload interrupted and nobody continued ends where its
+            // last stored segment ends, not at clock.now(), which would add the
+            // reload's gap as a black, silent tail (spec 4.4).
+            interrupted = false;
+            await sealTracks(interruptedEndMs);
+        }
+
         const unsealed = life.unsealedEndMs();
 
         if (unsealed !== null && !deferredSealed) {
@@ -2497,10 +2711,9 @@ export function createSession(
                 return rejectWith('invalid_state', { reason: 'discarding' });
             }
 
-            if (destroyed) {
-                destroyed = false;
-                attachPage();
-            }
+            // A session resume() opened, or one destroy() released, listens to the page again.
+            destroyed = false;
+            attachPage();
 
             const phase = (lifecycle as Lifecycle).phase();
 
@@ -2753,16 +2966,38 @@ export function createSession(
 
             const life = lifecycle as Lifecycle;
             const phase = life.phase();
+            // A take a reload interrupted may be reset without being continued (spec 6.5).
+            const interruptedReset =
+                interrupted &&
+                (phase === 'idle' || phase === 'ready' || phase === 'error');
 
-            if (phase !== 'stopped' && phase !== 'rejected') {
+            if (
+                phase !== 'stopped' &&
+                phase !== 'rejected' &&
+                !interruptedReset
+            ) {
                 return rejectWith('invalid_state', { phase });
             }
 
             resetting = (async (): Promise<void> => {
-                await resetTake(localTake, true);
+                // An interrupted take holds capture only when the host prepared it.
+                await resetTake(
+                    localTake,
+                    !interruptedReset || phase === 'ready',
+                );
+
+                if (interruptedReset) {
+                    // Through stopped, so ready forgets the take's stored start in the lifecycle.
+                    life.setPhase('stopped');
+                }
+
                 // ready forgets the take in the lifecycle, so nothing of it is sealed later.
                 life.setPhase('ready');
                 state.patch({ checks: null });
+
+                if (interruptedReset && engine?.stream === null) {
+                    life.setPhase('idle');
+                }
 
                 if (reacquireError !== null) {
                     const code = codeOf(reacquireError);
@@ -2857,6 +3092,21 @@ export function createSession(
         },
     };
 
+    /** The host re-attached a session resume() opened: it listens to the page from now on. */
+    const reattach = (): void => {
+        void ready.then(() => {
+            if (
+                !destroyed &&
+                !closed &&
+                !tombstoned &&
+                !tombstoning &&
+                discarding === null
+            ) {
+                attachPage();
+            }
+        });
+    };
+
     setters.set(created, (next) => {
         if (tombstoned) {
             return;
@@ -2864,12 +3114,14 @@ export function createSession(
 
         if (token === null) {
             pendingDescriptors.push(next);
+            reattach();
 
             return;
         }
 
         // The keeper persists it only when its token is newer (author's call 10).
         token.set(next);
+        reattach();
     });
 
     return created;
@@ -2897,6 +3149,35 @@ export function sessionWith(
     }
 
     const created = createSession(read.descriptor, options, seams);
+    sessions.set(key, created);
+
+    return created;
+}
+
+/** The session object this page already holds for an id, if any. */
+export function heldSession(sessionId: string): FittSession | undefined {
+    return sessions.get(sessionId.toLowerCase());
+}
+
+/**
+ * The passive session resume() opens over a stored record, entered in the
+ * same-id map, so a later FittVideo.session(descriptor) with its id returns
+ * this object (spec 6.5). An object this page already holds is returned as is.
+ */
+export function openResumed(
+    descriptor: Descriptor,
+    options: SessionOptions,
+    seams: SessionSeams,
+    opening: ResumeOpening,
+): FittSession {
+    const key = descriptor.session_id.toLowerCase();
+    const existing = sessions.get(key);
+
+    if (existing !== undefined) {
+        return existing;
+    }
+
+    const created = createSession(descriptor, options, seams, opening);
     sessions.set(key, created);
 
     return created;
