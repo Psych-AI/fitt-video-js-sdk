@@ -95,6 +95,8 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
     let stream: MediaStream | null = null;
     let acquired: MediaStream[] = [];
     let runs: Run[] = [];
+    /** The stops of runs the recorder failed, which left `runs` at the error; stopRuns() waits for them. */
+    const failing = new Set<Promise<RunRecord>>();
     /** The getUserMedia in flight, which a second prepare() joins. */
     let pending: Promise<void> | null = null;
     /** Counts releases, so a capture that lands after one is stopped, never kept. */
@@ -472,6 +474,8 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
      * stops itself with recorder_error (run.ts); the replacement starts at
      * once on the same take and stream, without waiting for the failed
      * run's last data to be stored, so the gap is as short as it can be.
+     * The failed run's stop is kept in `failing`, so stopTake() still waits
+     * for its last segments and its ended record before it releases capture.
      */
     function onRunError(
         run: Run,
@@ -484,6 +488,12 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
         }
 
         runs = runs.filter((other) => other !== run);
+        // The same promise the run's own error listener gets from stop().
+        const stopping = run.stop('recorder_error');
+        failing.add(stopping);
+        void stopping
+            .finally(() => failing.delete(stopping))
+            .catch(() => undefined);
         deps.onError('recorder_error');
 
         // Loop guard: a replacement that fails before it cut a media segment is not replaced again.
@@ -504,8 +514,9 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
 
     /**
      * A run for one track. A run that replaces one the recorder failed
-     * (`replacing`) clears the error at its start event, and is not
-     * replaced again if it fails before it cut a media segment.
+     * (`replacing`) clears the error at its recorder's own `start` event
+     * while it is still an open run, and is not replaced again if it fails
+     * before it cut a media segment.
      */
     function runFor(
         track: ChunkedTrack,
@@ -532,17 +543,24 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
                     onRunError(run, track, replacing),
                 );
 
+                if (replacing) {
+                    // Not the run's recorder.started, which finish() also emits for a recorder that never started.
+                    made.addEventListener(
+                        'start',
+                        () => {
+                            if (runs.includes(run)) {
+                                deps.onError(null);
+                            }
+                        },
+                        { once: true },
+                    );
+                }
+
                 return made;
             },
             add: (record) => deps.add(record),
             putRun: (record) => deps.putRun(record),
-            emit: (type, payload) => {
-                deps.emit(type, payload);
-
-                if (replacing && type === 'recorder.started') {
-                    deps.onError(null);
-                }
-            },
+            emit: (type, payload) => deps.emit(type, payload),
             // onRunError() has already handed the track to a replacement.
             onRecorderError: () => undefined,
             ua: deps.ua,
@@ -551,13 +569,18 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
         return run;
     }
 
-    /** Stops every open run with this reason; the first failure is thrown after all have stopped. */
+    /**
+     * Stops every open run with this reason and waits for the runs the
+     * recorder failed to finish stopping; the first failure is thrown after
+     * all have stopped.
+     */
     async function stopRuns(reason: RunEndedReason): Promise<void> {
         const stopping = runs;
         runs = [];
-        const results = await Promise.allSettled(
-            stopping.map((run) => run.stop(reason)),
-        );
+        const results = await Promise.allSettled([
+            ...stopping.map((run) => run.stop(reason)),
+            ...failing,
+        ]);
         const failed = results.find(
             (result): result is PromiseRejectedResult =>
                 result.status === 'rejected',

@@ -5,7 +5,7 @@ import type { ChunkedTrack } from '../../src/core/descriptor.ts';
 import { FittVideoError } from '../../src/core/errors.ts';
 import type { RunRecord, SegmentRecord } from '../../src/core/store.ts';
 import { createRecorderEngine } from '../../src/recorder/engine.ts';
-import { fakeEnvironment } from '../support/fake-env.ts';
+import { fakeEnvironment, settle } from '../support/fake-env.ts';
 import { fakeMedia } from '../support/fake-media.ts';
 import { readSet } from '../support/fixtures.ts';
 import { descriptorFixture, SID } from '../support/records.ts';
@@ -16,6 +16,8 @@ function engineRig(
         permission?: Partial<Record<'camera' | 'microphone', PermissionState>>;
         chunks?: boolean;
         noRecorder?: boolean;
+        /** Held before a segment is stored, when it returns a promise. */
+        holdAdd?: (record: SegmentRecord) => Promise<void> | undefined;
     } = {},
 ) {
     const env = fakeEnvironment();
@@ -66,6 +68,7 @@ function engineRig(
             runs.set(record.run_id, record);
         },
         add: async (record) => {
+            await options.holdAdd?.(record);
             added.push(record);
         },
         emit: (type, payload) => events.push([type, payload]),
@@ -340,6 +343,88 @@ test('a replacement run that fails before it cut a media segment is not replaced
     assert.deepEqual(r.cameraReasons(), ['recorder_error', 'recorder_error']);
     assert.deepEqual(r.errors, ['recorder_error', null, 'recorder_error']);
     assert.equal(r.media.recorders.length, 3);
+});
+
+test('stopTake waits for a run the recorder failed just before it, so its last segments and its ended record are stored', async () => {
+    let open: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+        open = resolve;
+    });
+    const r = engineRig({
+        chunks: true,
+        holdAdd: (record) =>
+            record.track === 'camera' && record.run_index === 0
+                ? gate
+                : undefined,
+    });
+    await r.engine.prepare();
+    await r.engine.startTake(0);
+    await r.env.advance(10);
+    r.media.recorders[0].dispatchEvent(new Event('error'));
+    let settled = false;
+    const stopping = r.engine.stopTake().then(() => {
+        settled = true;
+
+        return {
+            reasons: r.cameraReasons(),
+            failedSegments: r.added.filter(
+                (s) => s.track === 'camera' && s.run_index === 0,
+            ).length,
+        };
+    });
+    const audioStopped = (): boolean =>
+        [...r.runs.values()].some(
+            (run) => run.track === 'audio' && run.ended_reason === 'stop',
+        );
+
+    for (let turn = 0; turn < 100 && !audioStopped(); turn++) {
+        await r.env.advance(10);
+    }
+
+    await settle();
+    assert.ok(audioStopped());
+    assert.equal(settled, false);
+    assert.ok(r.media.acquired[0].some((track) => !track.stopped));
+
+    open();
+    const seen = await stopping;
+
+    assert.deepEqual(seen.reasons, ['recorder_error']);
+    assert.ok(seen.failedSegments > 0);
+    assert.equal(r.media.recorders.length, 2);
+    assert.ok(r.media.acquired[0].every((track) => track.stopped));
+});
+
+test('a replacement run that fails before its start event leaves the error set', async () => {
+    const r = engineRig();
+    await r.engine.prepare();
+    await r.engine.startTake(0);
+    await r.env.advance(10);
+    r.media.recorders[0].dispatchEvent(new Event('error'));
+    await settle();
+    assert.equal(r.media.recorders.length, 3);
+    r.media.recorders[2].dispatchEvent(new Event('error'));
+    await r.env.advance(10);
+    await r.stop();
+
+    assert.deepEqual(r.cameraReasons(), ['recorder_error', 'recorder_error']);
+    assert.deepEqual(r.errors, ['recorder_error', 'recorder_error']);
+});
+
+test('a replacement run stopped by an unplug before its start event leaves device_disconnected set', async () => {
+    const r = engineRig();
+    await r.engine.prepare();
+    await r.engine.startTake(0);
+    await r.env.advance(10);
+    r.media.recorders[0].dispatchEvent(new Event('error'));
+    await settle();
+    assert.equal(r.media.recorders.length, 3);
+    r.media.videoTrack().end();
+    await r.env.advance(10);
+    await r.stop();
+
+    assert.deepEqual(r.cameraReasons(), ['recorder_error', 'device_switch']);
+    assert.deepEqual(r.errors, ['recorder_error', 'device_disconnected']);
 });
 
 test('an unplugged camera is device_disconnected, and a devicechange that brings it back starts a new run', async () => {
