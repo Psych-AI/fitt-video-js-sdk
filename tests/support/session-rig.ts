@@ -140,11 +140,8 @@ export function sessionRig(
     const descriptor =
         options.descriptor ?? descriptorFixture(options.recipe ?? 'monitor');
     env.respond(router());
-    const session = createSession(
-        descriptor,
-        options.options ?? {},
-        rigSeams(env, store, media, storage),
-    );
+    const seams = rigSeams(env, store, media, storage);
+    const session = createSession(descriptor, options.options ?? {}, seams);
     const calls = (pattern: RegExp): FetchCall[] =>
         env.calls.filter((call) => pattern.test(call.url));
 
@@ -155,6 +152,8 @@ export function sessionRig(
         media,
         descriptor,
         session,
+        /** The fake page the session listens on. */
+        page: seams.page!,
         respond(overrides: Record<string, Answer>): void {
             env.respond(router(overrides));
         },

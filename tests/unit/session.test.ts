@@ -6,12 +6,17 @@ import { MemoryQueueStore } from '../../src/core/store.ts';
 import { FittVideo } from '../../src/index.ts';
 import { fakeEnvironment, json, settle, until } from '../support/fake-env.ts';
 import { fakeMedia } from '../support/fake-media.ts';
-import { descriptorFixture, sessionRecord } from '../support/records.ts';
+import {
+    descriptorFixture,
+    segmentRecord,
+    sessionRecord,
+} from '../support/records.ts';
 import {
     recordTake,
     rigSeams,
     sessionRig,
     statusBody,
+    type SessionRig,
 } from '../support/session-rig.ts';
 
 test('options narrow what the descriptor allows and never widen it', () => {
@@ -427,4 +432,121 @@ test('a preview attached before prepare() gets the stream, and the stall watch w
         r.session.stream !== null && video.srcObject === r.session.stream,
     );
     assert.ok(frameRequests >= 1);
+});
+
+/** finalise() after the recorded take, then until the tombstone is written. */
+async function finaliseToTombstone(r: SessionRig): Promise<void> {
+    const finalising = r.session.finalise();
+    await r.env.advance(10);
+    await finalising;
+    await until(() => r.session.state.upload.sessionFinalised);
+
+    for (let i = 0; i < 20; i++) {
+        await settle();
+    }
+
+    assert.equal(
+        (await r.store.getSession(r.descriptor.session_id))?.finalised,
+        true,
+    );
+}
+
+test('a finalised session still polls checks and playback, in this page and as a tombstone in a later one', async () => {
+    const r = sessionRig({ chunks: true });
+    r.respond({
+        '/status': () =>
+            json(
+                200,
+                statusBody(
+                    { status: 'done', verdict: 'accept', take: 1, reasons: [] },
+                    {
+                        playback: {
+                            camera: {
+                                url: 'https://media.example/camera.webm',
+                            },
+                        },
+                    },
+                ),
+            ),
+    });
+    await recordTake(r, 1000);
+    await finaliseToTombstone(r);
+    const again = createSession(
+        r.descriptor,
+        {},
+        rigSeams(r.env, r.store, fakeMedia(r.env), r.storage),
+    );
+
+    assert.equal(
+        await r.session.waitForReady({ track: 'camera' }),
+        'https://media.example/camera.webm',
+    );
+    assert.equal((await again.waitForChecks()).verdict, 'accept');
+    assert.equal(
+        await again.waitForReady({ track: 'camera' }),
+        'https://media.example/camera.webm',
+    );
+});
+
+test('finalise() from ready leaves a tombstone: no new take, and no refresh after it', async () => {
+    const r = sessionRig({ chunks: true });
+    await r.session.prepare();
+    await finaliseToTombstone(r);
+
+    assert.equal(r.session.state.phase, 'stopped');
+    await assert.rejects(
+        r.session.start(),
+        (error: unknown) =>
+            (error as { code?: string }).code === 'invalid_state' &&
+            (error as { detail?: { reason?: string } }).detail?.reason ===
+                'finalised',
+    );
+    await r.env.advance(2 * 675_000);
+    assert.deepEqual(r.calls(/\/refresh-upload$/), []);
+    assert.deepEqual(r.segmentCalls(), []);
+});
+
+test('a tombstone freezes and sends no batch when the page hides: the signals and pagehide are detached', async () => {
+    const r = sessionRig({ chunks: true });
+    await recordTake(r, 1000);
+    await finaliseToTombstone(r);
+    const before = r.env.calls.length;
+    const doc = r.page.doc as unknown as EventTarget & {
+        visibilityState: string;
+    };
+    r.page.win.dispatchEvent(new Event('blur'));
+    doc.visibilityState = 'hidden';
+    doc.dispatchEvent(new Event('visibilitychange'));
+    r.page.win.dispatchEvent(new Event('pagehide'));
+    await r.env.advance(10_000);
+
+    assert.deepEqual(
+        r.env.calls.slice(before).filter((call) => /\/events$/.test(call.url)),
+        [],
+    );
+    assert.deepEqual(await r.store.listBatches(r.descriptor.session_id), []);
+});
+
+test('the purge keeps the numbering of the session being opened: idle past abandon_after_ms, its first batch_seq is still the stored one', async () => {
+    const descriptor = descriptorFixture('monitor');
+    const store = new MemoryQueueStore();
+    await store.putSession(
+        sessionRecord({
+            session_id: descriptor.session_id,
+            descriptor,
+            next_batch_seq: 7,
+            last_activity_ms: 1_762_400_000_000 - 600_001,
+        }),
+    );
+    await store.putSegment(
+        segmentRecord({ session_id: descriptor.session_id }),
+    );
+    const r = sessionRig({ descriptor, store });
+    r.session.event('marker');
+    await r.session.prepare();
+    await r.env.advance(5000);
+    const [body] = r.bodies();
+
+    assert.equal(body.batch_seq, 7);
+    assert.deepEqual(await store.listSegments(descriptor.session_id), []);
 });

@@ -403,6 +403,7 @@ export function createSession(
     let stay: { arm(): void; disarm(): void } | null = null;
     let stopSignals: (() => void) | null = null;
     let pageListeners: (() => void)[] = [];
+    let removeOnline: (() => void) | null = null;
     let tickTimer: number | null = null;
 
     /** Events raised before the batcher exists; they move onto the stored clock if it changes. */
@@ -445,9 +446,13 @@ export function createSession(
         clock,
         groups: settings.groups,
         onQueued: (event) => {
-            if (batcher !== null) {
+            // A finished session queues nothing more: the last flush is behind it (item 10).
+            // Listeners still see the event; no batch carries it.
+            const sending = !tombstoned && !tombstoning;
+
+            if (sending && batcher !== null) {
                 batcher.add(event);
-            } else if (!tombstoned) {
+            } else if (sending) {
                 early.push(event);
             }
 
@@ -587,8 +592,26 @@ export function createSession(
 
         for (const stored of await store.listSessions()) {
             const plan = planResume(stored, nowMs);
+            const own =
+                stored.session_id.toLowerCase() === sessionId.toLowerCase();
 
-            if (plan === 'purge') {
+            if (plan === 'purge' && own) {
+                // The session being opened: its media is abandoned, its numbering is not.
+                // A fresh next_batch_seq would replay seqs the server already holds,
+                // and the server drops a replayed batch_seq as a no-op.
+                await store.deleteSession(stored.session_id);
+                await store.putSession({
+                    ...stored,
+                    take_start_ms: null,
+                    take_open: false,
+                    take_end_ms: null,
+                    stop_completed: false,
+                    manifest_owed: {},
+                    finalised: false,
+                    expires_at_ms: null,
+                    last_activity_ms: nowMs,
+                });
+            } else if (plan === 'purge') {
                 await store.deleteSession(stored.session_id);
                 removeItem(storage, epochKey(stored.session_id));
                 removeItem(storage, seqKey(stored.session_id));
@@ -614,6 +637,14 @@ export function createSession(
             planResume(existing, nowMs) === 'tombstone'
         ) {
             record = existing;
+            localTake = Math.max(existing.take, given.take);
+
+            if (
+                existing.descriptor.token.id.toLowerCase() >
+                given.token.id.toLowerCase()
+            ) {
+                descriptor = existing.descriptor;
+            }
 
             return true;
         }
@@ -701,10 +732,31 @@ export function createSession(
         return false;
     };
 
+    /**
+     * The token a finished session still reads with: the held one, never
+     * refreshed. Its lapse ends the call with token_expired instead of a
+     * wait for a refresh that a stopped keeper never makes.
+     */
+    const heldToken: Pick<TokenKeeper, 'current' | 'expired' | 'ready'> = {
+        current: () =>
+            token?.current() ?? {
+                id: descriptor.token.id,
+                secret: descriptor.token.secret,
+            },
+        expired: () => 'paused',
+        ready: () => rejectWith('token_expired'),
+    };
+
     /** The object a finalised session leaves: phase stopped, finalised, nothing running (item 10). */
     const becomeTombstone = (): void => {
         tombstoned = true;
         early = [];
+        // No uploader, batcher or keeper; the status reads (checks, playback) still go.
+        api = createSessionApi(
+            env,
+            () => descriptor,
+            () => heldToken.current(),
+        );
         state.patch({
             phase: 'stopped',
             upload: { ...state.get().upload, sessionFinalised: true },
@@ -1006,6 +1058,10 @@ export function createSession(
         stopTick();
         await batcher?.flush().catch((error: unknown) => console.error(error));
         batcher?.stop();
+        // No signal, pagehide or online listener may freeze or send a batch after the last flush.
+        detachPage();
+        removeOnline?.();
+        removeOnline = null;
         await token?.stop();
         await uploader?.stop();
         const tombstone: SessionRecord = {
@@ -1595,7 +1651,10 @@ export function createSession(
         }
 
         const onOnline = (): void => token?.check();
-        env.onlineTarget?.addEventListener('online', onOnline);
+        const onlineTarget = env.onlineTarget;
+        onlineTarget?.addEventListener('online', onOnline);
+        removeOnline = () =>
+            onlineTarget?.removeEventListener('online', onOnline);
 
         if (!destroyed) {
             attachPage();
@@ -1737,7 +1796,7 @@ export function createSession(
         async prepare(): Promise<void> {
             await ready;
 
-            if (tombstoned) {
+            if (tombstoned || finalised) {
                 return finalisedRefusal();
             }
 
@@ -1829,7 +1888,7 @@ export function createSession(
         async start(): Promise<void> {
             await ready;
 
-            if (tombstoned) {
+            if (tombstoned || finalised) {
                 return finalisedRefusal();
             }
 
@@ -1926,6 +1985,14 @@ export function createSession(
             }
 
             finalised = true;
+
+            if (life.phase() !== 'stopped') {
+                // Finalised with no stopped take (from idle, ready or error):
+                // nothing more is recorded into it, and it becomes the tombstone.
+                await preparing?.catch(() => undefined);
+                life.setPhase('stopped');
+            }
+
             refreshUpload();
             void maybeTombstone();
 
@@ -1935,11 +2002,8 @@ export function createSession(
         },
 
         async waitForChecks(checkOptions = {}): Promise<ChecksResult> {
+            // A finished session still polls with the held token (item 10).
             await ready;
-
-            if (tombstoned) {
-                return finalisedRefusal();
-            }
 
             // The shared poll, the rejected phase and the cancel on reset are Task 15a.
             return pollChecks(
@@ -1957,11 +2021,8 @@ export function createSession(
         },
 
         async waitForReady(readyOptions): Promise<string> {
+            // Playback exists only once a finalised session was processed: a tombstone polls too.
             await ready;
-
-            if (tombstoned) {
-                return finalisedRefusal();
-            }
 
             const url = await pollReady(
                 { env, status: () => api!.status() },
@@ -1976,7 +2037,7 @@ export function createSession(
         async reset(): Promise<void> {
             await ready;
 
-            if (tombstoned) {
+            if (tombstoned || finalised) {
                 return finalisedRefusal();
             }
 
@@ -1987,7 +2048,7 @@ export function createSession(
         async discard(): Promise<void> {
             await ready;
 
-            if (tombstoned) {
+            if (tombstoned || finalised) {
                 return finalisedRefusal();
             }
 
@@ -2002,15 +2063,11 @@ export function createSession(
         async uploadTranscript(upload): Promise<void> {
             const body = transcriptBody(upload);
             await ready;
-
-            if (tombstoned) {
-                return finalisedRefusal();
-            }
-
+            // A transcript often comes after finalise: a finished session sends it with the held token.
             const answer = await callWithRetry(
                 {
                     env,
-                    token: token!,
+                    token: tombstoned || tombstoning ? heldToken : token!,
                     onSuccess: () => ladder?.markSucceeded(),
                 },
                 () => api!.transcript(body),
