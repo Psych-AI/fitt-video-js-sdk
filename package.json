@@ -5,9 +5,25 @@
     "type": "module",
     "license": "UNLICENSED",
     "sideEffects": false,
+    "files": [
+        "dist",
+        "skill"
+    ],
+    "exports": {
+        ".": {
+            "types": "./dist/types/index.d.ts",
+            "default": "./dist/npm/index.js"
+        },
+        "./ui": {
+            "types": "./dist/types/ui.d.ts",
+            "default": "./dist/npm/ui.js"
+        }
+    },
     "scripts": {
+        "build": "vite build -c vite.hosted.config.ts && vite build -c vite.npm.config.ts && tsc -p tsconfig.build.json",
         "test": "node --test 'tests/unit/**/*.test.ts'",
         "typecheck": "tsc -p tsconfig.json && tsc -p tests/tsconfig.json",
-        "test:browser": "playwright test -c playwright.config.ts"
+        "test:browser": "playwright test -c playwright.config.ts",
+        "test:build": "node --test 'tests/build/*.test.ts'"
     }
 }
