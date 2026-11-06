@@ -181,6 +181,46 @@ function metaOf(record: SegmentRecord, part: Part): SegmentMeta {
     };
 }
 
+/**
+ * True when an ok answer to one part of a split segment shows the server
+ * still lacks some of its parts: `already_present` for a part it holds,
+ * with the segment still `expected` (or `missing`, sealed while expected),
+ * or with fewer parts present than the count. Any other status (present,
+ * or corrupt and closed to parts) means more parts would change nothing.
+ */
+function partsMissingIn(body: unknown): boolean {
+    if (typeof body !== 'object' || body === null) {
+        return false;
+    }
+
+    const segment = (body as { segment?: unknown }).segment;
+
+    if (typeof segment !== 'object' || segment === null) {
+        return false;
+    }
+
+    const {
+        status,
+        parts_present: present,
+        part_count: count,
+    } = segment as {
+        status?: unknown;
+        parts_present?: unknown;
+        part_count?: unknown;
+    };
+
+    if (status === 'expected' || status === 'missing') {
+        return true;
+    }
+
+    return (
+        status === undefined &&
+        typeof present === 'number' &&
+        typeof count === 'number' &&
+        present < count
+    );
+}
+
 /** True when the stored bytes no longer match the record: the local copy is corrupt. */
 async function corrupt(record: SegmentRecord): Promise<boolean> {
     if (record.data === null || record.data.byteLength !== record.bytes) {
@@ -243,17 +283,19 @@ export function createUploader(deps: UploaderDeps): Uploader {
         return promise;
     };
 
-    /** A store write only while the record is still pending; undefined when it no longer is. */
+    /** A store write only while the record is still pending, and never once stop() was called; undefined when it is not written. */
     const update = (
         key: SegmentKey,
         change: (current: SegmentRecord) => SegmentRecord,
     ): Promise<SegmentRecord | undefined> =>
-        tracked(
-            writes,
-            store.updateSegment(key, (current) =>
-                current.state === 'pending' ? change(current) : undefined,
-            ),
-        );
+        stopped
+            ? Promise.resolve(undefined)
+            : tracked(
+                  writes,
+                  store.updateSegment(key, (current) =>
+                      current.state === 'pending' ? change(current) : undefined,
+                  ),
+              );
 
     const laneOf = (track: TrackName): Lane => {
         let lane = lanes.get(track);
@@ -412,6 +454,10 @@ export function createUploader(deps: UploaderDeps): Uploader {
             waitMs: number | undefined,
             wait: Wait,
         ): Promise<boolean> => {
+            if (gone()) {
+                return false;
+            }
+
             const written = await update(entry.key, (current) => ({
                 ...current,
                 failures: current.failures + 1,
@@ -550,12 +596,17 @@ export function createUploader(deps: UploaderDeps): Uploader {
                 ladder.success();
                 sentMs += endedAtMs - startedAtMs;
                 const last = part.index === part.count - 1;
-
-                if (
-                    !last &&
+                // The server holds this part but not yet the whole segment. A
+                // track_sealed {stored: true} on the last part is the whole
+                // segment: every earlier part was answered as held in this pass.
+                const partHeld =
+                    part.count > 1 &&
                     (verdict.code === 'part_stored' ||
-                        verdict.code === 'track_sealed')
-                ) {
+                        (verdict.code === 'track_sealed' && !last) ||
+                        (verdict.code === 'already_present' &&
+                            partsMissingIn(answer.body)));
+
+                if (!last && partHeld) {
                     part = await nextPart(
                         record.data as ArrayBuffer,
                         record.sha256,
@@ -570,8 +621,8 @@ export function createUploader(deps: UploaderDeps): Uploader {
                     continue;
                 }
 
-                if (last && part.count > 1 && verdict.code === 'part_stored') {
-                    // The server still lacks an earlier part: send them all again.
+                if (last && partHeld) {
+                    // The server still lacks an earlier part: send them all again, and the parts it holds answer already_present.
                     part = null;
 
                     if (
@@ -609,15 +660,17 @@ export function createUploader(deps: UploaderDeps): Uploader {
             }
 
             if (verdict.kind === 'retry') {
-                if (
+                const localCorrupt =
                     (verdict.code === 'hash_mismatch' ||
                         verdict.code === 'size_mismatch') &&
-                    (await corrupt(record))
-                ) {
-                    if (gone()) {
-                        return 'remove';
-                    }
+                    (await corrupt(record));
 
+                // stop() may have resolved while the copy was hashed.
+                if (gone()) {
+                    return 'remove';
+                }
+
+                if (localCorrupt) {
                     const written = await update(entry.key, (pending) => ({
                         ...pending,
                         state: 'rejected',

@@ -579,3 +579,172 @@ test('stats() counts what was enqueued, what was delivered and what is pending',
     });
     await r.uploader.stop();
 });
+
+/** The answer descriptor with a 100 byte part_size on the camera track, so a 500 byte segment goes as 5 parts. */
+function smallParts() {
+    const descriptor = descriptorFixture();
+    descriptor.tracks = descriptor.tracks.map((track) =>
+        track.track === 'camera'
+            ? { ...track, segments: { ...track.segments, part_size: 100 } }
+            : track,
+    );
+
+    return descriptor;
+}
+
+/** A 200 answer to a part the server already holds, while the segment still lacks some parts. */
+function partHeld(present: number): Response {
+    return json(200, {
+        code: 'already_present',
+        segment: {
+            track: 'camera',
+            seq: 1,
+            status: 'expected',
+            parts_present: present,
+            part_count: 5,
+        },
+    });
+}
+
+test('a part answered already_present while later parts are missing goes on to the next part', async () => {
+    const r = rig({
+        descriptor: smallParts(),
+        env: fakeEnvironment({ random: 0 }),
+    });
+    let failedOnce = false;
+    r.env.respond((call) => {
+        const part = call.headers['X-Fitt-Part'];
+
+        if (part === '1/5' && !failedOnce) {
+            // The server stored the part, but its answer never came back.
+            failedOnce = true;
+
+            return json(500, { error: { code: 'server_error', message: 'x' } });
+        }
+
+        if (part === '1/5') {
+            return partHeld(2);
+        }
+
+        return json(201, {
+            code: part === '4/5' ? 'stored' : 'part_stored',
+            segment: {},
+        });
+    });
+    await add(r, { seq: 1, bytes: 500 });
+    r.uploader.start();
+    await until(() => failedOnce);
+    await r.env.advance(1000);
+    await r.uploader.idle();
+
+    assert.deepEqual(
+        r.env.calls.map((call) => call.headers['X-Fitt-Part']),
+        ['0/5', '1/5', '1/5', '2/5', '3/5', '4/5'],
+    );
+    assert.equal((await r.store.listSegments(SID))[0].state, 'delivered');
+});
+
+test('after parts_missing the resend goes past the parts the server already holds', async () => {
+    const r = rig({
+        descriptor: smallParts(),
+        env: fakeEnvironment({ random: 0 }),
+    });
+    let lastSends = 0;
+    r.env.respond((call) => {
+        const part = call.headers['X-Fitt-Part'];
+
+        if (part === '4/5') {
+            lastSends += 1;
+
+            // The first time the server says it still lacks a part (it lost part 2); the second time the segment is whole.
+            return json(201, {
+                code: lastSends === 1 ? 'part_stored' : 'stored',
+                segment: {},
+            });
+        }
+
+        // Every part reaches the server the first time; the second time only part 2 is missing.
+        return lastSends === 0 || part === '2/5'
+            ? json(201, { code: 'part_stored', segment: {} })
+            : partHeld(3);
+    });
+    await add(r, { seq: 1, bytes: 500 });
+    r.uploader.start();
+    await until(() => lastSends === 1);
+    await r.env.advance(1000);
+    await r.uploader.idle();
+
+    assert.deepEqual(
+        r.env.calls.map((call) => call.headers['X-Fitt-Part']),
+        ['0/5', '1/5', '2/5', '3/5', '4/5', '0/5', '1/5', '2/5', '3/5', '4/5'],
+    );
+    assert.equal((await r.store.listSegments(SID))[0].state, 'delivered');
+});
+
+test('an already_present that shows the segment whole delivers it from any part', async () => {
+    const r = rig({ descriptor: smallParts() });
+    r.env.respond(() =>
+        json(200, {
+            code: 'already_present',
+            segment: {
+                track: 'camera',
+                seq: 1,
+                status: 'present',
+                parts_present: 5,
+                part_count: 5,
+            },
+        }),
+    );
+    await add(r, { seq: 1, bytes: 500 });
+    r.uploader.start();
+    await r.uploader.idle();
+
+    assert.deepEqual(
+        r.env.calls.map((call) => call.headers['X-Fitt-Part']),
+        ['0/5'],
+    );
+    assert.equal((await r.store.listSegments(SID))[0].state, 'delivered');
+});
+
+test('stop() while a hash_mismatch is re-hashing the local copy writes nothing after it resolves', async () => {
+    const r = rig();
+    r.env.respond(() =>
+        json(400, { error: { code: 'hash_mismatch', message: 'x' } }),
+    );
+    await add(r, { seq: 1, bytes: 4_194_304 });
+    const writes: string[] = [];
+    let stopped = false;
+    let stopping: Promise<void> | null = null;
+    let reads = 0;
+    const update = r.store.updateSegment.bind(r.store);
+    const read = r.store.getSegment.bind(r.store);
+    r.store.updateSegment = (key, change) => {
+        writes.push(stopped ? 'after stop' : 'before stop');
+
+        return update(key, change);
+    };
+    r.store.getSegment = (key) => {
+        reads += 1;
+
+        if (reads === 2) {
+            // The read-back after the answer: stop() lands while the 4 MB copy is hashed.
+            setImmediate(() => {
+                stopping = r.uploader.stop().then(() => {
+                    stopped = true;
+                });
+            });
+        }
+
+        return read(key);
+    };
+    r.uploader.start();
+    await until(() => stopping !== null);
+    await stopping;
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    assert.deepEqual(writes, []);
+    assert.deepEqual(
+        r.events.filter(([type]) => type === 'upload.chunk_failed'),
+        [],
+    );
+});
