@@ -1,4 +1,4 @@
-import type { Page, TestInfo } from '@playwright/test';
+import { test, type Page, type TestInfo } from '@playwright/test';
 
 /**
  * True for WebKit, where a spec records what it saw instead of asserting it (author's call 3).
@@ -51,4 +51,64 @@ export async function openHarness(
     await page.waitForFunction(() => window.internals !== undefined);
 
     return errors;
+}
+
+/** Linux WebKit may ship without MediaRecorder, or refuse to record: skip, and say so in the report. */
+export async function skipWithoutRecorder(page: Page): Promise<void> {
+    // A throwaway stream that never touches navigator.mediaDevices, so the stub's AudioContext is still made after a click.
+    const result = await page.evaluate(() => {
+        if (typeof MediaRecorder === 'undefined') {
+            return 'missing';
+        }
+
+        const context = new AudioContext();
+        const stream = new MediaStream([
+            ...document
+                .createElement('canvas')
+                .captureStream(30)
+                .getVideoTracks(),
+            ...context.createMediaStreamDestination().stream.getAudioTracks(),
+        ]);
+
+        try {
+            const recorder = new MediaRecorder(stream);
+            recorder.start(1000);
+            recorder.stop();
+
+            return 'present';
+        } catch (error) {
+            return 'refused: ' + (error as Error).name;
+        } finally {
+            stream.getTracks().forEach((track) => track.stop());
+            void context.close();
+        }
+    });
+    test.info().annotations.push({
+        type: 'media-recorder',
+        description: result,
+    });
+    test.skip(
+        result !== 'present',
+        'MediaRecorder cannot record in this engine: ' + result,
+    );
+}
+
+/**
+ * Owner decision 2: Linux WebKit has no MediaRecorder at all, so a spec that records asserts the
+ * recorder_unsupported path there instead of skipping. True (with a `media-recorder` annotation)
+ * when this engine has no MediaRecorder; false where it has one, and the spec records as written.
+ */
+export async function assertsUnsupported(page: Page): Promise<boolean> {
+    const missing = await page.evaluate(
+        () => typeof MediaRecorder === 'undefined',
+    );
+
+    if (missing) {
+        test.info().annotations.push({
+            type: 'media-recorder',
+            description: 'missing: the recorder_unsupported path is asserted',
+        });
+    }
+
+    return missing;
 }

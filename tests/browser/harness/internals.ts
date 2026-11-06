@@ -1,9 +1,14 @@
 /** What the browser specs call through `window.internals`. Later tasks add the functions their specs need. */
 import { createBatcher } from '../../../src/core/batcher.ts';
-import { createClock } from '../../../src/core/clock.ts';
+import { createClock, type Clock } from '../../../src/core/clock.ts';
 import { sha256Hex } from '../../../src/core/crypto.ts';
-import type { Descriptor, TrackName } from '../../../src/core/descriptor.ts';
+import type {
+    ChunkedTrack,
+    Descriptor,
+    TrackName,
+} from '../../../src/core/descriptor.ts';
 import { browserEnvironment } from '../../../src/core/env.ts';
+import { FittVideoError, type ErrorCode } from '../../../src/core/errors.ts';
 import { createEventBus } from '../../../src/core/events.ts';
 import { send } from '../../../src/core/http.ts';
 import { createLadder } from '../../../src/core/ladder.ts';
@@ -26,6 +31,13 @@ import {
     jsonRequest,
     segmentPut,
 } from '../../../src/core/wire.ts';
+import {
+    createRecorderEngine,
+    type RecorderEngine,
+} from '../../../src/recorder/engine.ts';
+import answerDescriptor from '../../fixtures/descriptor-answer.json';
+import conversationDescriptor from '../../fixtures/descriptor-conversation.json';
+import monitorDescriptor from '../../fixtures/descriptor-monitor.json';
 import { STORE_CASES } from '../../shared/store-suite.ts';
 
 export const ready = true;
@@ -655,4 +667,182 @@ export async function putFixtureSegments(options: {
     }
 
     return Object.assign(records, { run });
+}
+
+/** The descriptor fixtures a recording spec may name. */
+const RECORDING_DESCRIPTORS: Record<string, Descriptor> = {
+    answer: answerDescriptor as Descriptor,
+    monitor: monitorDescriptor as Descriptor,
+    conversation: conversationDescriptor as Descriptor,
+};
+
+/** Base64 of an ArrayBuffer, in slices so a large segment never overflows the argument list. */
+function toBase64(data: ArrayBuffer): string {
+    const bytes = new Uint8Array(data);
+    let binary = '';
+
+    for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+        binary += String.fromCharCode(
+            ...bytes.subarray(offset, offset + 0x8000),
+        );
+    }
+
+    return btoa(binary);
+}
+
+/** What a recording rig collected. */
+interface RecordingRig {
+    engine: RecorderEngine;
+    clock: Clock;
+    runs: Map<string, RunRecord>;
+    segments: SegmentRecord[];
+    recorderOptions: MediaRecorderOptions[];
+    errors: (ErrorCode | null)[];
+    events: string[];
+}
+
+/**
+ * The real recorder engine over the browser: navigator.mediaDevices, MediaRecorder (each
+ * constructor's options recorded), MediaStream and navigator.permissions, on a recipe's fixture
+ * descriptor. Where MediaRecorder is missing, the factory throws as the real constructor would.
+ */
+function recordingRig(recipe: string): RecordingRig {
+    const descriptor = RECORDING_DESCRIPTORS[recipe];
+
+    if (descriptor === undefined) {
+        throw new Error(`No recording descriptor is named "${recipe}".`);
+    }
+
+    const env = browserEnvironment();
+    const clock = createClock(env);
+    const tracks = descriptor.tracks.filter(
+        (track): track is ChunkedTrack => track.kind === 'chunked',
+    );
+    const runs = new Map<string, RunRecord>();
+    const segments: SegmentRecord[] = [];
+    const recorderOptions: MediaRecorderOptions[] = [];
+    const errors: (ErrorCode | null)[] = [];
+    const events: string[] = [];
+    const runIndexes = new Map<string, number>();
+    const engine = createRecorderEngine({
+        env,
+        clock,
+        sessionId: descriptor.session_id,
+        take: () => descriptor.take,
+        tracks,
+        media: navigator.mediaDevices,
+        recorderFactory: (stream, options) => {
+            recorderOptions.push({ ...options });
+
+            return new MediaRecorder(stream, options);
+        },
+        isTypeSupported: (type) =>
+            typeof MediaRecorder !== 'undefined' &&
+            MediaRecorder.isTypeSupported(type),
+        bitrates: (track) => ({
+            video: track.capture.video?.bitrate_bps,
+            audio: track.capture.audio.bitrate_bps,
+        }),
+        cameraAudio: (stream) => stream.getAudioTracks(),
+        makeStream: (streamTracks) => new MediaStream(streamTracks),
+        permissions: navigator.permissions,
+        nextRunIndex: (track) => {
+            const next = runIndexes.get(track) ?? 0;
+            runIndexes.set(track, next + 1);
+
+            return next;
+        },
+        add: async (record) => {
+            segments.push(record);
+        },
+        putRun: async (record) => {
+            runs.set(record.run_id, record);
+        },
+        emit: (type) => events.push(type),
+        onError: (code) => errors.push(code),
+        ua: navigator.userAgent,
+    });
+
+    return { engine, clock, runs, segments, recorderOptions, errors, events };
+}
+
+/** Starts a take, and says false when the engine refused it as recorder_unsupported. */
+async function startTake(rig: RecordingRig): Promise<boolean> {
+    try {
+        await rig.engine.startTake(rig.clock.now());
+
+        return true;
+    } catch (error) {
+        if (
+            error instanceof FittVideoError &&
+            error.code === 'recorder_unsupported'
+        ) {
+            return false;
+        }
+
+        throw error;
+    }
+}
+
+/**
+ * Prepares, records one take for `seconds` and stops it. A take the engine refuses as
+ * recorder_unsupported (Linux WebKit, owner decision 2) is stopped at once and records nothing.
+ */
+export async function recordTake(options: {
+    recipe: string;
+    seconds: number;
+}): Promise<{
+    runs: RunRecord[];
+    segments: {
+        run_id: string;
+        seq: number;
+        kind: 'init' | 'media';
+        start_ms: number;
+        duration_ms: number;
+        base64: string;
+    }[];
+    recorderOptions: MediaRecorderOptions[];
+    errors: (ErrorCode | null)[];
+    events: string[];
+}> {
+    const rig = recordingRig(options.recipe);
+    await rig.engine.prepare();
+
+    if (await startTake(rig)) {
+        await new Promise((resolve) =>
+            setTimeout(resolve, options.seconds * 1000),
+        );
+    }
+
+    await rig.engine.stopTake();
+
+    return {
+        runs: [...rig.runs.values()],
+        segments: rig.segments.map((segment) => ({
+            run_id: segment.run_id,
+            seq: segment.seq,
+            kind: segment.kind,
+            start_ms: segment.start_ms,
+            duration_ms: segment.duration_ms,
+            base64: toBase64(segment.data ?? new ArrayBuffer(0)),
+        })),
+        recorderOptions: rig.recorderOptions,
+        errors: rig.errors,
+        events: rig.events,
+    };
+}
+
+/** Prepares, records a 2 s take and calls stopTake() only: the readyState of every track it acquired. */
+export async function releaseCheck(): Promise<string[]> {
+    const rig = recordingRig('answer');
+    await rig.engine.prepare();
+    const acquired = rig.engine.stream?.getTracks() ?? [];
+
+    if (await startTake(rig)) {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+
+    await rig.engine.stopTake();
+
+    return acquired.map((track) => track.readyState);
 }
