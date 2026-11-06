@@ -44,9 +44,12 @@ export interface Lifecycle {
     /** Continue a take that a reload interrupted (author's call 12). */
     resumeTake(takeStartMs: number): void;
     /**
-     * Raises what is due now and sets the timer again. The session calls it
-     * when clock.check() reports a jump, because a jump moves the session cap
-     * nearer in performance time.
+     * Raises what is due now and sets the timer again. It is cheap and safe
+     * to call at any time, as often as wanted: it raises nothing that is not
+     * due and nothing twice. The session calls it when clock.check() reports
+     * a jump, because a jump moves the session cap nearer in performance
+     * time, and on every cut, because a hidden tab may run timers as late as
+     * once a minute while MediaRecorder events still arrive on time.
      */
     recheck(): void;
 }
@@ -358,9 +361,16 @@ export function createLifecycle(deps: LifecycleDeps): Lifecycle {
         forced?: ForcedReason;
     }): Promise<void> => {
         clearTimer();
-        const endMs = clock.now();
-        const elapsedMs = endMs - (takeStart ?? endMs);
+        const nowMs = clock.now();
+        const elapsedMs = nowMs - (takeStart ?? nowMs);
         const minMs = recording.min_duration_ms;
+        // A late timer may stop the take after the forced stop was due: the
+        // take never ends after it, or finalise would pass the cap, and it
+        // never ends before its own start.
+        const endMs = Math.max(
+            takeStart ?? 0,
+            Math.min(nowMs, deps.sessionCapMs - CAP_MARGIN_MS),
+        );
 
         if (options.forced === undefined && elapsedMs < minMs) {
             moveTo('stopping');
@@ -427,10 +437,19 @@ export function createLifecycle(deps: LifecycleDeps): Lifecycle {
             return Promise.resolve();
         }
 
-        const finishing = finishTake(options).finally(() => {
-            stopping = null;
+        // Claimed before finishTake() runs, because it calls host listeners
+        // (onMilestone, onError, onPhase) before its first await, and a stop()
+        // from one of them must join this stop, not start a second one.
+        let settleStop!: { resolve(): void; reject(error: unknown): void };
+        const finishing = new Promise<void>((resolve, reject) => {
+            settleStop = { resolve, reject };
         });
         stopping = finishing;
+        finishTake(options)
+            .finally(() => {
+                stopping = null;
+            })
+            .then(settleStop.resolve, settleStop.reject);
 
         return finishing;
     };

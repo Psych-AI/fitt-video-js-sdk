@@ -3,7 +3,9 @@ import { test } from 'node:test';
 import { createClock } from '../../src/core/clock.ts';
 import type { RecordingLimits } from '../../src/core/descriptor.ts';
 import { FittVideoError } from '../../src/core/errors.ts';
+import type { Lifecycle, Milestone } from '../../src/core/lifecycle.ts';
 import { createLifecycle } from '../../src/core/lifecycle.ts';
+import type { Phase } from '../../src/core/state.ts';
 import { createState } from '../../src/core/state.ts';
 import { fakeEnvironment, settle, until } from '../support/fake-env.ts';
 
@@ -22,7 +24,18 @@ const MONITOR: RecordingLimits = {
     warning_before_end_ms: 0,
 };
 
-function rig(recording = ANSWER, resetTake?: () => Promise<void>) {
+/** Host listeners that run after the rig has recorded the call. */
+interface Hooks {
+    onMilestone?(milestone: Milestone, lifecycle: Lifecycle): void;
+    onPhase?(phase: Phase, lifecycle: Lifecycle): void;
+    onError?(code: string, lifecycle: Lifecycle): void;
+}
+
+function rig(
+    recording = ANSWER,
+    resetTake?: () => Promise<void>,
+    hooks: Hooks = {},
+) {
     const env = fakeEnvironment({ perf: 0 });
     const clock = createClock(env);
     const milestones: [string, number, number?][] = [];
@@ -63,9 +76,13 @@ function rig(recording = ANSWER, resetTake?: () => Promise<void>) {
                     : [m.name, m.t_ms, m.remaining_ms],
             );
             reasons.push(m.reason);
+            hooks.onMilestone?.(m, lifecycle);
         },
-        onPhase: () => {},
-        onError: (code) => errors.push(code),
+        onPhase: (phase) => hooks.onPhase?.(phase, lifecycle),
+        onError: (code) => {
+            errors.push(code);
+            hooks.onError?.(code, lifecycle);
+        },
     });
     lifecycle.setPhase('ready');
 
@@ -292,6 +309,71 @@ test('recheck() after a forward clock jump brings the forced stop to 1 s before 
         [['forced_stop', 7_199_000], 'session_cap'],
     );
     assert.ok(r.calls.includes('seal@7199000'));
+});
+
+test('a host stop() from the forced_stop milestone joins the forced stop: one stopTake, one seal, no reset', async () => {
+    let hostStop: Promise<void> | null = null;
+    const r = rig(ANSWER, () => Promise.resolve(), {
+        onMilestone: (m, lifecycle) => {
+            if (m.name === 'forced_stop') {
+                hostStop = lifecycle.stop();
+            }
+        },
+    });
+    void r.lifecycle.start();
+    await r.env.advance(4000); // 1 s into the take, below the 5 s minimum
+    const forced = r.lifecycle.stop({ forced: 'left_page' });
+
+    assert.ok(hostStop !== null);
+    await (hostStop as Promise<void>).then(() => r.calls.push('host done'));
+    await forced;
+    assert.deepEqual(r.calls, [
+        'start@3000',
+        'stop@4000',
+        'seal@4000',
+        'host done',
+    ]);
+    assert.equal(r.lifecycle.phase(), 'stopped');
+});
+
+test('a host stop() from onError on the cap path or from onPhase(stopping) waits for the one seal', async () => {
+    const hostStops: Promise<void>[] = [];
+    const r = rig(MONITOR, undefined, {
+        onError: (_code, lifecycle) => hostStops.push(lifecycle.stop()),
+        onPhase: (phase, lifecycle) => {
+            if (phase === 'stopping') {
+                hostStops.push(lifecycle.stop());
+            }
+        },
+    });
+    await r.lifecycle.start();
+    await r.env.advance(7_198_999);
+    await r.env.advance(1);
+    assert.equal(hostStops.length, 2);
+    await Promise.all(hostStops).then(() => r.calls.push('host done'));
+
+    assert.deepEqual(r.errors, ['session_cap_reached']);
+    assert.deepEqual(r.calls.slice(-3), [
+        'stop@7199000',
+        'seal@7199000',
+        'host done',
+    ]);
+    assert.equal(r.calls.filter((call) => call.startsWith('seal')).length, 1);
+});
+
+test('recheck() after a throttled timer let session time pass the cap stops at once and ends the take 1 s before the cap', async () => {
+    const r = rig(MONITOR);
+    await r.lifecycle.start();
+    await r.env.advance(7_150_000);
+    r.env.stall(100_000); // hidden tab: the timer has not run, session time is 7,250,000
+    r.lifecycle.recheck(); // a cut arrived on time
+
+    await until(() => r.lifecycle.phase() === 'stopped');
+    assert.deepEqual(
+        [r.milestones.at(-1), r.reasons.at(-1)],
+        [['forced_stop', 7_250_000], 'session_cap'],
+    );
+    assert.deepEqual(r.calls.slice(-2), ['stop@7250000', 'seal@7199000']);
 });
 
 test('createState merges a patch and hands out a frozen copy', () => {
