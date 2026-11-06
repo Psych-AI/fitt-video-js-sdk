@@ -1,0 +1,34 @@
+{
+    "session_id": "01jbz8q4w6x0k3m5n7p9r2t4aa",
+    "recipe": "file",
+    "take": 1,
+    "clock": { "session_cap_ms": 7200000 },
+    "token": {
+        "id": "01jbz8q4w6x0k3m5n7p9r2t4bb",
+        "secret": "Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4zAb7cDe0f",
+        "expires_in_s": 900,
+        "refresh_after_s": 675
+    },
+    "endpoints": { "api": "http://127.0.0.1:8123/api/v1", "media": null },
+    "tracks": [
+        {
+            "track": "upload",
+            "video_id": "01jbz8q4w6x0k3m5n7p9r2t4ca",
+            "kind": "file",
+            "segments": {
+                "part_size": 5242880,
+                "max_bytes": 8388608,
+                "max_file_bytes": 52428800
+            },
+            "upload": {
+                "mode": "passthrough",
+                "url": "http://127.0.0.1:8123/api/v1/sessions/01jbz8q4w6x0k3m5n7p9r2t4aa/tracks/upload/segments",
+                "fallback_url": "http://127.0.0.1:8123/api/v1/sessions/01jbz8q4w6x0k3m5n7p9r2t4aa/tracks/upload/segments"
+            }
+        }
+    ],
+    "signals": { "groups": [] },
+    "enforce": {},
+    "events": { "batch_ms": 5000 },
+    "queue": { "abandon_after_ms": 600000, "buffer_budget_bytes": 209715200 }
+}
