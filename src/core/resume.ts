@@ -49,6 +49,28 @@ async function keepRecordOnly(
 }
 
 /**
+ * The synchronous copies of a purged session that never finalised. Its
+ * media is abandoned, its numbering is not: the server may still hold the
+ * session open (IdleClose waits for its newest token to lapse), and a later
+ * FittVideo.session(descriptor) for it continues on the stored epoch and
+ * batch_seq. A fresh batch_seq would replay seqs the server already holds,
+ * and the server drops a replayed batch_seq as a no-op.
+ */
+function keepNumbering(
+    storage: SessionSeams['storage'],
+    record: SessionRecord,
+): void {
+    const sessionId = record.session_id;
+    const nextBatchSeq = Math.max(
+        record.next_batch_seq,
+        readNumber(storage, seqKey(sessionId)) ?? 0,
+    );
+    writeItem(storage, seqKey(sessionId), String(nextBatchSeq));
+    // The stored epoch wins over its copy, as when the record is read.
+    writeItem(storage, epochKey(sessionId), String(record.epoch_ms));
+}
+
+/**
  * The one batch a lapsed session gets on resume: only
  * `session.resume_expired {session_id}`, frozen at the record's
  * next_batch_seq. The next seq is stored first, in the record and in the
@@ -140,8 +162,14 @@ export async function resumeWith(
 
         if (plan === 'purge' || state === undefined) {
             await store.deleteSession(record.session_id);
-            removeItem(seams.storage, epochKey(record.session_id));
-            removeItem(seams.storage, seqKey(record.session_id));
+
+            if (record.finalised) {
+                // A tombstone past its expiry: the server takes nothing more for it.
+                removeItem(seams.storage, epochKey(record.session_id));
+                removeItem(seams.storage, seqKey(record.session_id));
+            } else {
+                keepNumbering(seams.storage, record);
+            }
 
             continue;
         }

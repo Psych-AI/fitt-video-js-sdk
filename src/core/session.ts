@@ -1078,7 +1078,12 @@ export function createSession(
         void postManifest(described, take, endMs);
     };
 
-    /** Seals the take's tracks: take_end_ms first, then each manifest, owed until answered (item 5). */
+    /**
+     * Seals the take's tracks: take_end_ms and every owed manifest stored in
+     * one write, then each manifest posted, owed until answered (item 5). One
+     * write, so a reload never finds take_end_ms set with no manifest owed,
+     * which reads as a stop whose manifests were all answered.
+     */
     const sealTracks = async (endMs: number): Promise<void> => {
         const take = activeTake ?? localTake;
 
@@ -1087,11 +1092,9 @@ export function createSession(
             return;
         }
 
-        record.take_end_ms = endMs;
-        await persist();
-
         if (take < localTake) {
-            // The server moved on to a newer take: this one is gone.
+            // The server moved on to a newer take: this one is gone, and its
+            // end is never stored as the newer take's.
             return;
         }
 
@@ -1101,9 +1104,16 @@ export function createSession(
         );
         const held: SessionRecord | null = record;
 
-        if (held === null) {
+        if (
+            held === null ||
+            closed ||
+            discarding !== null ||
+            take < localTake
+        ) {
             return;
         }
+
+        held.take_end_ms = endMs;
 
         for (const track of tracks) {
             held.manifest_owed[track.track] = take;
@@ -1157,6 +1167,10 @@ export function createSession(
         record.take_end_ms = null;
         record.stop_completed = false;
         record.manifest_owed = {};
+        // A take a reload interrupted is gone too: finalise() never seals it,
+        // and start() never continues it.
+        interrupted = false;
+        lifecycle?.forgetResumedTake();
         void persist();
         uploader?.dropTakesBelow(current);
         setError('stale_take');

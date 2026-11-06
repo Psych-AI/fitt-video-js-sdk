@@ -43,6 +43,8 @@ export interface Lifecycle {
     unsealedEndMs(): number | null;
     /** Continue a take that a reload interrupted (author's call 12). */
     resumeTake(takeStartMs: number): void;
+    /** Forgets a take resumeTake() was given that was never continued (the server moved past it). */
+    forgetResumedTake(): void;
     /**
      * Raises what is due now and sets the timer again. It is cheap and safe
      * to call at any time, as often as wanted: it raises nothing that is not
@@ -481,6 +483,16 @@ export function createLifecycle(deps: LifecycleDeps): Lifecycle {
         resumeTake(takeStartMs: number): void {
             resumedFrom = takeStartMs;
             takeStart = takeStartMs;
+        },
+        forgetResumedTake(): void {
+            if (resumedFrom === null || starting !== null) {
+                // Nothing resumed, or its start is under way and settles itself.
+                return;
+            }
+
+            resumedFrom = null;
+            takeStart = null;
+            perfAtStart = null;
         },
         recheck(): void {
             if (countdown !== null) {

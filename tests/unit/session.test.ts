@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { resolveSettings } from '../../src/core/options.ts';
 import { resumeWith } from '../../src/core/resume.ts';
 import { createSession, sessionWith } from '../../src/core/session.ts';
-import { MemoryQueueStore } from '../../src/core/store.ts';
+import { MemoryQueueStore, type SessionRecord } from '../../src/core/store.ts';
 import { FittVideo } from '../../src/index.ts';
 import { fakeEnvironment, json, settle, until } from '../support/fake-env.ts';
 import { fakeMedia } from '../support/fake-media.ts';
@@ -18,6 +18,7 @@ import {
     router,
     sessionRig,
     statusBody,
+    type Answer,
     type SessionRig,
 } from '../support/session-rig.ts';
 
@@ -1303,7 +1304,11 @@ test('an owed reset is sent by resume() first, and the session is returned as in
  * stops, so each open run is given the segments a live page would have cut:
  * an init and seq 1 delivered, seq 2 still pending.
  */
-async function interruptedTake(sessionId: string, recordMs: number) {
+async function interruptedTake(
+    sessionId: string,
+    recordMs: number,
+    answers: Record<string, Answer> = {},
+) {
     const descriptor = {
         ...descriptorFixture('answer'),
         session_id: sessionId,
@@ -1339,6 +1344,7 @@ async function interruptedTake(sessionId: string, recordMs: number) {
 
     const env = fakeEnvironment({ date: first.env.dateNow() + 5000 });
     const second = sessionRig({ descriptor, store, env, chunks: true });
+    second.respond(answers);
 
     return { descriptor, store, first, second };
 }
@@ -1440,6 +1446,137 @@ test('reset() of an interrupted take resets it without continuing it', async () 
     assert.equal(second.calls(/\/reset$/).length, 1);
     assert.ok(milestones.includes('countdown_last'));
     assert.equal(second.session.state.phase, 'recording');
+});
+
+const staleTake: Record<string, Answer> = {
+    '/segments/': () =>
+        json(409, {
+            error: { code: 'stale_take', message: 'x', current_take: 2 },
+        }),
+};
+
+test('a stale_take after a reload forgets the interrupted take: finalise() never sends its end', async () => {
+    const { store, second, descriptor } = await interruptedTake(
+        '01jbz8q4w6x0k3m5n7p9r2t4s5',
+        12_000,
+        staleTake,
+    );
+    const segments = await store.listSegments(descriptor.session_id);
+    const end = Math.max(
+        ...segments.map((segment) => segment.start_ms + segment.duration_ms),
+    );
+    await until(() => second.session.state.error?.code === 'stale_take');
+
+    for (let i = 0; i < 20; i++) {
+        await settle();
+    }
+
+    const finalising = second.session.finalise();
+    await second.env.advance(10);
+    await finalising;
+    const ends = second
+        .calls(/\/finalise$/)
+        .map((call) => JSON.parse(String(call.body)).end_ms as number);
+
+    assert.deepEqual(second.manifestCalls(), []);
+    assert.equal(ends.length, 1);
+    assert.notEqual(ends[0], end);
+    assert.equal(
+        (await store.getSession(descriptor.session_id))?.take_end_ms ?? null,
+        null,
+    );
+});
+
+test('a stale_take after a reload forgets the interrupted take: start() begins the new take with its countdown', async () => {
+    const { second } = await interruptedTake(
+        '01jbz8q4w6x0k3m5n7p9r2t4s6',
+        12_000,
+        staleTake,
+    );
+    await until(() => second.session.state.error?.code === 'stale_take');
+
+    for (let i = 0; i < 20; i++) {
+        await settle();
+    }
+
+    await second.session.prepare();
+    const milestones: string[] = [];
+    second.session.onMilestone((milestone) => milestones.push(milestone.name));
+    const starting = second.session.start();
+    await second.env.advance(3000);
+    await starting;
+
+    assert.ok(milestones.includes('started'));
+    assert.equal(second.session.state.phase, 'recording');
+});
+
+test('stop() stores take_end_ms in the same write as the manifests it owes', async () => {
+    const store = new MemoryQueueStore();
+    const writes: SessionRecord[] = [];
+    const put = store.putSession.bind(store);
+    store.putSession = (record: SessionRecord) => {
+        writes.push(structuredClone(record));
+
+        return put(record);
+    };
+    const r = sessionRig({ store, chunks: true });
+    await recordTake(r, 2000);
+    const sealing = writes.find((write) => write.take_end_ms !== null);
+    const runTracks = [
+        ...new Set(
+            (await store.listRuns(r.descriptor.session_id)).map(
+                (run) => run.track,
+            ),
+        ),
+    ].sort();
+
+    assert.ok(runTracks.length > 0);
+    assert.deepEqual(
+        Object.entries(sealing?.manifest_owed ?? {}).sort(),
+        runTracks.map((track) => [track, 1]),
+    );
+});
+
+test('a session resume() purges keeps its numbering: session() for it later continues on the stored epoch and batch_seq', async () => {
+    const descriptor = resumable(7);
+    const store = new MemoryQueueStore();
+    const env = fakeEnvironment();
+    env.respond(router());
+    const storage = new Map<string, string>();
+    const epoch = env.dateNow() - 700_000;
+    await store.putSession(
+        sessionRecord({
+            session_id: descriptor.session_id,
+            descriptor,
+            epoch_ms: epoch,
+            next_batch_seq: 7,
+            last_activity_ms: env.dateNow() - 600_001,
+        }),
+    );
+    await store.putSegment(
+        segmentRecord({ session_id: descriptor.session_id }),
+    );
+    const seams = rigSeams(env, store, fakeMedia(env), storage);
+
+    assert.deepEqual(await resumeWith({}, seams), []);
+    assert.deepEqual(await store.listSessions(), []);
+    assert.deepEqual(await store.listSegments(descriptor.session_id), []);
+
+    const session = sessionWith(descriptor, {}, seams);
+    session.event('marker');
+    await session.prepare();
+    await env.advance(5000);
+    const [body] = env.calls
+        .filter((call) => call.url.endsWith('/events'))
+        .map(
+            (call) =>
+                JSON.parse(String(call.body)) as {
+                    batch_seq: number;
+                    clock_epoch_ms: number;
+                },
+        );
+
+    assert.deepEqual([body?.batch_seq, body?.clock_epoch_ms], [7, epoch]);
 });
 
 test('a reload after a completed stop is stopped: start() needs reset() first', async () => {
