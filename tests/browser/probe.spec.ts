@@ -132,6 +132,15 @@ test('the synthetic stream answers getUserMedia in every engine, Firefox without
         });
         first.getTracks().forEach((track) => track.stop());
 
+        let stoppedTwice = '';
+
+        try {
+            first.getTracks().forEach((track) => track.stop()); // a real track may be stopped any number of times
+            stoppedTwice = 'no error';
+        } catch (error) {
+            stoppedTwice = (error as Error).name;
+        }
+
         let refused = '';
 
         try {
@@ -158,6 +167,7 @@ test('the synthetic stream answers getUserMedia in every engine, Firefox without
             ],
             secondLive: second.getVideoTracks()[0].readyState,
             devices: devices.map((device) => device.deviceId),
+            stoppedTwice,
             refused,
             offset,
         };
@@ -172,6 +182,7 @@ test('the synthetic stream answers getUserMedia in every engine, Firefox without
         'fake-camera-2',
         'fake-mic-1',
     ]);
+    expect(result.stoppedTwice).toBe('no error');
     expect(result.refused).toBe('OverconstrainedError');
     expect(Math.abs(result.offset - 60_000)).toBeLessThan(1_000);
 });

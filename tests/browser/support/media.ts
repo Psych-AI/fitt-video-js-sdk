@@ -180,7 +180,11 @@ function syntheticMedia({ waitForAudio }: { waitForAudio: boolean }): void {
         return audio;
     };
 
-    /** A new mono microphone track fed by the one shared tone. */
+    /**
+     * A new mono microphone track fed by the one shared tone. Its stop() may be called any number
+     * of times, like a real track's: disconnect(destination) throws InvalidAccessError once the
+     * connection is gone, so it runs only on the first call.
+     */
     const microphoneTrack = (shared: {
         context: AudioContext;
         gain: GainNode;
@@ -191,8 +195,13 @@ function syntheticMedia({ waitForAudio }: { waitForAudio: boolean }): void {
 
         const track = destination.stream.getAudioTracks()[0];
         const stop = track.stop.bind(track);
+        let connected = true;
         track.stop = () => {
-            shared.gain.disconnect(destination);
+            if (connected) {
+                connected = false;
+                shared.gain.disconnect(destination);
+            }
+
             stop();
         };
 
