@@ -1558,6 +1558,8 @@ export const e2e = {
     stop: (): Promise<void> => e2eCurrent().stop(),
     reset: (): Promise<void> => e2eCurrent().reset(),
     finalise: (): Promise<void> => e2eCurrent().finalise(),
+    /** A host event on the current session (host. is added). */
+    event: (type: string): boolean => e2eCurrent().event(type),
     state: (): SessionState => e2eCurrent().state,
     /** The types of every event the session raised, in order. */
     events: (): string[] => [...e2eEvents],

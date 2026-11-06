@@ -13,6 +13,8 @@ import {
     sessionRecord,
 } from '../support/records.ts';
 import {
+    fakeChannels,
+    fakeLocks,
     recordTake,
     rigSeams,
     router,
@@ -1596,5 +1598,357 @@ test('a reload after a completed stop is stopped: start() needs reset() first', 
         second.session.start(),
         (error: unknown) =>
             (error as { code?: string }).code === 'invalid_state',
+    );
+});
+
+test('the purge sweep skips a stored session whose lock a live tab holds', async () => {
+    const store = new MemoryQueueStore();
+    const idle = (id: string) => ({
+        ...descriptorFixture('answer'),
+        session_id: id,
+    });
+    const held = idle('01jbz8q4w6x0k3m5n7p9r2t4zy');
+    const free = idle('01jbz8q4w6x0k3m5n7p9r2t4zz');
+
+    for (const descriptor of [held, free]) {
+        await store.putSession(
+            sessionRecord({
+                session_id: descriptor.session_id,
+                descriptor,
+                last_activity_ms: 1_762_400_000_000 - 600_001,
+            }),
+        );
+    }
+
+    const r = sessionRig({
+        store,
+        locks: fakeLocks([`fitt-video:${held.session_id}`]),
+    });
+    await r.session.prepare();
+
+    assert.ok(await store.getSession(held.session_id));
+    assert.equal(await store.getSession(free.session_id), undefined);
+});
+
+test('destroy() keeps the lock: a second tab stays idle and only the destroyed owner keeps sending', async () => {
+    const store = new MemoryQueueStore();
+    const locks = fakeLocks();
+    const { channel } = fakeChannels();
+    const descriptor = {
+        ...descriptorFixture('monitor'),
+        session_id: '01jbz8q4w6x0k3m5n7p9r2t4zx',
+    };
+    const ownerEnv = fakeEnvironment();
+    const otherEnv = fakeEnvironment();
+    ownerEnv.respond(router());
+    otherEnv.respond(router());
+    const owner = createSession(
+        descriptor,
+        {},
+        rigSeams(
+            ownerEnv,
+            store,
+            fakeMedia(ownerEnv),
+            new Map(),
+            locks,
+            channel,
+        ),
+    );
+    await owner.prepare();
+    owner.destroy();
+    const second = createSession(
+        descriptor,
+        {},
+        rigSeams(
+            otherEnv,
+            store,
+            fakeMedia(otherEnv),
+            new Map(),
+            locks,
+            channel,
+        ),
+    );
+    await settle();
+
+    await assert.rejects(second.start(), (error: unknown) => {
+        const failure = error as {
+            code?: string;
+            detail?: { reason?: string };
+        };
+
+        return (
+            failure.code === 'invalid_state' &&
+            failure.detail?.reason === 'other_tab'
+        );
+    });
+    await ownerEnv.advance(10_000);
+    await otherEnv.advance(10_000);
+    const ownerTypes = ownerEnv.calls
+        .filter((call) => call.url.endsWith('/events'))
+        .flatMap((call) =>
+            (JSON.parse(call.body as string).events as { type: string }[]).map(
+                (event) => event.type,
+            ),
+        );
+
+    assert.equal(second.state.phase, 'idle');
+    assert.deepEqual(
+        otherEnv.calls.filter((call) =>
+            /\/events$|\/segments\//.test(call.url),
+        ),
+        [],
+    );
+    assert.ok(ownerTypes.includes('page.duplicate_tab'));
+});
+
+test('a hidden owner hands the lock to a visible tab that asks, and its waiting events go out from the new owner', async () => {
+    const store = new MemoryQueueStore();
+    const locks = fakeLocks();
+    const { channel } = fakeChannels();
+    const storage = new Map<string, string>();
+    const descriptor = {
+        ...descriptorFixture('monitor'),
+        session_id: '01jbz8q4w6x0k3m5n7p9r2t4zw',
+    };
+    const hiddenEnv = fakeEnvironment();
+    const visibleEnv = fakeEnvironment();
+    hiddenEnv.respond(router());
+    visibleEnv.respond(router());
+    const hiddenSeams = rigSeams(
+        hiddenEnv,
+        store,
+        fakeMedia(hiddenEnv),
+        storage,
+        locks,
+        channel,
+    );
+    (hiddenSeams.page!.doc as { visibilityState: string }).visibilityState =
+        'hidden';
+    const hidden = createSession(descriptor, {}, hiddenSeams);
+    await hidden.prepare();
+    hidden.event('before_handover');
+    const visible = createSession(
+        descriptor,
+        {},
+        rigSeams(
+            visibleEnv,
+            store,
+            fakeMedia(visibleEnv),
+            storage,
+            locks,
+            channel,
+        ),
+    );
+    await until(() => hidden.state.phase === 'idle');
+    await visible.prepare();
+    await visibleEnv.advance(5000);
+    await hiddenEnv.advance(10_000);
+    const types = visibleEnv.calls
+        .filter((call) => call.url.endsWith('/events'))
+        .flatMap((call) =>
+            (JSON.parse(call.body as string).events as { type: string }[]).map(
+                (event) => event.type,
+            ),
+        );
+
+    assert.equal(visible.state.phase, 'ready');
+    assert.ok(types.includes('host.before_handover'));
+    assert.ok(types.includes('page.duplicate_tab'));
+    assert.deepEqual(
+        hiddenEnv.calls.filter((call) =>
+            /\/events$|\/segments\//.test(call.url),
+        ),
+        [],
+    );
+    await assert.rejects(
+        hidden.prepare(),
+        (error: unknown) =>
+            (error as { detail?: { reason?: string } }).detail?.reason ===
+            'other_tab',
+    );
+});
+
+test('a visible owner keeps the lock when another visible tab asks for it', async () => {
+    const store = new MemoryQueueStore();
+    const locks = fakeLocks();
+    const { channel } = fakeChannels();
+    const descriptor = {
+        ...descriptorFixture('monitor'),
+        session_id: '01jbz8q4w6x0k3m5n7p9r2t4zv',
+    };
+    const ownerEnv = fakeEnvironment();
+    const otherEnv = fakeEnvironment();
+    ownerEnv.respond(router());
+    otherEnv.respond(router());
+    const owner = createSession(
+        descriptor,
+        {},
+        rigSeams(
+            ownerEnv,
+            store,
+            fakeMedia(ownerEnv),
+            new Map(),
+            locks,
+            channel,
+        ),
+    );
+    await owner.prepare();
+    const second = createSession(
+        descriptor,
+        {},
+        rigSeams(
+            otherEnv,
+            store,
+            fakeMedia(otherEnv),
+            new Map(),
+            locks,
+            channel,
+        ),
+    );
+    await ownerEnv.advance(100);
+
+    assert.equal(owner.state.phase, 'ready');
+    await assert.rejects(
+        second.prepare(),
+        (error: unknown) =>
+            (error as { detail?: { reason?: string } }).detail?.reason ===
+            'other_tab',
+    );
+});
+
+test('a descriptor handed to a second tab reaches the owner, whose next batch uses its newer token', async () => {
+    const store = new MemoryQueueStore();
+    const locks = fakeLocks();
+    const { channel } = fakeChannels();
+    const descriptor = {
+        ...descriptorFixture('monitor'),
+        session_id: '01jbz8q4w6x0k3m5n7p9r2t4zt',
+    };
+    const renewed = {
+        ...descriptor,
+        token: {
+            ...descriptor.token,
+            id: '01jbz8q4w6x0k3m5n7p9r2t4zs',
+            secret: 'S'.repeat(40),
+        },
+    };
+    const ownerEnv = fakeEnvironment();
+    const otherEnv = fakeEnvironment();
+    ownerEnv.respond(router());
+    otherEnv.respond(router());
+    const owner = sessionWith(
+        descriptor,
+        {},
+        rigSeams(
+            ownerEnv,
+            store,
+            fakeMedia(ownerEnv),
+            new Map(),
+            locks,
+            channel,
+        ),
+    );
+    await owner.prepare();
+    createSession(
+        renewed,
+        {},
+        rigSeams(
+            otherEnv,
+            store,
+            fakeMedia(otherEnv),
+            new Map(),
+            locks,
+            channel,
+        ),
+    );
+    await settle();
+    owner.event('after_remint');
+    await ownerEnv.advance(5000);
+    const sent = ownerEnv.calls.filter((call) => call.url.endsWith('/events'));
+
+    assert.ok(sent.length > 0);
+    assert.match(
+        sent.at(-1)?.headers.Authorization ?? '',
+        new RegExp(`fvt_${renewed.token.id}\\.`),
+    );
+    assert.equal(
+        (await store.getSession(descriptor.session_id))?.descriptor.token.id,
+        renewed.token.id,
+    );
+});
+
+test('resume() reports a session another tab holds as owned_elsewhere and touches nothing of it', async () => {
+    const store = new MemoryQueueStore();
+    const env = fakeEnvironment();
+    const descriptor = {
+        ...descriptorFixture('monitor'),
+        session_id: '01jbz8q4w6x0k3m5n7p9r2t4zr',
+    };
+    await store.putSession(
+        sessionRecord({
+            session_id: descriptor.session_id,
+            descriptor,
+            take_open: true,
+            take_start_ms: 100,
+            last_activity_ms: 1_762_400_000_000 - 600_001,
+        }),
+    );
+    await store.putSegment(
+        segmentRecord({ session_id: descriptor.session_id, seq: 1 }),
+    );
+    const entries = await resumeWith(
+        {},
+        rigSeams(
+            env,
+            store,
+            fakeMedia(env),
+            new Map(),
+            fakeLocks([`fitt-video:${descriptor.session_id}`]),
+        ),
+    );
+
+    assert.deepEqual(entries, [
+        {
+            session_id: descriptor.session_id,
+            state: 'owned_elsewhere',
+            session: null,
+        },
+    ]);
+    assert.ok(await store.getSession(descriptor.session_id));
+    assert.equal((await store.listSegments(descriptor.session_id)).length, 1);
+});
+
+test('a finalised owner releases the lock: a waiting tab becomes the tombstone', async () => {
+    const store = new MemoryQueueStore();
+    const locks = fakeLocks();
+    const { channel } = fakeChannels();
+    const r = sessionRig({ store, chunks: true, locks, channel });
+    const otherEnv = fakeEnvironment();
+    otherEnv.respond(router());
+    const second = createSession(
+        r.descriptor,
+        {},
+        rigSeams(
+            otherEnv,
+            store,
+            fakeMedia(otherEnv),
+            r.storage,
+            locks,
+            channel,
+        ),
+    );
+    await recordTake(r, 1000);
+    const finalising = r.session.finalise();
+    await r.env.advance(10);
+    await finalising;
+    await until(() => r.session.state.upload.sessionFinalised);
+    await until(() => second.state.upload.sessionFinalised);
+
+    assert.equal(second.state.phase, 'stopped');
+    await assert.rejects(
+        second.start(),
+        (error: unknown) =>
+            (error as { detail?: { reason?: string } }).detail?.reason ===
+            'finalised',
     );
 });

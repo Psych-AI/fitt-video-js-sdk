@@ -1,5 +1,5 @@
 import { createClock } from './clock.ts';
-import { readDescriptor } from './descriptor.ts';
+import { readDescriptor, type Descriptor } from './descriptor.ts';
 import { browserEnvironment, type Environment } from './env.ts';
 import { phpJsonBytes, type SdkEvent } from './events.ts';
 import type { SessionOptions } from './options.ts';
@@ -8,10 +8,13 @@ import {
     browserSeams,
     epochKey,
     heldSession,
+    lockName,
     openResumed,
+    ownsLock,
     readNumber,
     removeItem,
     seqKey,
+    underLock,
     writeItem,
     type FittSession,
     type ResumeOpening,
@@ -20,14 +23,24 @@ import {
 import { openStore, type QueueStore, type SessionRecord } from './store.ts';
 import { ulid } from './ulid.ts';
 
-// Task 15c adds 'owned_elsewhere'.
 export type ResumeState =
-    'interrupted' | 'finalising' | 'discarding' | 'resume_expired';
+    | 'interrupted'
+    | 'finalising'
+    | 'discarding'
+    | 'resume_expired'
+    | 'owned_elsewhere';
 
 export interface ResumeEntry {
     session_id: string;
     state: ResumeState;
     session: FittSession | null;
+}
+
+/** A stored session resume() opens: its descriptor, the state it is reported as, and how it opens. */
+interface Opened {
+    descriptor: Descriptor;
+    state: ResumeState;
+    opening: ResumeOpening;
 }
 
 /** The state each kept decision is reported as; a tombstone and a purge are not reported. */
@@ -38,6 +51,22 @@ const STATES: Partial<Record<ResumeDecision, ResumeState>> = {
     finalise: 'finalising',
     interrupted: 'interrupted',
 };
+
+/** Whether a tab holds the session's lock right now, as locks.query() lists it. */
+async function lockHeld(
+    locks: SessionSeams['locks'],
+    sessionId: string,
+): Promise<boolean> {
+    if (locks === null) {
+        return false;
+    }
+
+    const snapshot = await locks.query();
+
+    return (snapshot.held ?? []).some(
+        (lock) => lock.name === lockName(sessionId),
+    );
+}
 
 /** Deletes a session's runs, segments and batches and keeps its record (author's call 15). */
 async function keepRecordOnly(
@@ -125,7 +154,9 @@ async function freezeResumeExpired(
  * stop drains, then finalises with its stored take end (`finalising`); a
  * lapsed token freezes one `session.resume_expired` batch and sends nothing
  * until a fresh descriptor arrives (`resume_expired`); anything else only
- * drains (`interrupted`).
+ * drains (`interrupted`). A session whose Web Lock another tab holds is
+ * `owned_elsewhere`, with no session, and nothing stored for it is read or
+ * touched; every delete runs inside the lock, taken only when it is free.
  */
 export async function resumeWith(
     options: SessionOptions,
@@ -137,13 +168,24 @@ export async function resumeWith(
     const entries: ResumeEntry[] = [];
 
     for (const record of await store.listSessions()) {
-        const nowMs = env.dateNow();
-        const plan = planResume(record, nowMs);
-        const state = STATES[plan];
         const held = heldSession(record.session_id);
+        const ownedHere = held !== undefined && ownsLock(held);
+
+        if (!ownedHere && (await lockHeld(seams.locks, record.session_id))) {
+            // Another tab holds the lock: nothing stored is read or touched.
+            entries.push({
+                session_id: record.session_id,
+                state: 'owned_elsewhere',
+                session: null,
+            });
+
+            continue;
+        }
 
         if (held !== undefined) {
             // This page already holds it: reported as it is, nothing stored is touched.
+            const state = STATES[planResume(record, env.dateNow())];
+
             if (state !== undefined) {
                 entries.push({
                     session_id: record.session_id,
@@ -155,59 +197,106 @@ export async function resumeWith(
             continue;
         }
 
-        if (plan === 'tombstone') {
-            // Kept, unreported, until it expires.
-            continue;
-        }
+        let opened: Opened | null = null;
+        // Every delete and write runs inside the session's lock, taken only when no tab holds it.
+        const granted = await underLock(
+            seams.locks,
+            record.session_id,
+            async () => {
+                opened = await planOne(env, store, seams.storage, record);
+            },
+        );
 
-        if (plan === 'purge' || state === undefined) {
-            await store.deleteSession(record.session_id);
-
-            if (record.finalised) {
-                // A tombstone past its expiry: the server takes nothing more for it.
-                removeItem(seams.storage, epochKey(record.session_id));
-                removeItem(seams.storage, seqKey(record.session_id));
-            } else {
-                keepNumbering(seams.storage, record);
-            }
-
-            continue;
-        }
-
-        const read = readDescriptor(record.descriptor);
-
-        if (!read.ok) {
-            console.warn(
-                `Fitt Video: the stored session ${record.session_id} has a descriptor this version cannot read; it was not resumed.`,
-            );
+        if (!granted) {
+            entries.push({
+                session_id: record.session_id,
+                state: 'owned_elsewhere',
+                session: null,
+            });
 
             continue;
         }
 
-        if (
-            (plan === 'discard' || plan === 'reset') &&
-            nowMs - record.last_activity_ms >
-                record.descriptor.queue.abandon_after_ms
-        ) {
-            // The owed call outlives the purge; its media does not.
-            await keepRecordOnly(store, record);
-        }
+        const chosen = opened as Opened | null;
 
-        if (plan === 'resume_expired') {
-            await freezeResumeExpired(env, store, seams.storage, record);
+        if (chosen !== null) {
+            entries.push({
+                session_id: record.session_id,
+                state: chosen.state,
+                session: openResumed(
+                    chosen.descriptor,
+                    options,
+                    shared,
+                    chosen.opening,
+                ),
+            });
         }
-
-        const opening: ResumeOpening = {
-            resume: plan === 'finalise' ? 'finalise' : 'drain',
-        };
-        entries.push({
-            session_id: record.session_id,
-            state,
-            session: openResumed(read.descriptor, options, shared, opening),
-        });
     }
 
     return entries;
+}
+
+/**
+ * One stored session no tab holds, inside its lock: a tombstone is kept,
+ * a purge deleted (neither reported), anything else prepared for opening.
+ */
+async function planOne(
+    env: Environment,
+    store: QueueStore,
+    storage: SessionSeams['storage'],
+    record: SessionRecord,
+): Promise<Opened | null> {
+    const nowMs = env.dateNow();
+    const plan = planResume(record, nowMs);
+    const state = STATES[plan];
+
+    if (plan === 'tombstone') {
+        // Kept, unreported, until it expires.
+        return null;
+    }
+
+    if (plan === 'purge' || state === undefined) {
+        await store.deleteSession(record.session_id);
+
+        if (record.finalised) {
+            // A tombstone past its expiry: the server takes nothing more for it.
+            removeItem(storage, epochKey(record.session_id));
+            removeItem(storage, seqKey(record.session_id));
+        } else {
+            keepNumbering(storage, record);
+        }
+
+        return null;
+    }
+
+    const read = readDescriptor(record.descriptor);
+
+    if (!read.ok) {
+        console.warn(
+            `Fitt Video: the stored session ${record.session_id} has a descriptor this version cannot read; it was not resumed.`,
+        );
+
+        return null;
+    }
+
+    if (
+        (plan === 'discard' || plan === 'reset') &&
+        nowMs - record.last_activity_ms >
+            record.descriptor.queue.abandon_after_ms
+    ) {
+        // The owed call outlives the purge; its media does not.
+        await keepRecordOnly(store, record);
+    }
+
+    if (plan === 'resume_expired') {
+        await freezeResumeExpired(env, store, storage, record);
+    }
+
+    return {
+        descriptor: read.descriptor,
+        state,
+        opening: { resume: plan === 'finalise' ? 'finalise' : 'drain' },
+    };
 }
 
 /** resumeWith(options, browserSeams()). */

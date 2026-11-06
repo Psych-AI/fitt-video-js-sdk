@@ -372,3 +372,198 @@ test('a session re-attached in a fresh tab continues on the same clock', async (
     expect(runs[1].anchor_source).toBe('wall_clock');
     expect(runs[1].anchor_ms).toBeGreaterThan(runs[0].ended_ms ?? 0);
 });
+
+test('a second tab with the same session never records or uploads, and the owner reports it', async ({
+    page,
+    context,
+    request,
+    browserName,
+}, testInfo) => {
+    test.skip(measured(testInfo, browserName), 'media in chromium and firefox');
+    const { descriptor } = await createSession(request, { recipe: 'monitor' });
+    await installMedia(page, browserName);
+    await openHarness(page);
+    await page.evaluate((d) => window.internals.e2e.open(d, {}), descriptor);
+    const second = await context.newPage();
+    await installMedia(second, browserName);
+    await openHarness(second);
+    await second.evaluate((d) => window.internals.e2e.open(d, {}), descriptor);
+    // Firefox holds enumerateDevices() until the page is the front tab, so prepare() would wait.
+    await page.bringToFront();
+    await record(page, 6);
+    await second.evaluate(async () => {
+        await window.internals.e2e.prepare().catch(() => null);
+        await window.internals.e2e.start().catch(() => null);
+    });
+    await second.waitForTimeout(6000);
+    const resetRefused = await second.evaluate(() =>
+        window.internals.e2e.reset().then(
+            () => 'resolved',
+            (error: { code?: string }) => error.code,
+        ),
+    );
+
+    expect(
+        (await second.evaluate(() => window.internals.e2e.state())).phase,
+    ).toBe('idle');
+    expect(resetRefused).toBe('invalid_state');
+    expect(
+        (await second.evaluate(() => window.internals.e2e.calls())).filter(
+            (c) => /\/segments\/|\/events$/.test(c.url),
+        ),
+    ).toEqual([]);
+    expect(await page.evaluate(() => window.internals.e2e.events())).toContain(
+        'page.duplicate_tab',
+    );
+});
+
+test('a host re-mint in a second tab reaches the owner, whose uploads keep landing past the grace', async ({
+    page,
+    context,
+    request,
+    browserName,
+}, testInfo) => {
+    test.skip(measured(testInfo, browserName), 'media in chromium and firefox');
+    test.setTimeout(180_000);
+    const { descriptor } = await createSession(request, { recipe: 'monitor' });
+    await installMedia(page, browserName);
+    await openHarness(page);
+    await page.evaluate((d) => window.internals.e2e.open(d, {}), descriptor);
+    await record(page, 4);
+    const remint = await request.post(
+        `${API}/sessions/${descriptor.session_id}/upload-token`,
+        {
+            headers: {
+                Authorization: `Bearer ${process.env.FITT_CONTRACT_KEY}`,
+                Accept: 'application/json',
+            },
+        },
+    );
+    const renewed = (await remint.json()).descriptor;
+    const second = await context.newPage();
+    await installMedia(second, browserName);
+    await openHarness(second);
+    await second.evaluate((d) => window.internals.e2e.open(d, {}), renewed);
+    const before = (await status(request, renewed)).tracks[0].segments.present;
+    await page.waitForTimeout(70_000); // past the 60 s grace of the superseded token
+
+    await expect
+        .poll(
+            async () =>
+                (await status(request, renewed)).tracks[0].segments.present,
+            { timeout: 30_000 },
+        )
+        .toBeGreaterThan(before);
+    expect(
+        (await page.evaluate(() => window.internals.e2e.state())).error?.code,
+    ).not.toBe('token_expired');
+});
+
+test('resume() in a second tab reports the live session as owned_elsewhere, and that tab drains the queue once the owner closes', async ({
+    page,
+    context,
+    request,
+    browserName,
+}) => {
+    test.skip(
+        browserName !== 'chromium',
+        'one engine is enough for the reload path',
+    );
+    const { descriptor } = await createSession(request, { recipe: 'monitor' });
+    await installMedia(page, browserName);
+    await openHarness(page);
+    await page.evaluate((d) => window.internals.e2e.open(d, {}), descriptor);
+    const second = await context.newPage();
+    await installMedia(second, browserName);
+    await openHarness(second);
+    await second.evaluate((d) => window.internals.e2e.open(d, {}), descriptor);
+    await record(page, 6);
+
+    expect(await second.evaluate(() => window.internals.e2e.resume())).toEqual([
+        { session_id: descriptor.session_id, state: 'owned_elsewhere' },
+    ]);
+    await page.evaluate(() => window.internals.e2e.stop());
+    const stored = (await page.evaluate(() => window.internals.e2e.local()))
+        .counts.camera;
+    await page.close();
+    await expect
+        .poll(
+            async () =>
+                (await status(request, descriptor)).tracks[0].segments.present,
+            { timeout: 30_000 },
+        )
+        .toBe(stored);
+});
+
+test('a reload of the owner while a duplicate tab is hidden gives the lock back to the reloaded tab', async ({
+    page,
+    context,
+    request,
+    browserName,
+}) => {
+    test.skip(
+        browserName !== 'chromium',
+        'one engine is enough for the lock hand-over',
+    );
+    const { descriptor } = await createSession(request, { recipe: 'monitor' });
+    const asOwner = (target: Page) =>
+        target.evaluate(() =>
+            window.internals.e2e.prepare().then(
+                () => 'owner',
+                (error: { code?: string }) => error.code,
+            ),
+        );
+    await installMedia(page, browserName);
+    await openHarness(page);
+    await page.evaluate((d) => window.internals.e2e.open(d, {}), descriptor);
+    const second = await context.newPage();
+    await installMedia(second, browserName);
+    await openHarness(second);
+    // Headless pages all report visible, so the duplicate tab is made hidden by hand.
+    await second.evaluate(() => {
+        Object.defineProperty(document, 'visibilityState', {
+            configurable: true,
+            get: () => 'hidden',
+        });
+        document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await second.evaluate((d) => window.internals.e2e.open(d, {}), descriptor);
+    await record(page, 4);
+    await page.reload();
+    await page.waitForFunction(() => 'internals' in window);
+    // The hidden tab now owns the session: this event waits in its memory when the visible tab asks for the lock.
+    await second.evaluate(() => window.internals.e2e.event('before_handover'));
+    await page.evaluate((d) => window.internals.e2e.open(d, {}), descriptor);
+
+    await expect.poll(() => asOwner(page), { timeout: 10_000 }).toBe('owner');
+    await record(page, 3);
+    await page.evaluate(() => window.internals.e2e.stop());
+
+    expect(
+        (await page.evaluate(() => window.internals.e2e.local())).runs.map(
+            (r) => r.ended_reason,
+        ),
+    ).toEqual(['reload', 'stop']);
+    expect(await asOwner(second)).toBe('invalid_state');
+    const accepted = async () =>
+        [
+            ...(await page.evaluate(() => window.internals.e2e.calls())),
+            ...(await second.evaluate(() => window.internals.e2e.calls())),
+        ]
+            .filter((c) => c.url.endsWith('/events') && c.status === 204)
+            .flatMap((c) =>
+                (
+                    JSON.parse(c.body ?? '{"events":[]}') as {
+                        events: { type: string }[];
+                    }
+                ).events.map((e) => e.type),
+            );
+    await expect
+        .poll(accepted, { timeout: 15_000 })
+        .toEqual(
+            expect.arrayContaining([
+                'host.before_handover',
+                'page.duplicate_tab',
+            ]),
+        );
+});

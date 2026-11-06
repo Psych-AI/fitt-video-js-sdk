@@ -82,12 +82,152 @@ export function router(overrides: Record<string, Answer> = {}): Answer {
     };
 }
 
+type Locks = NonNullable<SessionSeams['locks']>;
+type ChannelFactory = NonNullable<SessionSeams['channel']>;
+type LockCallback = (
+    lock: { name: string; mode: 'exclusive' } | null,
+) => unknown;
+
+/**
+ * Web Locks for one origin. Names in `heldElsewhere` are held for good by
+ * another tab. A free name is granted at once and released when the
+ * promise its callback returns settles; the next waiting request for it is
+ * then granted. A held name with ifAvailable runs callback(null) at once;
+ * without it the request waits.
+ */
+export function fakeLocks(heldElsewhere: string[] = []): Locks {
+    const held = new Set<string>(heldElsewhere);
+    const waiting = new Map<string, (() => void)[]>();
+
+    const run = (name: string, callback: LockCallback): Promise<unknown> => {
+        held.add(name);
+        let outcome: Promise<unknown>;
+
+        try {
+            outcome = Promise.resolve(callback({ name, mode: 'exclusive' }));
+        } catch (error) {
+            outcome = Promise.reject(error);
+        }
+
+        const release = (): void => {
+            held.delete(name);
+            waiting.get(name)?.shift()?.();
+        };
+        outcome.then(release, release);
+
+        return outcome;
+    };
+
+    const locks = {
+        request(
+            name: string,
+            optionsOrCallback: { ifAvailable?: boolean } | LockCallback,
+            maybeCallback?: LockCallback,
+        ): Promise<unknown> {
+            const callback =
+                typeof optionsOrCallback === 'function'
+                    ? optionsOrCallback
+                    : (maybeCallback as LockCallback);
+            const options =
+                typeof optionsOrCallback === 'function'
+                    ? {}
+                    : optionsOrCallback;
+
+            if (!held.has(name)) {
+                return run(name, callback);
+            }
+
+            if (options.ifAvailable === true) {
+                try {
+                    return Promise.resolve(callback(null));
+                } catch (error) {
+                    return Promise.reject(error);
+                }
+            }
+
+            return new Promise((resolve, reject) => {
+                const queue = waiting.get(name) ?? [];
+                waiting.set(name, queue);
+                queue.push(() => {
+                    run(name, callback).then(resolve, reject);
+                });
+            });
+        },
+        query: async () => ({
+            held: [...held].map((name) => ({ name, mode: 'exclusive' })),
+            pending: [],
+        }),
+    };
+
+    return locks as unknown as Locks;
+}
+
+/**
+ * One in-memory BroadcastChannel bus shared by every channel it makes.
+ * postMessage(data) delivers {data} on a later microtask to the message
+ * listeners of every other open channel of the same name; close() stops a
+ * channel sending and receiving.
+ */
+export function fakeChannels(): { channel: ChannelFactory } {
+    interface FakeChannel {
+        name: string;
+        closed: boolean;
+        listeners: Set<(event: { data: unknown }) => void>;
+    }
+
+    const open = new Set<FakeChannel>();
+
+    const channel = (name: string) => {
+        const self: FakeChannel = { name, closed: false, listeners: new Set() };
+        open.add(self);
+
+        return {
+            postMessage(data: unknown): void {
+                if (self.closed) {
+                    return;
+                }
+
+                for (const other of open) {
+                    if (other === self || other.name !== name) {
+                        continue;
+                    }
+
+                    const copy = structuredClone(data);
+                    queueMicrotask(() => {
+                        if (!other.closed) {
+                            for (const listener of [...other.listeners]) {
+                                listener({ data: copy });
+                            }
+                        }
+                    });
+                }
+            },
+            addEventListener(
+                type: string,
+                listener: (event: { data: unknown }) => void,
+            ): void {
+                if (type === 'message') {
+                    self.listeners.add(listener);
+                }
+            },
+            close(): void {
+                self.closed = true;
+                open.delete(self);
+            },
+        };
+    };
+
+    return { channel: channel as unknown as ChannelFactory };
+}
+
 /** The session's seams over a fake environment, a memory store, fake media and a fake page. */
 export function rigSeams(
     env: FakeEnvironment,
     store: MemoryQueueStore,
     media: ReturnType<typeof fakeMedia>,
     storage = new Map<string, string>(),
+    locks: SessionSeams['locks'] = null,
+    channel: SessionSeams['channel'] = null,
 ): SessionSeams {
     return {
         env,
@@ -109,6 +249,8 @@ export function rigSeams(
         },
         indexedDB: undefined,
         store,
+        locks,
+        channel,
     };
 }
 
@@ -122,6 +264,8 @@ export function sessionRig(
         refuse?: string;
         chunks?: boolean;
         options?: SessionOptions;
+        locks?: SessionSeams['locks'];
+        channel?: SessionSeams['channel'];
     } = {},
 ) {
     const env = options.env ?? fakeEnvironment();
@@ -140,7 +284,14 @@ export function sessionRig(
     const descriptor =
         options.descriptor ?? descriptorFixture(options.recipe ?? 'monitor');
     env.respond(router());
-    const seams = rigSeams(env, store, media, storage);
+    const seams = rigSeams(
+        env,
+        store,
+        media,
+        storage,
+        options.locks ?? null,
+        options.channel ?? null,
+    );
     const session = createSession(descriptor, options.options ?? {}, seams);
     const calls = (pattern: RegExp): FetchCall[] =>
         env.calls.filter((call) => pattern.test(call.url));

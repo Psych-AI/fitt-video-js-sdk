@@ -117,7 +117,7 @@ export interface FittSession {
     ): () => void;
     requestFullscreen(target?: Element): Promise<ActionResult>;
     lockKeyboard(): Promise<ActionResult>;
-    /** Releases capture and listeners; the lock, the channel, the queue and the map entry stay (author's call 12). */
+    /** Releases capture and listeners; the lock, the channel, the queue and the map entry stay (author's calls 12 and 15). */
     destroy(): void;
 }
 
@@ -139,6 +139,17 @@ export interface SessionSeams {
     indexedDB: IDBFactory | undefined;
     /** Tests pass a store; the browser opens IndexedDB. */
     store?: QueueStore;
+    /** navigator.locks: one owning tab per session (author's call 15). null: every session owns its id. */
+    locks: Pick<LockManager, 'request' | 'query'> | null;
+    /** BroadcastChannel: the relay between a second tab and the owner. null outside a browser. */
+    channel:
+        | ((
+              name: string,
+          ) => Pick<
+              BroadcastChannel,
+              'postMessage' | 'addEventListener' | 'close'
+          >)
+        | null;
 }
 
 type StorageView = SessionSeams['storage'];
@@ -241,6 +252,52 @@ export function removeItem(storage: StorageView, key: string): void {
         // Nothing to do: the key ages out with the origin's storage.
     }
 }
+
+/** The Web Lock and BroadcastChannel name of a session (author's call 15). */
+export const lockName = (sessionId: string): string =>
+    `fitt-video:${sessionId.toLowerCase()}`;
+
+/**
+ * Runs `work` inside the session's Web Lock when no tab holds it, and says
+ * whether it ran. Without locks it always runs. The purge sweep and resume()
+ * delete through it, so a session a live tab holds is never deleted.
+ */
+export async function underLock(
+    locks: SessionSeams['locks'],
+    sessionId: string,
+    work: () => Promise<void>,
+): Promise<boolean> {
+    if (locks === null) {
+        await work();
+
+        return true;
+    }
+
+    let granted = false;
+    await locks.request(
+        lockName(sessionId),
+        { ifAvailable: true },
+        async (lock) => {
+            if (lock === null) {
+                return;
+            }
+
+            granted = true;
+            await work();
+        },
+    );
+
+    return granted;
+}
+
+/** What one tab tells the others of a session over its BroadcastChannel. */
+type RelayMessage =
+    | {
+          type: 'descriptor';
+          event: 'page.duplicate_tab';
+          descriptor: Descriptor;
+      }
+    | { type: 'want_lock' };
 
 function isErrorCode(code: unknown): code is ErrorCode {
     return (ERROR_CODES as readonly unknown[]).includes(code);
@@ -414,6 +471,14 @@ function invalidSession(detail: Record<string, unknown>): FittSession {
 /** The descriptor setter of every session object, for the same-id map. */
 const setters = new WeakMap<FittSession, (descriptor: Descriptor) => void>();
 
+/** Whether each session object holds its Web Lock, for resume(). */
+const owners = new WeakMap<FittSession, () => boolean>();
+
+/** Whether this page's object holds the session's lock (always true without locks). */
+export function ownsLock(session: FittSession): boolean {
+    return owners.get(session)?.() ?? true;
+}
+
 /** The same-id map: one session object per session id in this page. */
 const sessions = new Map<string, FittSession>();
 
@@ -532,6 +597,19 @@ export function createSession(
     let autoFinalise = opening?.resume === 'finalise';
     /** startPipeline() ran: the queue holds every pending segment, so a backlog of 0 means drained. */
     let pipelineStarted = false;
+
+    // One owning tab (author's call 15).
+    const locks = seams.locks;
+    /** This tab holds the session's Web Lock; without locks every session owns its id. */
+    let owner = locks === null;
+    /** Settles the promise the lock callback returned, which hands the lock to the next waiting request. */
+    let releaseLock: (() => void) | null = null;
+    /** A waiting lock request is queued. */
+    let lockQueued = false;
+    let relay: ReturnType<NonNullable<SessionSeams['channel']>> | null = null;
+    let handingOver = false;
+    /** The host re-attached or prepared: the page is listened to whenever this tab owns the session. */
+    let attachWanted = false;
 
     // Previews and the stall watch (item 13).
     const previews: HTMLVideoElement[] = [];
@@ -687,44 +765,63 @@ export function createSession(
         }
     };
 
-    // The purge sweep over every stored session (item 3).
+    /**
+     * The purge sweep over every stored session (item 3). Each delete runs
+     * inside that session's Web Lock, taken only when no tab holds it: a
+     * session a live tab holds is skipped (author's call 15).
+     */
     const purgeSweep = async (): Promise<void> => {
         const nowMs = env.dateNow();
 
         for (const stored of await store.listSessions()) {
             const plan = planResume(stored, nowMs);
-            const own =
-                stored.session_id.toLowerCase() === sessionId.toLowerCase();
-
-            if (plan === 'purge' && own) {
-                // The session being opened: its media is abandoned, its numbering is not.
-                // A fresh next_batch_seq would replay seqs the server already holds,
-                // and the server drops a replayed batch_seq as a no-op.
-                await store.deleteSession(stored.session_id);
-                await store.putSession({
-                    ...stored,
-                    take_start_ms: null,
-                    take_open: false,
-                    take_end_ms: null,
-                    stop_completed: false,
-                    manifest_owed: {},
-                    finalised: false,
-                    expires_at_ms: null,
-                    last_activity_ms: nowMs,
-                });
-            } else if (plan === 'purge') {
-                await store.deleteSession(stored.session_id);
-                removeItem(storage, epochKey(stored.session_id));
-                removeItem(storage, seqKey(stored.session_id));
-            } else if (
+            const keepOwed =
                 (plan === 'discard' || plan === 'reset') &&
                 nowMs - stored.last_activity_ms >
-                    stored.descriptor.queue.abandon_after_ms
-            ) {
-                // The owed call outlives the purge; its media does not (author's call 15).
-                await store.deleteSession(stored.session_id);
-                await store.putSession(stored);
+                    stored.descriptor.queue.abandon_after_ms;
+
+            if (plan !== 'purge' && !keepOwed) {
+                continue;
             }
+
+            await underLock(seams.locks, stored.session_id, () =>
+                sweepOne(stored, plan, nowMs),
+            );
+        }
+    };
+
+    /** One stored session the purge sweep deletes, or keeps as a record with no media. */
+    const sweepOne = async (
+        stored: SessionRecord,
+        plan: ReturnType<typeof planResume>,
+        nowMs: number,
+    ): Promise<void> => {
+        const own = stored.session_id.toLowerCase() === sessionId.toLowerCase();
+
+        if (plan === 'purge' && own) {
+            // The session being opened: its media is abandoned, its numbering is not.
+            // A fresh next_batch_seq would replay seqs the server already holds,
+            // and the server drops a replayed batch_seq as a no-op.
+            await store.deleteSession(stored.session_id);
+            await store.putSession({
+                ...stored,
+                take_start_ms: null,
+                take_open: false,
+                take_end_ms: null,
+                stop_completed: false,
+                manifest_owed: {},
+                finalised: false,
+                expires_at_ms: null,
+                last_activity_ms: nowMs,
+            });
+        } else if (plan === 'purge') {
+            await store.deleteSession(stored.session_id);
+            removeItem(storage, epochKey(stored.session_id));
+            removeItem(storage, seqKey(stored.session_id));
+        } else {
+            // The owed call outlives the purge; its media does not (author's call 15).
+            await store.deleteSession(stored.session_id);
+            await store.putSession(stored);
         }
     };
 
@@ -848,10 +945,20 @@ export function createSession(
         ready: () => rejectWith('token_expired'),
     };
 
+    /** Item 10's cleanup: the lock goes to the next waiting tab, and the relay closes. */
+    const releaseOwnership = (): void => {
+        const release = releaseLock;
+        releaseLock = null;
+        release?.();
+        relay?.close();
+        relay = null;
+    };
+
     /** The object a finalised session leaves: phase stopped, finalised, nothing running (item 10). */
     const becomeTombstone = (): void => {
         tombstoned = true;
         early = [];
+        releaseOwnership();
         // No uploader, batcher or keeper; the status reads (checks, playback) still go.
         api = createSessionApi(
             env,
@@ -1677,6 +1784,7 @@ export function createSession(
 
         await store.putSession(tombstone);
         tombstoned = true;
+        releaseOwnership();
         refreshUpload();
     };
 
@@ -2316,7 +2424,7 @@ export function createSession(
             return;
         }
 
-        if (mode === 'full' && !destroyed) {
+        if ((mode === 'full' || attachWanted) && !destroyed) {
             attachPage();
         }
 
@@ -2462,25 +2570,12 @@ export function createSession(
         }
     };
 
-    const ready: Promise<void> = (async () => {
-        if (seams.store !== undefined) {
-            store = seams.store;
-        } else {
-            const opened = await openStore(seams.indexedDB, (reason) =>
-                reportStorage(reason),
-            );
-            store = opened.store;
-
-            if (opened.unavailable !== undefined) {
-                reportStorage(opened.unavailable);
-            }
-        }
-
-        if (opening === null) {
-            // resume() swept every stored session before it opened this one.
-            await purgeSweep();
-        }
-
+    /**
+     * The record, the build and the owed calls, run only while this tab
+     * holds the lock: at once, or when a waiting request is granted (the
+     * owner closed, or handed the lock over). The record is read fresh.
+     */
+    const takeOwnership = async (): Promise<void> => {
         if (await loadRecord()) {
             becomeTombstone();
 
@@ -2520,10 +2615,306 @@ export function createSession(
 
         await continueAfterReload();
         startPipeline(opening === null ? 'full' : 'drain');
+    };
+
+    const reportReady = (error: unknown): void =>
+        console.error('Fitt Video: the session could not start.', error);
+
+    const otherTabRefusal = (): Promise<never> =>
+        rejectWith('invalid_state', { reason: 'other_tab' });
+
+    /** The relay message a second tab sends: page.duplicate_tab for the owner, and the descriptor it was handed. */
+    const sendRelay = (current: Descriptor): void => {
+        const message: RelayMessage = {
+            type: 'descriptor',
+            event: 'page.duplicate_tab',
+            descriptor: current,
+        };
+
+        try {
+            relay?.postMessage(message);
+        } catch (error) {
+            console.error(error);
+        }
+    };
+
+    /** A descriptor from the host or a relay: the keeper takes it only when its token is newer (author's call 10). */
+    const takeDescriptor = (next: Descriptor): void => {
+        if (tombstoned) {
+            return;
+        }
+
+        if (token === null) {
+            pendingDescriptors.push(next);
+        } else {
+            token.set(next);
+        }
+    };
+
+    /** Holds the lock until a hand-over or item 10's cleanup settles it. */
+    const holdLock = (granted: () => void): Promise<void> =>
+        new Promise<void>((release) => {
+            releaseLock = release;
+            owner = true;
+            granted();
+        });
+
+    /** One ifAvailable request: true when this tab now holds the lock. The session never awaits a held lock's promise. */
+    const requestLock = (): Promise<boolean> =>
+        new Promise<boolean>((resolve) => {
+            (locks as NonNullable<SessionSeams['locks']>)
+                .request(lockName(sessionId), { ifAvailable: true }, (lock) => {
+                    if (lock === null) {
+                        resolve(false);
+
+                        return undefined;
+                    }
+
+                    return holdLock(() => resolve(true));
+                })
+                .catch((error: unknown) => {
+                    console.error(error);
+                    resolve(false);
+                });
+        });
+
+    /** A waiting request: when it is granted, this tab builds the rest as the owner. */
+    const queueLock = (): void => {
+        if (locks === null || lockQueued) {
+            return;
+        }
+
+        lockQueued = true;
+        locks
+            .request(lockName(sessionId), { mode: 'exclusive' }, (lock) => {
+                lockQueued = false;
+
+                if (lock === null) {
+                    return undefined;
+                }
+
+                return holdLock(() => {
+                    ready = takeOwnership();
+                    ready.catch(reportReady);
+                });
+            })
+            .catch((error: unknown) => console.error(error));
+    };
+
+    /**
+     * Without the lock: phase idle, nothing stored, no keeper, uploader or
+     * batcher (bus events wait in memory). The owner hears of this tab and
+     * of its descriptor; a visible tab also asks for the lock. A waiting
+     * request is queued either way.
+     */
+    const becomeBystander = (): void => {
+        owner = false;
+        // Status reads only, with the token this tab was handed.
+        api = createSessionApi(
+            env,
+            () => descriptor,
+            () => heldToken.current(),
+        );
+        sendRelay(descriptor);
+
+        if (page !== null && page.doc.visibilityState === 'visible') {
+            try {
+                relay?.postMessage({
+                    type: 'want_lock',
+                } satisfies RelayMessage);
+            } catch (error) {
+                console.error(error);
+            }
+        }
+
+        queueLock();
+    };
+
+    /**
+     * A visible tab asked for the lock. A hidden owner that is not counting
+     * down, recording or stopping (and has no prepare, reset, discard,
+     * finalise or manifest in flight) freezes its waiting events, stops its
+     * keeper, uploader and batcher, and only then releases the lock and
+     * queues a waiting request again, so the visible tab's request is first.
+     */
+    const handOver = async (): Promise<void> => {
+        if (!owner || handingOver) {
+            return;
+        }
+
+        await whenReady();
+        const phase = lifecycle?.phase() ?? 'idle';
+
+        if (
+            !owner ||
+            handingOver ||
+            releaseLock === null ||
+            page === null ||
+            page.doc.visibilityState !== 'hidden' ||
+            tombstoned ||
+            tombstoning ||
+            closed ||
+            discarding !== null ||
+            resetting !== null ||
+            finalising ||
+            preparing !== null ||
+            manifestsInFlight.size > 0 ||
+            phase === 'preparing' ||
+            phase === 'countdown' ||
+            phase === 'recording' ||
+            phase === 'stopping'
+        ) {
+            return;
+        }
+
+        handingOver = true;
+        owner = false;
+        ready = (async (): Promise<void> => {
+            stopTick();
+            checksPoll?.cancel();
+            checksPoll = null;
+            detachPage();
+            removeOnline?.();
+            removeOnline = null;
+            engine?.release();
+            // The next owner sends what was waiting here: batch_seq and the bodies are stored first.
+            await batcher?.freeze();
+            await token?.stop();
+            await uploader?.stop();
+            batcher?.stop();
+            await writes;
+            pendingDescriptors.push(descriptor);
+            record = null;
+            batcher = null;
+            token = null;
+            ladder = null;
+            queue = null;
+            uploader = null;
+            lifecycle = null;
+            engine = null;
+            stall = null;
+            stay = null;
+            api = createSessionApi(
+                env,
+                () => descriptor,
+                () => heldToken.current(),
+            );
+            pipelineStarted = false;
+            heartbeats = false;
+            activeTake = null;
+            sealedTake = null;
+            interrupted = false;
+            deferredSealed = false;
+            recordExisted = false;
+            lastEmittedError = null;
+            posted.clear();
+            sealed.clear();
+            repostWanted.clear();
+            blockedTracks.clear();
+            state.patch({ phase: 'idle', error: null });
+            refreshUpload();
+            const release = releaseLock;
+            releaseLock = null;
+            release?.();
+            sendRelay(descriptor);
+            queueLock();
+        })().finally(() => {
+            handingOver = false;
+        });
+        ready.catch(reportReady);
+        await whenReady();
+    };
+
+    const onRelay = (data: unknown): void => {
+        const message = data as {
+            type?: unknown;
+            event?: unknown;
+            descriptor?: unknown;
+        } | null;
+
+        if (message?.type === 'want_lock') {
+            void handOver().catch((error: unknown) => console.error(error));
+
+            return;
+        }
+
+        if (message?.type !== 'descriptor') {
+            return;
+        }
+
+        if (owner && message.event === 'page.duplicate_tab') {
+            // Re-emitted on this bus, so it is batched with the owner's events.
+            emit('page.duplicate_tab', {});
+        }
+
+        const read = readDescriptor(message.descriptor);
+
+        if (
+            read.ok &&
+            read.descriptor.session_id.toLowerCase() === sessionId.toLowerCase()
+        ) {
+            // A host re-mint in the second tab never strands the owner on a superseded token.
+            takeDescriptor(read.descriptor);
+        }
+    };
+
+    const openRelay = (): void => {
+        try {
+            relay = seams.channel?.(lockName(sessionId)) ?? null;
+            relay?.addEventListener('message', (event) =>
+                onRelay((event as MessageEvent).data),
+            );
+        } catch (error) {
+            console.error(error);
+            relay = null;
+        }
+    };
+
+    let ready: Promise<void> = (async () => {
+        if (seams.store !== undefined) {
+            store = seams.store;
+        } else {
+            const opened = await openStore(seams.indexedDB, (reason) =>
+                reportStorage(reason),
+            );
+            store = opened.store;
+
+            if (opened.unavailable !== undefined) {
+                reportStorage(opened.unavailable);
+            }
+        }
+
+        if (opening === null) {
+            // resume() swept every stored session before it opened this one.
+            await purgeSweep();
+        }
+
+        if (locks !== null) {
+            // The lock comes before the record is touched (author's call 15).
+            openRelay();
+
+            if (!(await requestLock())) {
+                becomeBystander();
+
+                return;
+            }
+        }
+
+        await takeOwnership();
     })();
-    ready.catch((error: unknown) =>
-        console.error('Fitt Video: the session could not start.', error),
-    );
+    ready.catch(reportReady);
+
+    /** Waits for the current ready promise, and again whenever a grant or a hand-over replaced it meanwhile. */
+    async function whenReady(): Promise<void> {
+        for (;;) {
+            const current = ready;
+            await current;
+
+            if (current === ready) {
+                return;
+            }
+        }
+    }
 
     const emitEnvironment = (withLabels: boolean): void => {
         if (environmentSent) {
@@ -2602,7 +2993,11 @@ export function createSession(
             return engine?.devices().selected ?? {};
         },
         async select(kind, deviceId): Promise<void> {
-            await ready;
+            await whenReady();
+
+            if (!owner && !tombstoned) {
+                return otherTabRefusal();
+            }
 
             if (engine === null) {
                 throw new FittVideoError('recorder_unsupported');
@@ -2711,10 +3106,14 @@ export function createSession(
             : {}),
 
         async prepare(): Promise<void> {
-            await ready;
+            await whenReady();
 
             if (tombstoned || finalised) {
                 return finalisedRefusal();
+            }
+
+            if (!owner) {
+                return otherTabRefusal();
             }
 
             if (closed) {
@@ -2727,6 +3126,7 @@ export function createSession(
 
             // A session resume() opened, or one destroy() released, listens to the page again.
             destroyed = false;
+            attachWanted = true;
             attachPage();
 
             const phase = (lifecycle as Lifecycle).phase();
@@ -2810,10 +3210,14 @@ export function createSession(
         now: () => clock.now(),
 
         async start(): Promise<void> {
-            await ready;
+            await whenReady();
 
             if (tombstoned || finalised) {
                 return finalisedRefusal();
+            }
+
+            if (!owner) {
+                return otherTabRefusal();
             }
 
             if (closed) {
@@ -2862,10 +3266,14 @@ export function createSession(
         },
 
         async stop(stopOptions = {}): Promise<void> {
-            await ready;
+            await whenReady();
 
             if (tombstoned) {
                 return;
+            }
+
+            if (!owner) {
+                return otherTabRefusal();
             }
 
             const life = lifecycle as Lifecycle;
@@ -2894,10 +3302,14 @@ export function createSession(
         },
 
         async finalise(): Promise<void> {
-            await ready;
+            await whenReady();
 
             if (tombstoned) {
                 return;
+            }
+
+            if (!owner) {
+                return otherTabRefusal();
             }
 
             if (closed) {
@@ -2921,7 +3333,7 @@ export function createSession(
 
         async waitForChecks(checkOptions = {}): Promise<ChecksResult> {
             // A finished session still polls with the held token (item 10).
-            await ready;
+            await whenReady();
             const current = checksPoll;
 
             // One poll per take, shared with finalise() and the poll stop() started;
@@ -2942,7 +3354,7 @@ export function createSession(
 
         async waitForReady(readyOptions): Promise<string> {
             // Playback exists only once a finalised session was processed: a tombstone polls too.
-            await ready;
+            await whenReady();
 
             const url = await pollReady(
                 { env, status: () => api!.status() },
@@ -2955,10 +3367,14 @@ export function createSession(
         },
 
         async reset(): Promise<void> {
-            await ready;
+            await whenReady();
 
             if (tombstoned || finalised) {
                 return finalisedRefusal();
+            }
+
+            if (!owner) {
+                return otherTabRefusal();
             }
 
             if (closed) {
@@ -3031,10 +3447,14 @@ export function createSession(
         },
 
         async discard(): Promise<void> {
-            await ready;
+            await whenReady();
 
             if (tombstoned || finalised) {
                 return finalisedRefusal();
+            }
+
+            if (!owner) {
+                return otherTabRefusal();
             }
 
             return runDiscard();
@@ -3046,7 +3466,11 @@ export function createSession(
 
         async uploadTranscript(upload): Promise<void> {
             const body = transcriptBody(upload);
-            await ready;
+            await whenReady();
+
+            if (!owner && !tombstoned) {
+                return otherTabRefusal();
+            }
             // A transcript often comes after finalise: a finished session sends it with the held token.
             const answer = await callWithRetry(
                 {
@@ -3108,8 +3532,10 @@ export function createSession(
 
     /** The host re-attached a session resume() opened: it listens to the page from now on. */
     const reattach = (): void => {
-        void ready.then(() => {
+        attachWanted = true;
+        void whenReady().then(() => {
             if (
+                owner &&
                 !destroyed &&
                 !closed &&
                 !tombstoned &&
@@ -3126,6 +3552,15 @@ export function createSession(
             return;
         }
 
+        if (!owner) {
+            // A second tab: kept for a later grant, and relayed to the owner each time.
+            pendingDescriptors.push(next);
+            attachWanted = true;
+            sendRelay(next);
+
+            return;
+        }
+
         if (token === null) {
             pendingDescriptors.push(next);
             reattach();
@@ -3137,6 +3572,8 @@ export function createSession(
         token.set(next);
         reattach();
     });
+
+    owners.set(created, () => owner);
 
     return created;
 }
@@ -3214,6 +3651,9 @@ export function browserSeams(): SessionSeams {
             createAudioContext: null,
             storage: null,
             indexedDB: undefined,
+            // No Node run ever opens a BroadcastChannel: an open one keeps the process alive.
+            locks: null,
+            channel: null,
         };
     }
 
@@ -3253,6 +3693,14 @@ export function browserSeams(): SessionSeams {
                 : () => new AudioContext(),
         storage,
         indexedDB: typeof indexedDB === 'undefined' ? undefined : indexedDB,
+        locks:
+            typeof navigator !== 'undefined' && navigator.locks !== undefined
+                ? navigator.locks
+                : null,
+        channel:
+            typeof BroadcastChannel === 'undefined'
+                ? null
+                : (name) => new BroadcastChannel(name),
     };
 }
 
