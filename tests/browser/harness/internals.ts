@@ -12,8 +12,10 @@ import { FittVideoError, type ErrorCode } from '../../../src/core/errors.ts';
 import { createEventBus } from '../../../src/core/events.ts';
 import { send } from '../../../src/core/http.ts';
 import { createLadder } from '../../../src/core/ladder.ts';
+import type { SessionOptions } from '../../../src/core/options.ts';
 import { createQueue } from '../../../src/core/queue.ts';
-import type { Phase } from '../../../src/core/state.ts';
+import type { FittSession } from '../../../src/core/session.ts';
+import type { Phase, SessionState } from '../../../src/core/state.ts';
 import {
     MemoryQueueStore,
     openIdbStore,
@@ -1420,3 +1422,107 @@ export async function silenceProbe(): Promise<{
         session.destroy();
     }
 }
+
+/** One API call the end-to-end page made: `body` is the request body of an /events call, absent otherwise. */
+export interface E2eCall {
+    method: string;
+    url: string;
+    status: number;
+    at: number;
+    online: boolean;
+    body?: string;
+}
+
+let e2eSession: FittSession | null = null;
+const e2eCalls: E2eCall[] = [];
+const e2eEvents: string[] = [];
+
+function e2eCurrent(): FittSession {
+    if (e2eSession === null) {
+        throw new Error('e2e.open() was not called.');
+    }
+
+    return e2eSession;
+}
+
+/**
+ * The end-to-end contract spec's hold on one real session
+ * (FittVideo.session() with the browser's seams). Every API call goes
+ * through options.environment.fetch, which logs it.
+ */
+export const e2e = {
+    open(descriptor: Descriptor, options: SessionOptions = {}): void {
+        e2eCalls.length = 0;
+        e2eEvents.length = 0;
+        const logged = (url: string, init: RequestInit): Promise<Response> => {
+            const entry: E2eCall = {
+                method: init.method ?? 'GET',
+                url,
+                status: 0,
+                at: performance.now(),
+                online: navigator.onLine,
+            };
+
+            if (/\/events$/.test(url) && typeof init.body === 'string') {
+                entry.body = init.body;
+            }
+
+            e2eCalls.push(entry);
+
+            return fetch(url, init).then((response) => {
+                entry.status = response.status;
+
+                return response;
+            });
+        };
+        e2eSession = FittVideo.session(descriptor, {
+            ...options,
+            environment: { ...options.environment, fetch: logged },
+        });
+        e2eSession.onEvent((event) => e2eEvents.push(event.type));
+    },
+    prepare: (): Promise<void> => e2eCurrent().prepare(),
+    start: (): Promise<void> => e2eCurrent().start(),
+    stop: (): Promise<void> => e2eCurrent().stop(),
+    reset: (): Promise<void> => e2eCurrent().reset(),
+    finalise: (): Promise<void> => e2eCurrent().finalise(),
+    state: (): SessionState => e2eCurrent().state,
+    /** The types of every event the session raised, in order. */
+    events: (): string[] => [...e2eEvents],
+    calls: (): E2eCall[] => e2eCalls.map((call) => ({ ...call })),
+    /** The stored runs and the stored segment count per track, with the batch_seq of the first batch this page sent. */
+    async local(): Promise<{
+        runs: RunRecord[];
+        counts: { camera: number; audio: number };
+        firstBatchSeqAfterReload: number | null;
+    }> {
+        const id = e2eCurrent().id;
+        const store = await openIdbStore(indexedDB);
+
+        try {
+            const segments = await store.listSegments(id);
+            const firstBatch = e2eCalls.find((call) => call.body !== undefined);
+
+            return {
+                runs: await store.listRuns(id),
+                counts: {
+                    camera: segments.filter((each) => each.track === 'camera')
+                        .length,
+                    audio: segments.filter((each) => each.track === 'audio')
+                        .length,
+                },
+                firstBatchSeqAfterReload:
+                    firstBatch?.body === undefined
+                        ? null
+                        : (JSON.parse(firstBatch.body) as { batch_seq: number })
+                              .batch_seq,
+            };
+        } finally {
+            store.close();
+        }
+    },
+    /** A host re-render with a (re-minted) descriptor: the same session object takes it. */
+    setDescriptor(descriptor: Descriptor): void {
+        FittVideo.session(descriptor);
+    },
+};

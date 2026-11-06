@@ -249,6 +249,59 @@ function isOk(answer: WireAnswer): boolean {
     return answer.status >= 200 && answer.status < 300;
 }
 
+/** The two 409 codes after which the server takes nothing more for the session. */
+type ClosingCode = 'session_closed' | 'discarded';
+
+function isClosingCode(code: unknown): code is ClosingCode {
+    return code === 'session_closed' || code === 'discarded';
+}
+
+/** The closing code of a 409 answer, or null for any other answer. */
+function closingCodeOf(answer: WireAnswer): ClosingCode | null {
+    const verdict = classify(answer);
+
+    return verdict.kind === 'terminal' &&
+        verdict.status === 409 &&
+        isClosingCode(verdict.code)
+        ? verdict.code
+        : null;
+}
+
+/** A refusal made locally, so a call that must not go out ends as the server would end it. */
+function localRefusal(code: string): WireAnswer {
+    return {
+        status: 409,
+        body: { error: { code, message: code } },
+        networkError: false,
+        timedOut: false,
+    };
+}
+
+/** error.current_take of a 409 stale_take, or null. */
+function currentTakeIn(body: unknown): number | null {
+    const error = (body as { error?: { current_take?: unknown } } | null)
+        ?.error;
+    const take = error?.current_take;
+
+    return typeof take === 'number' && Number.isSafeInteger(take) && take > 0
+        ? take
+        : null;
+}
+
+/** The answer of a call owed until a final answer, or the token that can no longer be re-minted. */
+type OwedOutcome =
+    { kind: 'answer'; answer: WireAnswer } | { kind: 'unrecoverable' };
+
+/** One shared checks poll for one take (spec 6.7). */
+interface ChecksPoll {
+    take: number;
+    promise: Promise<ChecksResult>;
+    /** What the server said, or the local unknown at the timeout; null while polling. */
+    result: ChecksResult | null;
+    cancelled: boolean;
+    cancel(): void;
+}
+
 function listenerSet<T>(): {
     add(listener: (value: T) => void): () => void;
     call(value: T): void;
@@ -433,6 +486,19 @@ export function createSession(
     const repostWanted = new Set<string>();
     /** Tracks whose manifest stop() stopped waiting for on a network that blocks preflights. */
     const blockedTracks = new Set<TrackName>();
+    /** The server closed or discarded the session: everything local is gone, nothing more is sent. */
+    let closed = false;
+    let closedReason: ClosingCode = 'session_closed';
+    let closing: Promise<void> | null = null;
+    /** The discard in progress, owed until a final answer (spec 6.5). */
+    let discarding: Promise<void> | null = null;
+    /** The host's reset in progress. */
+    let resetting: Promise<void> | null = null;
+    /** The take whose manifests stop() has posted: its checks poll may start (spec 6.7). */
+    let sealedTake: number | null = null;
+    let checksPoll: ChecksPoll | null = null;
+    /** The capture error of the re-acquire after the last reset, if it failed. */
+    let reacquireError: unknown = null;
 
     // Previews and the stall watch (item 13).
     const previews: HTMLVideoElement[] = [];
@@ -448,7 +514,7 @@ export function createSession(
         onQueued: (event) => {
             // A finished session queues nothing more: the last flush is behind it (item 10).
             // Listeners still see the event; no batch carries it.
-            const sending = !tombstoned && !tombstoning;
+            const sending = !tombstoned && !tombstoning && !closed;
 
             if (sending && batcher !== null) {
                 batcher.add(event);
@@ -827,12 +893,12 @@ export function createSession(
             if (verdict.kind === 'ok' || code === 'track_sealed') {
                 sealed.add(key);
                 owed();
-            } else if (
-                status === 409 &&
-                ['stale_take', 'session_closed', 'discarded'].includes(code)
-            ) {
-                // stale_take: that take's manifest is dropped. session_closed and discarded close the session (Task 15a).
+            } else if (status === 409 && code === 'stale_take') {
+                // That take's manifest is dropped and never posted again.
                 owed();
+            } else if (status === 409 && isClosingCode(code)) {
+                owed();
+                void closeSession(code);
             } else {
                 // The track stays unsealed until the server's IdleClose.
                 setError('manifest_rejected', { track, code });
@@ -887,6 +953,15 @@ export function createSession(
             posted.add(key);
             let attempt = 0;
             const call = async (): Promise<WireAnswer> => {
+                if (closed) {
+                    return localRefusal(closedReason);
+                }
+
+                if (take < localTake) {
+                    // A reset or a newer take on the server: the old take is never posted again.
+                    return localRefusal('stale_take');
+                }
+
                 const answer = await api!.postManifest(track.track, body);
 
                 if (answer.networkError && !answer.timedOut) {
@@ -972,7 +1047,8 @@ export function createSession(
     const sealTracks = async (endMs: number): Promise<void> => {
         const take = activeTake ?? localTake;
 
-        if (record === null) {
+        if (record === null || closed || discarding !== null) {
+            // A session being discarded or already closed seals nothing.
             return;
         }
 
@@ -988,9 +1064,14 @@ export function createSession(
         const tracks = chunkedTracks(descriptor).filter((track) =>
             runs.some((run) => run.track === track.track && run.take === take),
         );
+        const held: SessionRecord | null = record;
+
+        if (held === null) {
+            return;
+        }
 
         for (const track of tracks) {
-            record.manifest_owed[track.track] = take;
+            held.manifest_owed[track.track] = take;
         }
 
         await persist();
@@ -1008,6 +1089,11 @@ export function createSession(
             }
 
             setError('manifests_blocked', { tracks: [...blockedTracks] });
+        }
+
+        if (take === localTake && !closed) {
+            // stop() has posted the manifests: the take's checks poll may start (spec 6.7).
+            sealedTake = take;
         }
     };
 
@@ -1039,6 +1125,420 @@ export function createSession(
 
         await engine?.stopTake().catch(() => undefined);
         await dropLocalTakesBelow(current);
+    };
+
+    /**
+     * The server takes nothing more for this session (a discard that
+     * landed, or the first 409 session_closed or discarded from a segment,
+     * a batch, a refresh, a manifest, finalise or discard; never from reset).
+     * The uploader aborts what is in flight first, so no store write follows,
+     * then the record with its runs, segments and batches and both storage
+     * copies are deleted. Capture is released.
+     */
+    const closeSession = (code: ClosingCode): Promise<void> => {
+        if (closing !== null) {
+            return closing;
+        }
+
+        closed = true;
+        closedReason = code;
+        // No write after this point may bring the record back.
+        record = null;
+        checksPoll?.cancel();
+        stopTick();
+        batcher?.stop();
+        detachPage();
+        removeOnline?.();
+        removeOnline = null;
+        const phase = lifecycle?.phase();
+
+        if (
+            phase === 'countdown' ||
+            phase === 'recording' ||
+            phase === 'ready'
+        ) {
+            lifecycle?.setPhase('stopped');
+        }
+
+        closing = (async (): Promise<void> => {
+            // Stops any run still open (its last cuts are dropped) and releases capture.
+            await engine?.stopTake().catch(() => undefined);
+            await uploader?.stop();
+            await token?.stop();
+            await writes;
+            await store.deleteSession(sessionId);
+            removeItem(storage, epochKey(sessionId));
+            removeItem(storage, seqKey(sessionId));
+            refreshUpload();
+        })().catch((error: unknown) => console.error(error));
+
+        return closing;
+    };
+
+    /** A write that landed after the close: the rows go again (deleteSession also removes rows with no record). */
+    const sweepAfterClose = async (): Promise<void> => {
+        await closing;
+        await store.deleteSession(sessionId);
+    };
+
+    const closedRefusal = (): Promise<never> =>
+        rejectWith('invalid_state', { reason: closedReason });
+
+    /**
+     * A reset or a discard, sent until a final answer (author's call 15).
+     * It waits on token.ready() first. A 401 token_expired with
+     * recoverable false (the session can no longer be re-minted) ends it
+     * as `unrecoverable`; a 405 or a proxy 403 backs off and goes again.
+     */
+    const callOwed = async (
+        call: () => Promise<WireAnswer>,
+    ): Promise<OwedOutcome> => {
+        const keeper = token as TokenKeeper;
+        let unrecoverable = false;
+        let giveUp = false;
+        const guarded: Pick<TokenKeeper, 'current' | 'expired' | 'ready'> = {
+            current: () => keeper.current(),
+            expired: (usedId) => {
+                const result = keeper.expired(usedId);
+
+                if (result === 'paused' && unrecoverable) {
+                    giveUp = true;
+                }
+
+                return result;
+            },
+            ready: () =>
+                giveUp ? rejectWith('token_expired') : keeper.ready(),
+        };
+        let attempt = 0;
+
+        await keeper.ready();
+
+        for (;;) {
+            let answer: WireAnswer;
+
+            try {
+                answer = await callWithRetry(
+                    {
+                        env,
+                        token: guarded,
+                        onSuccess: () => ladder?.markSucceeded(),
+                    },
+                    async () => {
+                        if (closed) {
+                            return localRefusal(closedReason);
+                        }
+
+                        const sent = await call();
+                        const verdict = classify(sent);
+                        unrecoverable =
+                            verdict.kind === 'refresh' && !verdict.recoverable;
+
+                        return sent;
+                    },
+                );
+            } catch (error) {
+                if (giveUp) {
+                    return { kind: 'unrecoverable' };
+                }
+
+                throw error;
+            }
+
+            const verdict = isOk(answer) ? null : classify(answer);
+
+            if (verdict?.kind === 'blocked' || verdict?.kind === 'step_down') {
+                // JSON calls have no POST rung: back off and keep the call owed.
+                attempt += 1;
+                await sleep(backoffMs(attempt, env.random()));
+
+                continue;
+            }
+
+            return { kind: 'answer', answer };
+        }
+    };
+
+    /** A checks result for the current take: state.checks, onChecks, and the rejected phase on a reject (spec 6.5). */
+    const takeChecks = (result: ChecksResult): void => {
+        state.patch({ checks: result });
+        checksListeners.call(result);
+
+        if (
+            result.verdict !== 'reject' ||
+            result.take !== localTake ||
+            record === null ||
+            finalised ||
+            tombstoned
+        ) {
+            return;
+        }
+
+        record.rejected_take = result.take;
+        void persist().then(() => {
+            if (
+                !closed &&
+                result.take === localTake &&
+                lifecycle?.phase() === 'stopped'
+            ) {
+                lifecycle.setPhase('rejected');
+            }
+        });
+    };
+
+    /** Starts the one shared checks poll for the current take. */
+    const startChecks = (timeoutMs: number): ChecksPoll => {
+        const take = localTake;
+        let cancelled!: (result: ChecksResult) => void;
+        const onCancel = new Promise<ChecksResult>((resolve) => {
+            cancelled = resolve;
+        });
+        const poll: ChecksPoll = {
+            take,
+            promise: onCancel,
+            result: null,
+            cancelled: false,
+            cancel(): void {
+                if (poll.cancelled) {
+                    return;
+                }
+
+                poll.cancelled = true;
+                // A cancelled wait settles at once on the local unknown.
+                cancelled({
+                    status: 'pending',
+                    verdict: 'unknown',
+                    take,
+                    reasons: [],
+                });
+            },
+        };
+        const polled = pollChecks(
+            {
+                env,
+                // A cancelled poll sends nothing more: its next look never settles.
+                status: () =>
+                    poll.cancelled
+                        ? new Promise<WireAnswer>(() => undefined)
+                        : api!.status(),
+                take: () => take,
+                onChecks: (result) => {
+                    if (!poll.cancelled) {
+                        poll.result = result;
+                        takeChecks(result);
+                    }
+                },
+            },
+            timeoutMs,
+        );
+        poll.promise = Promise.race([polled, onCancel]);
+        checksPoll = poll;
+
+        return poll;
+    };
+
+    /** Once stop() has posted the take's manifests, its checks poll starts by itself (spec 6.7 step 3). */
+    const maybeStartChecks = (): void => {
+        if (
+            descriptor.checks === undefined ||
+            closed ||
+            discarding !== null ||
+            sealedTake !== localTake ||
+            lifecycle?.phase() !== 'stopped' ||
+            (checksPoll !== null &&
+                checksPoll.take === localTake &&
+                !checksPoll.cancelled)
+        ) {
+            return;
+        }
+
+        startChecks(settings.checksTimeoutMs);
+    };
+
+    /** The server is on `newTake`: the old take is gone here too (spec 6.5). */
+    const applyReset = async (
+        newTake: number,
+        reacquire: boolean,
+    ): Promise<void> => {
+        if (record === null) {
+            return;
+        }
+
+        const take = Math.max(newTake, localTake);
+        localTake = take;
+        record.take = take;
+        record.take_open = false;
+        record.take_start_ms = null;
+        record.take_end_ms = null;
+        record.stop_completed = false;
+        record.rejected_take = null;
+        record.pending_reset_take = null;
+        record.manifest_owed = {};
+        posted.clear();
+        repostWanted.clear();
+        blockedTracks.clear();
+        clearError('manifests_blocked', 'manifest_rejected');
+        activeTake = null;
+        sealedTake = null;
+        // Nothing of the old take is sealed later, not even by finalise().
+        deferredSealed = true;
+        checksPoll?.cancel();
+        checksPoll = null;
+        await persist();
+        uploader?.dropTakesBelow(take);
+        await dropLocalTakesBelow(take);
+
+        if (!reacquire || engine === null || closed) {
+            return;
+        }
+
+        // stopTake() released capture: the preview and the meter are live again (spec 6.5).
+        try {
+            await engine.prepare();
+            clearError(...CAPTURE_CODES);
+        } catch (error) {
+            const code = codeOf(error);
+
+            if (code !== null && isErrorCode(code)) {
+                engineError(code);
+            }
+
+            reacquireError = error;
+        }
+    };
+
+    /**
+     * The reset of `take` (the host's reset(), the too_short path, or one
+     * owed by an earlier page). Owed from before the first request until a
+     * final answer. A 409 session_closed is not the closing signal here: the
+     * server answers it for every status but open, finalising included, so
+     * the take, the queue and the uploads stay as they are (Task 15a).
+     */
+    const resetTake = async (
+        take: number,
+        reacquire: boolean,
+    ): Promise<void> => {
+        reacquireError = null;
+
+        if (closed) {
+            return closedRefusal();
+        }
+
+        if (record === null) {
+            return;
+        }
+
+        record.pending_reset_take = take;
+        await persist();
+        const outcome = await callOwed(() => api!.reset(take));
+
+        if (closed) {
+            return closedRefusal();
+        }
+
+        const clearIntent = async (): Promise<void> => {
+            if (record !== null) {
+                record.pending_reset_take = null;
+                await persist();
+            }
+        };
+
+        if (outcome.kind === 'unrecoverable') {
+            await clearIntent();
+
+            return rejectWith('invalid_state', { reason: 'token_expired' });
+        }
+
+        const { answer } = outcome;
+
+        if (isOk(answer)) {
+            const next = (answer.body as { take?: unknown } | null)?.take;
+            await applyReset(
+                typeof next === 'number' && Number.isSafeInteger(next)
+                    ? next
+                    : take + 1,
+                reacquire,
+            );
+
+            return;
+        }
+
+        const verdict = classify(answer);
+        const code = verdict.kind === 'terminal' ? verdict.code : 'refused';
+
+        if (closingCodeOf(answer) === 'discarded') {
+            await closeSession('discarded');
+
+            return closedRefusal();
+        }
+
+        const current =
+            code === 'stale_take' ? currentTakeIn(answer.body) : null;
+
+        if (current !== null && current > take) {
+            // The server is already past that take: the reset landed, or another did.
+            await applyReset(current, reacquire);
+
+            return;
+        }
+
+        await clearIntent();
+
+        return rejectWith(
+            'invalid_state',
+            code === 'session_closed'
+                ? { reason: code }
+                : { reason: code, status: answer.status },
+        );
+    };
+
+    /**
+     * The discard (spec 6.5): owed from before the first request, the batcher
+     * and the checks poll stopped, then sent until a final answer. Any final
+     * answer closes the session locally.
+     */
+    const runDiscard = (): Promise<void> => {
+        discarding ??= (async (): Promise<void> => {
+            if (closed) {
+                return;
+            }
+
+            if (record !== null) {
+                record.pending_discard = true;
+                await persist();
+            }
+
+            batcher?.stop();
+            checksPoll?.cancel();
+            const outcome = await callOwed(() => api!.discard());
+
+            if (outcome.kind === 'unrecoverable') {
+                await closeSession('discarded');
+
+                return;
+            }
+
+            const { answer } = outcome;
+            const closingCode = closingCodeOf(answer);
+
+            if (isOk(answer) || closingCode !== null) {
+                await closeSession(closingCode ?? 'discarded');
+
+                return;
+            }
+
+            // Any other final refusal (a 404 for a session the server no longer has):
+            // nothing is left to discard there, so nothing is kept here.
+            await closeSession('discarded');
+            const verdict = classify(answer);
+
+            return rejectWith('invalid_state', {
+                reason: verdict.kind === 'terminal' ? verdict.code : 'refused',
+                status: answer.status,
+            });
+        })();
+
+        return discarding;
     };
 
     /** A finished session: stopped, every segment settled, finalised. Leaves the tombstone (item 10). */
@@ -1287,6 +1787,10 @@ export function createSession(
             void persist();
         }
 
+        if (phase === 'stopped') {
+            maybeStartChecks();
+        }
+
         refreshUpload();
         void maybeTombstone();
     };
@@ -1335,11 +1839,18 @@ export function createSession(
 
     /** Every cut: stored, then handed to the uploader; the clock and the limits are read again. */
     const addSegment = async (segment: SegmentRecord): Promise<unknown> => {
-        if (segment.take < localTake || queue === null) {
+        if (closed || segment.take < localTake || queue === null) {
             return 'dropped';
         }
 
         const result = await queue.add(segment);
+
+        if (closed) {
+            // The session closed while this segment was stored.
+            await sweepAfterClose();
+
+            return 'dropped';
+        }
 
         if (segment.take < localTake) {
             // The take was adopted away while this segment was stored.
@@ -1374,8 +1885,12 @@ export function createSession(
             warning_before_end_ms: 0,
         };
 
-    /** Builds the pipeline over the stored record, in the plan's order (item 5). */
-    const build = (): void => {
+    /**
+     * Builds the pipeline over the stored record, in the plan's order (item
+     * 5). A passive build (an owed discard) starts no uploader, no batcher
+     * timer and no page listener: nothing but the discard is ever sent.
+     */
+    const build = (passive: boolean): void => {
         const held = record as SessionRecord;
         api = createSessionApi(
             env,
@@ -1414,6 +1929,12 @@ export function createSession(
 
                 if (answer.status === 201) {
                     ladder?.markSucceeded();
+                }
+
+                const closingCode = closingCodeOf(answer);
+
+                if (closingCode !== null) {
+                    void closeSession(closingCode);
                 }
 
                 return answer;
@@ -1483,8 +2004,9 @@ export function createSession(
             persistNextBatchSeqSync: (next) =>
                 writeItem(storage, seqKey(sessionId), String(next)),
             readNextBatchSeqSync: () => readNumber(storage, seqKey(sessionId)),
-            // Closing on session_closed and discarded is Task 15a.
-            onClosed: () => undefined,
+            onClosed: (code) => {
+                void closeSession(code);
+            },
             onRejected: (rejection) => {
                 console.warn(
                     `Fitt Video: event batch ${rejection.batch_seq} was refused (${rejection.code}).`,
@@ -1517,7 +2039,16 @@ export function createSession(
             tracks: () => descriptor.tracks,
             token,
             ladder,
-            emit,
+            emit: (type, payload) => {
+                emit(type, payload);
+
+                if (
+                    type === 'upload.segment_rejected' &&
+                    isClosingCode(payload.code)
+                ) {
+                    void closeSession(payload.code);
+                }
+            },
             onAbandon: (track, take) => {
                 const phase = lifecycle?.phase();
 
@@ -1576,8 +2107,14 @@ export function createSession(
                 },
                 add: addSegment,
                 putRun: async (run) => {
-                    if (run.take >= localTake) {
-                        await store.putRun(run);
+                    if (closed || run.take < localTake) {
+                        return;
+                    }
+
+                    await store.putRun(run);
+
+                    if (closed) {
+                        await sweepAfterClose();
                     }
                 },
                 emit,
@@ -1598,8 +2135,8 @@ export function createSession(
             recording: recordingLimits(),
             sessionCapMs: cap,
             engine: engine ?? unsupportedEngine,
-            // The reset call is Task 15a; until then the too_short path resets at once.
-            resetTake: async () => undefined,
+            // The too_short path: the take is reset on the server before the phase is ready again.
+            resetTake: () => resetTake(localTake, true),
             sealTracks,
             onMilestone,
             onPhase,
@@ -1656,13 +2193,18 @@ export function createSession(
         removeOnline = () =>
             onlineTarget?.removeEventListener('online', onOnline);
 
+        tickTimer = env.timers.setTimeout(tick, TICK_MS);
+
+        if (passive) {
+            return;
+        }
+
         if (!destroyed) {
             attachPage();
         }
 
         uploader.start();
         batcher.startTimer({ emptyHeartbeats: false });
-        tickTimer = env.timers.setTimeout(tick, TICK_MS);
     };
 
     const ready: Promise<void> = (async () => {
@@ -1687,7 +2229,36 @@ export function createSession(
             return;
         }
 
-        build();
+        // loadRecord() set it; the cast only widens what the compiler narrowed.
+        const held = record as SessionRecord | null;
+
+        if (held === null) {
+            return;
+        }
+
+        const owedDiscard = held.pending_discard;
+        build(owedDiscard);
+
+        if (owedDiscard) {
+            // A discard that never landed is finished before anything else, and nothing else is sent.
+            void runDiscard().catch((error: unknown) =>
+                warn(
+                    `Fitt Video: the owed discard was refused: ${String(error)}`,
+                ),
+            );
+
+            return;
+        }
+
+        if (held.pending_reset_take !== null) {
+            // A reset whose answer was lost is finished before any capture or take.
+            await resetTake(held.pending_reset_take, false).catch(
+                (error: unknown) =>
+                    warn(
+                        `Fitt Video: the owed reset was refused: ${String(error)}`,
+                    ),
+            );
+        }
     })();
     ready.catch((error: unknown) =>
         console.error('Fitt Video: the session could not start.', error),
@@ -1730,6 +2301,15 @@ export function createSession(
 
         try {
             await engine.prepare();
+
+            if (closed || discarding !== null) {
+                // Closed while the permission prompt was open: nothing is held for it.
+                engine.release();
+
+                throw new FittVideoError('invalid_state', {
+                    reason: closed ? closedReason : 'discarding',
+                });
+            }
         } catch (error) {
             const code = codeOf(error);
 
@@ -1798,6 +2378,14 @@ export function createSession(
 
             if (tombstoned || finalised) {
                 return finalisedRefusal();
+            }
+
+            if (closed) {
+                return closedRefusal();
+            }
+
+            if (discarding !== null) {
+                return rejectWith('invalid_state', { reason: 'discarding' });
             }
 
             if (destroyed) {
@@ -1892,6 +2480,16 @@ export function createSession(
                 return finalisedRefusal();
             }
 
+            if (closed) {
+                return closedRefusal();
+            }
+
+            if (discarding !== null || resetting !== null) {
+                return rejectWith('invalid_state', {
+                    reason: discarding !== null ? 'discarding' : 'resetting',
+                });
+            }
+
             const life = lifecycle as Lifecycle;
             const phase = life.phase();
 
@@ -1934,8 +2532,29 @@ export function createSession(
                 return;
             }
 
-            await (lifecycle as Lifecycle).stop(stopOptions);
-            await writes;
+            const life = lifecycle as Lifecycle;
+
+            try {
+                await life.stop(stopOptions);
+            } catch (error) {
+                if (
+                    codeOf(error) === 'too_short' &&
+                    reacquireError !== null &&
+                    life.phase() === 'ready'
+                ) {
+                    // The reset landed but capture could not be acquired again.
+                    const code = codeOf(reacquireError);
+                    life.setPhase(
+                        code !== null && PHASE_ERRORS.has(code)
+                            ? 'error'
+                            : 'idle',
+                    );
+                }
+
+                throw error;
+            } finally {
+                await writes;
+            }
         },
 
         async finalise(): Promise<void> {
@@ -1943,6 +2562,14 @@ export function createSession(
 
             if (tombstoned) {
                 return;
+            }
+
+            if (closed) {
+                return closedRefusal();
+            }
+
+            if (discarding !== null) {
+                return rejectWith('invalid_state', { reason: 'discarding' });
             }
 
             const life = lifecycle as Lifecycle;
@@ -1959,12 +2586,18 @@ export function createSession(
             if (unsealed !== null && !deferredSealed) {
                 deferredSealed = true;
                 await sealTracks(unsealed);
+                // The deferred manifests are posted: the take's checks poll may start.
+                maybeStartChecks();
             }
 
             await batcher?.flush();
-            const held = record as SessionRecord;
+
+            if (closed || record === null) {
+                return closedRefusal();
+            }
+
             // The take's real end, so a wait for checks never adds a black, silent tail (spec 4.4).
-            const endMs = Math.min(held.take_end_ms ?? clock.now(), cap);
+            const endMs = Math.min(record.take_end_ms ?? clock.now(), cap);
             const answer = await callWithRetry(
                 {
                     env,
@@ -1976,6 +2609,11 @@ export function createSession(
 
             if (!isOk(answer)) {
                 const verdict = classify(answer);
+                const closingCode = closingCodeOf(answer);
+
+                if (closingCode !== null) {
+                    await closeSession(closingCode);
+                }
 
                 return rejectWith('invalid_state', {
                     reason:
@@ -2004,20 +2642,22 @@ export function createSession(
         async waitForChecks(checkOptions = {}): Promise<ChecksResult> {
             // A finished session still polls with the held token (item 10).
             await ready;
+            const current = checksPoll;
 
-            // The shared poll, the rejected phase and the cancel on reset are Task 15a.
-            return pollChecks(
-                {
-                    env,
-                    status: () => api!.status(),
-                    take: () => localTake,
-                    onChecks: (result) => {
-                        state.patch({ checks: result });
-                        checksListeners.call(result);
-                    },
-                },
+            // One poll per take, shared with finalise() and the poll stop() started;
+            // after a local unknown at the timeout, a new wait polls again.
+            if (
+                current !== null &&
+                !current.cancelled &&
+                current.take === localTake &&
+                current.result?.status !== 'pending'
+            ) {
+                return current.promise;
+            }
+
+            return startChecks(
                 checkOptions.timeoutMs ?? settings.checksTimeoutMs,
-            );
+            ).promise;
         },
 
         async waitForReady(readyOptions): Promise<string> {
@@ -2041,8 +2681,46 @@ export function createSession(
                 return finalisedRefusal();
             }
 
-            // The reset call and its bookkeeping are Task 15a.
-            return rejectWith('invalid_state', { reason: 'not_available' });
+            if (closed) {
+                return closedRefusal();
+            }
+
+            if (discarding !== null) {
+                return rejectWith('invalid_state', { reason: 'discarding' });
+            }
+
+            if (resetting !== null) {
+                return resetting;
+            }
+
+            const life = lifecycle as Lifecycle;
+            const phase = life.phase();
+
+            if (phase !== 'stopped' && phase !== 'rejected') {
+                return rejectWith('invalid_state', { phase });
+            }
+
+            resetting = (async (): Promise<void> => {
+                await resetTake(localTake, true);
+                // ready forgets the take in the lifecycle, so nothing of it is sealed later.
+                life.setPhase('ready');
+                state.patch({ checks: null });
+
+                if (reacquireError !== null) {
+                    const code = codeOf(reacquireError);
+                    life.setPhase(
+                        code !== null && PHASE_ERRORS.has(code)
+                            ? 'error'
+                            : 'idle',
+                    );
+
+                    throw reacquireError;
+                }
+            })().finally(() => {
+                resetting = null;
+            });
+
+            return resetting;
         },
 
         async discard(): Promise<void> {
@@ -2052,8 +2730,7 @@ export function createSession(
                 return finalisedRefusal();
             }
 
-            // The discard call and closing are Task 15a.
-            return rejectWith('invalid_state', { reason: 'not_available' });
+            return runDiscard();
         },
 
         event(type, payload): boolean {

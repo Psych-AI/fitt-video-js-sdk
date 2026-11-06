@@ -550,3 +550,352 @@ test('the purge keeps the numbering of the session being opened: idle past aband
     assert.equal(body.batch_seq, 7);
     assert.deepEqual(await store.listSegments(descriptor.session_id), []);
 });
+
+test('a reject verdict after stop moves the phase to rejected with no host call', async () => {
+    const r = sessionRig({ recipe: 'answer' });
+    const verdict = {
+        status: 'done',
+        verdict: 'reject',
+        take: 1,
+        reasons: ['no_speech'],
+    };
+    const seen: unknown[] = [];
+    r.session.onChecks((checks) => seen.push(checks));
+    r.respond({ '/status': () => json(200, statusBody(verdict)) });
+    await recordTake(r, 6000);
+    await r.env.advance(1000);
+    await until(() => r.session.state.phase === 'rejected');
+
+    assert.deepEqual(seen, [verdict]);
+    assert.equal(
+        (await r.store.getSession(r.descriptor.session_id))?.rejected_take,
+        1,
+    );
+});
+
+test('reset from stopped ends in ready with capture again, and start then succeeds', async () => {
+    const r = sessionRig();
+    await recordTake(r, 1000);
+    assert.equal(r.session.state.phase, 'stopped');
+    assert.ok(r.media.acquired.flat().every((track) => track.stopped));
+
+    await r.session.reset();
+
+    assert.equal(r.session.state.phase, 'ready');
+    assert.equal(r.media.calls(), 2);
+    await r.session.start();
+    assert.equal(r.session.state.phase, 'recording');
+});
+
+test('after a reset, the old take never re-posts a manifest while the new take records', async () => {
+    const r = sessionRig({ chunks: true });
+    let oldTake: 'retry' | 'stale' = 'retry';
+    r.respond({
+        '/segments/': (call) => {
+            if (call.headers['X-Fitt-Take'] !== '1') {
+                return json(201, { code: 'stored', segment: {} });
+            }
+
+            return oldTake === 'retry'
+                ? json(500, { error: { code: 'server_error', message: 'x' } })
+                : json(409, {
+                      error: {
+                          code: 'stale_take',
+                          message: 'x',
+                          current_take: 2,
+                      },
+                  });
+        },
+    });
+    await recordTake(r, 1000);
+    const manifestsAtStop = r.manifestCalls().length;
+    oldTake = 'stale';
+    await r.session.reset();
+    await r.session.start();
+    await r.env.advance(30_000);
+
+    assert.equal(r.manifestCalls().length, manifestsAtStop);
+    assert.deepEqual(
+        (await r.store.listSegments(r.descriptor.session_id)).filter(
+            (segment) => segment.take === 1,
+        ),
+        [],
+    );
+});
+
+test('a reset whose answer was lost is finished first, and the next take uploads as take 2', async () => {
+    const descriptor = descriptorFixture('monitor');
+    const store = new MemoryQueueStore();
+    const first = sessionRig({ descriptor, store, chunks: true });
+    first.respond({
+        '/reset': () => {
+            throw new TypeError('Failed to fetch');
+        },
+    });
+    await recordTake(first, 1000);
+    void first.session.reset().catch(() => null);
+    await settle();
+    first.session.destroy();
+
+    const second = sessionRig({
+        descriptor: { ...descriptor, take: 2 },
+        store,
+        chunks: true,
+    });
+    await recordTake(second, 1000);
+    await until(() => second.segmentCalls().length > 0);
+
+    assert.equal(
+        second.env.calls.find((call) => call.url.endsWith('/reset'))?.body,
+        '{"take":1}',
+    );
+    assert.equal(second.segmentCalls()[0].headers['X-Fitt-Take'], '2');
+});
+
+test('discard() deletes the local session and its copies', async () => {
+    const r = sessionRig();
+    await r.session.prepare();
+    await r.session.discard();
+
+    assert.deepEqual(await r.store.listSessions(), []);
+    assert.equal(r.storage.size, 0);
+});
+
+test('a 409 session_closed on a segment deletes the local session', async () => {
+    const r = sessionRig({ chunks: true });
+    r.respond({
+        '/segments/': () =>
+            json(409, { error: { code: 'session_closed', message: 'x' } }),
+    });
+    await recordTake(r, 1000);
+
+    for (let i = 0; i < 50 && (await r.store.listSessions()).length > 0; i++) {
+        await settle();
+    }
+
+    assert.deepEqual(await r.store.listSessions(), []);
+});
+
+test('a 409 session_closed from reset keeps the local session and keeps uploading', async () => {
+    const r = sessionRig({ chunks: true });
+    r.respond({
+        '/segments/': () =>
+            json(503, { error: { code: 'http_error', message: 'x' } }),
+    });
+    await recordTake(r, 1000);
+    const id = r.descriptor.session_id;
+    const pending = (await r.store.listSegments(id))
+        .filter((segment) => segment.state === 'pending')
+        .map((segment) => segment.seq);
+    r.respond({
+        '/reset': () =>
+            json(409, { error: { code: 'session_closed', message: 'x' } }),
+    });
+
+    await assert.rejects(r.session.reset(), (error: unknown) => {
+        const failure = error as {
+            code?: string;
+            detail?: { reason?: string };
+        };
+
+        return (
+            failure.code === 'invalid_state' &&
+            failure.detail?.reason === 'session_closed'
+        );
+    });
+    assert.equal(r.session.state.phase, 'stopped');
+    assert.equal((await r.store.listSessions()).length, 1);
+    assert.equal((await r.store.getSession(id))?.pending_reset_take, null);
+    await r.env.advance(60_000);
+
+    assert.ok(pending.length > 0);
+    assert.deepEqual(
+        (await r.store.listSegments(id))
+            .filter((segment) => pending.includes(segment.seq))
+            .map((segment) => segment.state),
+        pending.map(() => 'delivered'),
+    );
+});
+
+test('finalise() without checks.wait resolves on the close answer while checks are still pending', async () => {
+    const r = sessionRig({ recipe: 'answer', chunks: true });
+    await recordTake(r, 6000);
+    const finalising = r.session.finalise();
+    await r.env.advance(10);
+    await finalising;
+
+    assert.ok(
+        r.session.state.checks === null ||
+            r.session.state.checks.status === 'pending',
+    );
+    assert.equal(r.calls(/\/finalise$/).length, 1);
+});
+
+test('finalise() with checks.wait resolves at timeoutMs with a local unknown, or after a done verdict', async () => {
+    const waiting = sessionRig({
+        recipe: 'answer',
+        chunks: true,
+        options: { checks: { wait: true, timeoutMs: 5000 } },
+    });
+    await recordTake(waiting, 6000);
+    let resolved = false;
+    void waiting.session.finalise().then(() => {
+        resolved = true;
+    });
+    await waiting.env.advance(4000);
+    assert.equal(resolved, false);
+    await waiting.env.advance(1500);
+    await until(() => resolved);
+    assert.equal(waiting.session.state.checks?.verdict, 'unknown');
+
+    const answered = sessionRig({
+        recipe: 'answer',
+        chunks: true,
+        options: { checks: { wait: true, timeoutMs: 5000 } },
+    });
+    let done = false;
+    answered.respond({
+        '/status': () =>
+            json(
+                200,
+                statusBody(
+                    done
+                        ? {
+                              status: 'done',
+                              verdict: 'accept',
+                              take: 1,
+                              reasons: [],
+                          }
+                        : {
+                              status: 'pending',
+                              verdict: null,
+                              take: 1,
+                              reasons: [],
+                          },
+                ),
+            ),
+    });
+    await recordTake(answered, 6000);
+    let accepted = false;
+    void answered.session.finalise().then(() => {
+        accepted = true;
+    });
+    await answered.env.advance(1000);
+    done = true;
+    await answered.env.advance(1500);
+    await until(() => accepted);
+    assert.equal(answered.session.state.checks?.verdict, 'accept');
+});
+
+test('a discard that never landed is finished by the next session over the same store, and nothing is finalised or uploaded', async () => {
+    const descriptor = descriptorFixture('monitor');
+    const store = new MemoryQueueStore();
+    const first = sessionRig({ descriptor, store, chunks: true });
+    await recordTake(first, 1000);
+    first.env.setOnline(false);
+    void first.session.discard().catch(() => null);
+    await settle();
+    first.session.destroy();
+    assert.equal(
+        (await store.getSession(descriptor.session_id))?.pending_discard,
+        true,
+    );
+
+    const second = sessionRig({ descriptor, store, chunks: true });
+    await until(() => second.calls(/\/discard$/).length === 1);
+
+    for (let i = 0; i < 50 && (await store.listSessions()).length > 0; i++) {
+        await settle();
+    }
+
+    assert.deepEqual(
+        [second.calls(/\/finalise$/).length, second.segmentCalls().length],
+        [0, 0],
+    );
+    assert.deepEqual(await store.listSessions(), []);
+});
+
+test('discard while two segment PUTs are in flight leaves nothing behind, whatever they answer later', async () => {
+    const r = sessionRig({ chunks: true });
+    const held: ((response: Response) => void)[] = [];
+    r.respond({
+        '/segments/': () =>
+            new Promise<Response>((resolve) => held.push(resolve)),
+    });
+    await recordTake(r, 1000);
+    await until(() => held.length >= 2);
+    const discarding = r.session.discard();
+    await r.env.advance(10);
+    await discarding;
+    held.forEach((resolve) =>
+        resolve(json(409, { error: { code: 'discarded', message: 'x' } })),
+    );
+
+    for (let i = 0; i < 20; i++) {
+        await settle();
+    }
+
+    const id = r.descriptor.session_id;
+    assert.deepEqual(
+        [
+            (await r.store.listSegments(id)).length,
+            (await r.store.listRuns(id)).length,
+            (await r.store.listBatches(id)).length,
+        ],
+        [0, 0, 0],
+    );
+});
+
+test('a take stopped before min_duration_ms is reset on the server before the phase is ready again', async () => {
+    const r = sessionRig({ recipe: 'answer', chunks: true });
+    await r.session.prepare();
+    const starting = r.session.start();
+    await r.env.advance(3000);
+    await starting;
+    await r.env.advance(1000);
+    const stopping = r.session.stop().catch((error: unknown) => error);
+    await r.env.advance(10);
+
+    assert.equal(((await stopping) as { code?: string }).code, 'too_short');
+    assert.equal(r.session.state.phase, 'ready');
+    assert.deepEqual(
+        r.calls(/\/reset$/).map((call) => call.body),
+        ['{"take":1}'],
+    );
+    assert.equal(r.manifestCalls().length, 0);
+    assert.equal(r.media.calls(), 2);
+    const stored = await r.store.getSession(r.descriptor.session_id);
+    assert.deepEqual([stored?.take, stored?.pending_reset_take], [2, null]);
+});
+
+test('a reset answered 401 token_expired that cannot be re-minted is no longer owed', async () => {
+    const r = sessionRig();
+    await recordTake(r, 1000);
+    r.respond({
+        '/reset': () =>
+            json(401, {
+                error: {
+                    code: 'token_expired',
+                    message: 'x',
+                    recoverable: false,
+                },
+            }),
+    });
+
+    await assert.rejects(r.session.reset(), (error: unknown) => {
+        const failure = error as {
+            code?: string;
+            detail?: { reason?: string };
+        };
+
+        return (
+            failure.code === 'invalid_state' &&
+            failure.detail?.reason === 'token_expired'
+        );
+    });
+    assert.equal(
+        (await r.store.getSession(r.descriptor.session_id))?.pending_reset_take,
+        null,
+    );
+    assert.equal(r.session.state.phase, 'stopped');
+});
