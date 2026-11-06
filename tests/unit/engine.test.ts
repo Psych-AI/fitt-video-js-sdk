@@ -175,3 +175,48 @@ test('a refused capture throws its SDK code', async () => {
     );
     assert.equal(r.engine.stream, null);
 });
+
+test('two prepares at once share one getUserMedia, so the preview and the recorders get one capture', async () => {
+    const r = engineRig();
+    const open = r.media.hold();
+    const first = r.engine.prepare();
+    const second = r.engine.prepare();
+    open();
+    await Promise.all([first, second]);
+
+    assert.equal(r.media.calls(), 1);
+    assert.equal(r.media.acquired.length, 1);
+});
+
+test('a release while the permission prompt is open wins: the late capture is stopped and never kept', async () => {
+    const r = engineRig();
+    const open = r.media.hold();
+    const preparing = r.engine.prepare();
+    r.engine.release();
+    open();
+
+    await assert.rejects(
+        preparing,
+        (error: unknown) =>
+            error instanceof FittVideoError && error.code === 'invalid_state',
+    );
+    assert.equal(r.engine.stream, null);
+    assert.equal(r.media.acquired.flat().length, 2);
+    assert.ok(r.media.acquired.flat().every((track) => track.stopped));
+});
+
+test('a prepare after that release acquires again and keeps its own capture', async () => {
+    const r = engineRig();
+    const open = r.media.hold();
+    const late = r.engine.prepare();
+    r.engine.release();
+    const again = r.engine.prepare();
+    open();
+
+    await assert.rejects(late);
+    await again;
+    assert.equal(r.media.calls(), 2);
+    assert.ok(r.media.acquired[0].every((track) => track.stopped));
+    assert.ok(r.media.acquired[1].every((track) => !track.stopped));
+    assert.notEqual(r.engine.stream, null);
+});

@@ -106,6 +106,8 @@ export interface FakeMedia extends EventTarget {
     calls(): number;
     /** While set, getUserMedia throws a DOMException with this name. */
     refuse(name: string | null): void;
+    /** Holds every getUserMedia call (an open permission prompt) until the returned function is called. */
+    hold(): () => void;
     /** The tracks of each acquisition, in order. */
     readonly acquired: FakeTrack[][];
     /** Every recorder made, in order. */
@@ -132,12 +134,17 @@ export function fakeMedia(
     const recorders: ReplayRecorder[] = [];
     let callCount = 0;
     let refusal: string | null = null;
+    let held: Promise<void> | null = null;
 
     return Object.assign(target, {
         async getUserMedia(
             constraints: MediaStreamConstraints,
         ): Promise<MediaStream> {
             callCount++;
+
+            if (held !== null) {
+                await held;
+            }
 
             if (refusal !== null) {
                 throw new DOMException('refused', refusal);
@@ -187,6 +194,18 @@ export function fakeMedia(
 
         refuse(name: string | null): void {
             refusal = name;
+        },
+
+        hold(): () => void {
+            let open!: () => void;
+            held = new Promise<void>((resolve) => {
+                open = resolve;
+            });
+
+            return () => {
+                held = null;
+                open();
+            };
         },
 
         acquired,

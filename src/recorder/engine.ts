@@ -58,13 +58,28 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
     let stream: MediaStream | null = null;
     let acquired: MediaStream[] = [];
     let runs: Run[] = [];
+    /** The getUserMedia in flight, which a second prepare() joins. */
+    let pending: Promise<void> | null = null;
+    /** Counts releases, so a capture that lands after one is stopped, never kept. */
+    let generation = 0;
 
-    async function prepare(): Promise<void> {
-        if (stream !== null) {
-            return;
+    function stopAll(held: MediaStream): void {
+        for (const track of held.getTracks()) {
+            track.stop();
+        }
+    }
+
+    async function acquireOnce(): Promise<void> {
+        const asked = generation;
+        const next = await acquire(deps.media, deps.tracks, selection);
+
+        if (asked !== generation) {
+            // Released while the prompt was open: a release always wins.
+            stopAll(next);
+
+            throw new FittVideoError('invalid_state', { reason: 'released' });
         }
 
-        const next = await acquire(deps.media, deps.tracks, selection);
         stream = next;
         acquired.push(next);
 
@@ -75,11 +90,29 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
         deps.emit('device.permission_granted', { camera, microphone });
     }
 
+    function prepare(): Promise<void> {
+        if (stream !== null) {
+            return Promise.resolve();
+        }
+
+        if (pending === null) {
+            const mine = acquireOnce().finally(() => {
+                if (pending === mine) {
+                    pending = null;
+                }
+            });
+            pending = mine;
+        }
+
+        return pending;
+    }
+
     function release(): void {
+        generation++;
+        pending = null;
+
         for (const held of acquired) {
-            for (const track of held.getTracks()) {
-                track.stop();
-            }
+            stopAll(held);
         }
 
         acquired = [];
@@ -157,7 +190,14 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
 
         async startTake(): Promise<void> {
             await prepare();
-            const source = stream as MediaStream;
+            const source = stream;
+
+            if (source === null) {
+                // Released while the permission states were read.
+                throw new FittVideoError('invalid_state', {
+                    reason: 'released',
+                });
+            }
             const take = deps.take();
             // A screen track needs its own capture, which no recipe asks for yet.
             const recorded = deps.tracks.filter(

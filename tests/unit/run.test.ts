@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createClock } from '../../src/core/clock.ts';
 import type { ChunkedTrack } from '../../src/core/descriptor.ts';
-import type { SegmentRecord } from '../../src/core/store.ts';
+import type { RunRecord, SegmentRecord } from '../../src/core/store.ts';
 import { createRun, type RecorderFactory } from '../../src/recorder/run.ts';
 import {
     fakeEnvironment,
@@ -64,7 +64,15 @@ class FakeRecorder extends EventTarget {
     }
 }
 
-function rig(onRecorderError: () => void = () => {}) {
+function rig(
+    options: {
+        onRecorderError?: () => void;
+        /** The error add() rejects with for this record, or null to store it. */
+        addFails?: (record: SegmentRecord) => Error | null;
+        /** The error putRun() rejects with for this record, or null. */
+        putRunFails?: (record: RunRecord) => Error | null;
+    } = {},
+) {
     const env = fakeEnvironment({ perf: 0 });
     const clock = createClock(env);
     const whole = readSet('chrome-vp8-kf').whole;
@@ -96,11 +104,23 @@ function rig(onRecorderError: () => void = () => {}) {
         bitrates: { video: 300_000, audio: 32_000 },
         recorderFactory: factory,
         add: async (record) => {
+            const failure = options.addFails?.(record) ?? null;
+
+            if (failure !== null) {
+                throw failure;
+            }
+
             stored.push(record);
         },
-        putRun: async () => {},
+        putRun: async (record) => {
+            const failure = options.putRunFails?.(record) ?? null;
+
+            if (failure !== null) {
+                throw failure;
+            }
+        },
         emit: (type, payload) => events.push([type, payload]),
-        onRecorderError,
+        onRecorderError: options.onRecorderError ?? (() => {}),
         ua: 'Mozilla/5.0 (test)',
     });
 
@@ -227,7 +247,7 @@ test('the run reports recorder.started at the start event and recorder.stopped w
 
 test('a recorder error ends the run with recorder_error, then hands over to the engine', async () => {
     let handedOver = 0;
-    const r = rig(() => handedOver++);
+    const r = rig({ onRecorderError: () => handedOver++ });
     await r.run.start();
     await r.env.advance(2_010);
     const error = new Event('error');
@@ -248,4 +268,66 @@ test('a recorder error ends the run with recorder_error, then hands over to the 
         r.stored.at(-1)!.sha256,
         aligned('chrome-vp8-kf').fragments.at(-1)!.sha256,
     );
+});
+
+test('a failed store is reported and never fails the take: the later segments are stored and stop() resolves', async () => {
+    const quota = () =>
+        new DOMException('the disk is full', 'QuotaExceededError');
+    const r = rig({
+        addFails: (record) => (record.seq === 2 ? quota() : null),
+    });
+    await r.run.start();
+    await r.env.advance(59_000);
+    const stopping = r.run.stop('stop');
+    await r.env.advance(500);
+    const record = await stopping;
+    const expected = aligned('chrome-vp8-kf').fragments;
+
+    assert.equal(record.ended_reason, 'stop');
+    assert.deepEqual(
+        r.events.filter(([type]) => type === 'recorder.store_failed'),
+        [
+            [
+                'recorder.store_failed',
+                {
+                    track: 'camera',
+                    run_id: record.run_id,
+                    seq: 2,
+                    name: 'QuotaExceededError',
+                },
+            ],
+        ],
+    );
+    assert.deepEqual(
+        r.stored.map((s) => s.seq),
+        expected.map((_, i) => i).filter((seq) => seq !== 2),
+    );
+    assert.ok(r.events.some(([type]) => type === 'recorder.stopped'));
+});
+
+test('the last cut and the ended run record failing to store still stop the run with recorder.stopped', async () => {
+    const last = aligned('chrome-vp8-kf').fragments.length - 1;
+    const failure = () => new DOMException('broken', 'UnknownError');
+    const r = rig({
+        addFails: (record) => (record.seq === last ? failure() : null),
+        putRunFails: (record) =>
+            record.ended_reason !== null ? failure() : null,
+    });
+    await r.run.start();
+    await r.env.advance(59_000);
+    const stopping = r.run.stop('stop');
+    await r.env.advance(500);
+    const record = await stopping;
+
+    assert.equal(record.ended_reason, 'stop');
+    assert.deepEqual(
+        r.events
+            .filter(([type]) => type === 'recorder.store_failed')
+            .map(([, payload]) => payload.seq),
+        [last, null],
+    );
+    assert.deepEqual(r.events.at(-1), [
+        'recorder.stopped',
+        { track: 'camera', run_id: record.run_id, reason: 'stop' },
+    ]);
 });

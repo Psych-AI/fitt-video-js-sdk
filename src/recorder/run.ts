@@ -34,7 +34,11 @@ export type RecorderFactory = (
 export interface Run {
     readonly runId: string;
     start(): Promise<void>;
-    /** Resolves after the last dataavailable is cut and stored. */
+    /**
+     * Resolves after the last dataavailable is cut and stored. A failed
+     * store never rejects it: the failure is reported as
+     * `recorder.store_failed` and the take goes on.
+     */
     stop(reason: RunEndedReason): Promise<RunRecord>;
     record(): RunRecord;
     /** Media segments cut so far (the engine's guard against a recorder that errors in a loop). */
@@ -65,6 +69,13 @@ const TIMESLICE_MS = 1000;
 
 /** The manifest's `ua` limit, in code points, so a cut never splits a surrogate pair. */
 const UA_MAX = 512;
+
+/** An error's name for an event payload, never its message. */
+function nameOf(error: unknown): string {
+    const name = (error as { name?: unknown } | null | undefined)?.name;
+
+    return typeof name === 'string' ? name : 'unknown';
+}
 
 /**
  * One MediaRecorder for one track of one take (author's call 6). Its blobs
@@ -100,15 +111,30 @@ export function createRun(deps: RunDeps): Run {
     let mediaCut = 0;
     const mediaDurations: number[] = [];
     let chain: Promise<void> = Promise.resolve();
-    let chainError: unknown = null;
     let stopping: Promise<RunRecord> | null = null;
     let stopped: Promise<void> = Promise.resolve();
 
-    /** Runs the step after every step before it; a failure is kept for stop() and later steps still run. */
-    function enqueue(step: () => Promise<void>): void {
-        chain = chain.then(step).catch((error: unknown) => {
-            chainError ??= error;
+    /**
+     * A write to the local queue failed (an IndexedDB error, a full disk the
+     * store could not route round). The take goes on: the event says what
+     * was lost, and `seq` (null for the run record) is never handed out
+     * again, so the hole shows in the manifest instead of a second segment
+     * claiming the same number.
+     */
+    function storeFailed(seq: number | null, error: unknown): void {
+        deps.emit('recorder.store_failed', {
+            track: track.track,
+            run_id: runId,
+            seq,
+            name: nameOf(error),
         });
+    }
+
+    /** Runs the step after every step before it; a failure is reported and later steps still run. */
+    function enqueue(step: () => Promise<void>): void {
+        chain = chain
+            .then(step)
+            .catch((error: unknown) => storeFailed(null, error));
     }
 
     /** Waits for every step queued so far, including steps queued while waiting. */
@@ -206,7 +232,11 @@ export function createRun(deps: RunDeps): Run {
             mediaDurations.push(segment.durationMs);
         }
 
-        await deps.add(segmentRecord);
+        try {
+            await deps.add(segmentRecord);
+        } catch (error) {
+            storeFailed(seq, error);
+        }
     }
 
     async function storeAll(segments: CutSegment[]): Promise<void> {
@@ -232,12 +262,10 @@ export function createRun(deps: RunDeps): Run {
     }
 
     function onError(event: Event): void {
-        const error = (event as { error?: { name?: unknown } }).error;
-
         deps.emit('recorder.error', {
             track: track.track,
             run_id: runId,
-            name: typeof error?.name === 'string' ? error.name : 'unknown',
+            name: nameOf((event as { error?: unknown }).error),
         });
 
         if (stopping !== null) {
@@ -264,25 +292,34 @@ export function createRun(deps: RunDeps): Run {
         await stopped;
         await drain();
 
-        const active = anchor();
-        await drain();
-        await storeAll(active.end(clock.now()));
-        record.segmenting = active.segmenting;
+        // The ended run record and recorder.stopped are written whatever the
+        // last cut does, so the take can always be stopped and sealed.
+        try {
+            const active = anchor();
+            await drain();
+            await storeAll(active.end(clock.now()));
+            record.segmenting = active.segmenting;
+        } catch (error) {
+            storeFailed(null, error);
+        }
+
         record.keyframe_option_honoured = keyframeOptionHonoured(
             mediaDurations,
             track.segments.target_ms,
         );
         record.ended_reason = reason;
-        await deps.putRun({ ...record });
+
+        try {
+            await deps.putRun({ ...record });
+        } catch (error) {
+            storeFailed(null, error);
+        }
+
         deps.emit('recorder.stopped', {
             track: track.track,
             run_id: runId,
             reason,
         });
-
-        if (chainError !== null) {
-            throw chainError;
-        }
 
         return { ...record };
     }
