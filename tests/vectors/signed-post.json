@@ -1,0 +1,62 @@
+{
+    "vectors": [
+        {
+            "name": "whole",
+            "path": "/api/v1/sessions/01jbz8q4w6x0k3m5n7p9r2t4aa/tracks/camera/segments/3",
+            "query": {
+                "ts": "1762400000123",
+                "take": "1",
+                "run": "01jbz8q4w6x0k3m5n7p9r2t4v6",
+                "sha256": "abababababababababababababababababababababababababababababababab"
+            },
+            "secret": "Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4zAb7cDe0f",
+            "canonical": "POST\n/api/v1/sessions/01jbz8q4w6x0k3m5n7p9r2t4aa/tracks/camera/segments/3\n1762400000123\n1\n01jbz8q4w6x0k3m5n7p9r2t4v6\n3\n\nabababababababababababababababababababababababababababababababab\n",
+            "sig": "1113cf6ac650da74441a89b103446a93bcc6b49ee49e1066e4f04f6ac872589a"
+        },
+        {
+            "name": "part",
+            "path": "/api/v1/sessions/01jbz8q4w6x0k3m5n7p9r2t4aa/tracks/camera/segments/12",
+            "query": {
+                "ts": "1762400005000",
+                "take": "2",
+                "run": "01jbz8q4w6x0k3m5n7p9r2t4v6",
+                "part": "1/3",
+                "sha256": "abababababababababababababababababababababababababababababababab",
+                "part_sha256": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+            },
+            "secret": "Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4zAb7cDe0f",
+            "canonical": "POST\n/api/v1/sessions/01jbz8q4w6x0k3m5n7p9r2t4aa/tracks/camera/segments/12\n1762400005000\n2\n01jbz8q4w6x0k3m5n7p9r2t4v6\n12\n1/3\nabababababababababababababababababababababababababababababababab\ncdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+            "sig": "7eb30a7f760c53605252f5df073790506cde618b6695329e4ccb92fdea030de8"
+        },
+        {
+            "name": "upper_case",
+            "path": "/api/v1/sessions/01jbz8q4w6x0k3m5n7p9r2t4aa/tracks/audio/segments/0",
+            "query": {
+                "ts": "1762400009999",
+                "take": "1",
+                "run": "01JBZ8Q4W6X0K3M5N7P9R2T4V6",
+                "part": "0/2",
+                "sha256": "ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB",
+                "part_sha256": "EFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEF"
+            },
+            "secret": "Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4zAb7cDe0f",
+            "canonical": "POST\n/api/v1/sessions/01jbz8q4w6x0k3m5n7p9r2t4aa/tracks/audio/segments/0\n1762400009999\n1\n01jbz8q4w6x0k3m5n7p9r2t4v6\n0\n0/2\nabababababababababababababababababababababababababababababababab\nefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+            "sig": "06167dabdf9c52fbf1bf051d52f861b032ad6b917e410a61a9abea61f6cbe4f5"
+        },
+        {
+            "name": "empty_part",
+            "path": "/api/v1/sessions/01jbz8q4w6x0k3m5n7p9r2t4aa/tracks/camera/segments/7",
+            "query": {
+                "ts": "1762400012000",
+                "take": "1",
+                "run": "01jbz8q4w6x0k3m5n7p9r2t4v6",
+                "part": "",
+                "sha256": "0101010101010101010101010101010101010101010101010101010101010101",
+                "part_sha256": ""
+            },
+            "secret": "Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4zAb7cDe0f",
+            "canonical": "POST\n/api/v1/sessions/01jbz8q4w6x0k3m5n7p9r2t4aa/tracks/camera/segments/7\n1762400012000\n1\n01jbz8q4w6x0k3m5n7p9r2t4v6\n7\n\n0101010101010101010101010101010101010101010101010101010101010101\n",
+            "sig": "ed40d7a4f234ffe2a4c12ede6e6209aab7c245798de36a9a279f0f6d0e4bff39"
+        }
+    ]
+}

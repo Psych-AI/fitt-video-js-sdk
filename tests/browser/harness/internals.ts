@@ -192,3 +192,20 @@ export async function requestErrorProbe(): Promise<string> {
         db.close();
     }
 }
+
+export { sha256Hex } from '../../../src/core/crypto.ts';
+export { browserEnvironment } from '../../../src/core/env.ts';
+export { send } from '../../../src/core/http.ts';
+export { segmentPost, segmentPut } from '../../../src/core/wire.ts';
+
+/** The bytes of a base64 string: a spec hands fixture bytes to the page as base64. */
+export function fromBase64(text: string): ArrayBuffer {
+    const binary = atob(text);
+    const bytes = new Uint8Array(binary.length);
+
+    for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+    }
+
+    return bytes.buffer;
+}
