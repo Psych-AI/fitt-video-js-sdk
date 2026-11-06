@@ -3,14 +3,10 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 /**
- * The spike's real recordings (author's call 3).
- * Plan 4 moves them under tests/Fixtures/recordings/: change this one line then.
+ * The real recordings (spec 12), under tests/Fixtures/recordings/ since Plan 4.
  */
 export const FIXTURES_DIR = fileURLToPath(
-    new URL(
-        '../../../../docs/superpowers/spikes/2026-11-stitching/fixtures/',
-        import.meta.url,
-    ),
+    new URL('../../../../tests/Fixtures/recordings/', import.meta.url),
 );
 
 export interface FixtureFragment {
