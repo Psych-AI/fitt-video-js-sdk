@@ -14,6 +14,7 @@ test('the IIFE sets FittVideo with the package version and touches no DOM while 
     assert.equal(sdk.VERSION, '1.0.0');
     assert.equal(typeof sdk.session, 'function');
     assert.equal(typeof sdk.resume, 'function');
+    assert.equal(typeof sdk.defineFittRecorder, 'function');
 });
 
 test('neither hosted file mentions process.env', () => {

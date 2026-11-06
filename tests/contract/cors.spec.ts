@@ -2,17 +2,21 @@ import { expect, test } from '@playwright/test';
 import { openHarness } from '../browser/support/measure.ts';
 import { createSession, proxyCounts, resetProxy } from './support.ts';
 
-test('the hosted module imports cross-origin and reports its version', async ({
+test('the hosted module imports cross-origin, reports its version and defines fitt-recorder', async ({
     page,
 }) => {
     await openHarness(page);
 
-    const version = await page.evaluate(
-        async (url) => ((await import(url)) as { VERSION: string }).VERSION,
-        'http://127.0.0.1:8123/sdk/v1/fitt-video.js',
-    );
+    const loaded = await page.evaluate(async (url) => {
+        const module = (await import(url)) as { VERSION: string };
 
-    expect(version).toBe('1.0.0');
+        return {
+            version: module.VERSION,
+            element: typeof customElements.get('fitt-recorder'),
+        };
+    }, 'http://127.0.0.1:8123/sdk/v1/fitt-video.js');
+
+    expect(loaded).toEqual({ version: '1.0.0', element: 'function' });
 });
 
 test('a Bearer GET from an allowed origin gets a readable status', async ({

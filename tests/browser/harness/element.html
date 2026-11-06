@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <title>Fitt Video element harness</title>
+        <style>
+            fitt-recorder {
+                width: 320px;
+                margin: 8px;
+            }
+        </style>
+    </head>
+    <body>
+        <button id="gesture">gesture</button>
+        <script type="module">
+            import { defineFittRecorder, FittVideo } from '/src/hosted.ts';
+
+            // hosted.ts defines the element at load; a second call is a no-op.
+            defineFittRecorder();
+
+            window.__phases = [];
+            window.__uploads = [];
+            window.__events = [];
+            window.__audioElements = 0;
+
+            // The element must create no audio element (spec 6.4): count both ways of making one.
+            const RealAudio = window.Audio;
+            window.Audio = function (...args) {
+                window.__audioElements += 1;
+
+                return new RealAudio(...args);
+            };
+            const realCreateElement = document.createElement.bind(document);
+            document.createElement = (name, options) => {
+                if (String(name).toLowerCase() === 'audio') {
+                    window.__audioElements += 1;
+                }
+
+                return realCreateElement(name, options);
+            };
+
+            const base = await (
+                await fetch('/tests/fixtures/descriptor-answer.json')
+            ).json();
+
+            const json = (status, body) =>
+                new Response(JSON.stringify(body), {
+                    status,
+                    headers: { 'Content-Type': 'application/json' },
+                });
+
+            /** Answers every API call locally, as the server would on a good day. */
+            const answer = (statusBody) => async (url) => {
+                if (/\/segments(\/|$)/.test(url)) {
+                    return json(201, { code: 'stored', segment: {} });
+                }
+
+                if (/\/manifest$/.test(url)) {
+                    return json(200, {
+                        track: { sealed: true, take: 1 },
+                        late_window_s: 0,
+                    });
+                }
+
+                if (/\/events$/.test(url)) {
+                    return new Response(null, { status: 204 });
+                }
+
+                if (/\/finalise$/.test(url)) {
+                    return json(200, {
+                        session: { id: base.session_id, status: 'finalising' },
+                    });
+                }
+
+                if (/\/status$/.test(url)) {
+                    return json(
+                        200,
+                        statusBody ?? {
+                            session: {
+                                id: base.session_id,
+                                status: 'recording',
+                                take: 1,
+                                end_ms: null,
+                            },
+                            tracks: [],
+                            checks: {
+                                status: 'pending',
+                                verdict: null,
+                                take: 1,
+                                reasons: [],
+                            },
+                            upload: { bytes_received: 0 },
+                        },
+                    );
+                }
+
+                return json(200, {});
+            };
+
+            const TYPES = [
+                'fitt-state',
+                'fitt-event',
+                'fitt-milestone',
+                'fitt-checks',
+                'fitt-ready',
+                'fitt-error',
+            ];
+
+            window.mount = ({
+                recording,
+                controls,
+                mirror,
+                statusBody,
+                startLabel,
+                slots = [],
+            } = {}) => {
+                const descriptor = {
+                    ...base,
+                    recording: { ...base.recording, ...(recording ?? {}) },
+                };
+                const session = FittVideo.session(descriptor, {
+                    environment: { fetch: answer(statusBody) },
+                });
+                const element = document.createElement('fitt-recorder');
+
+                if (controls !== undefined) {
+                    element.setAttribute('controls', controls);
+                }
+
+                if (mirror !== undefined) {
+                    element.setAttribute('mirror', mirror);
+                }
+
+                if (startLabel !== undefined) {
+                    element.setAttribute('start-label', startLabel);
+                }
+
+                for (const name of slots) {
+                    const child = document.createElement('span');
+                    child.slot = name;
+                    child.textContent = name;
+                    element.append(child);
+                }
+
+                for (const type of TYPES) {
+                    element.addEventListener(type, (event) => {
+                        window.__events.push({ type, detail: event.detail });
+
+                        // The element sets its data attributes before it dispatches fitt-state.
+                        if (type === 'fitt-state') {
+                            window.__phases.push(element.dataset.phase);
+                            window.__uploads.push(element.dataset.upload);
+                        }
+                    });
+                }
+
+                document.body.append(element);
+                element.session = session;
+            };
+
+            import * as internals from './internals.ts';
+            window.internals = internals;
+        </script>
+    </body>
+</html>

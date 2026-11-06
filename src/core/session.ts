@@ -503,6 +503,21 @@ export function lockDecided(session: FittSession): Promise<boolean> {
     return lockDecisions.get(session) ?? Promise.resolve(true);
 }
 
+/** What <fitt-recorder> reads to draw its timers and its stop rule. Not part of the public API. */
+export interface TakeView {
+    recording: RecordingLimits;
+    /** Session time of the current take's `started` milestone, or null when no take is open. */
+    takeStartMs: number | null;
+}
+
+/** Each session object's take view, for the element. */
+const takeViews = new WeakMap<FittSession, () => TakeView>();
+
+/** The take's limits and start, or null for a session this module did not make (an invalid descriptor, another copy of the SDK). */
+export function takeView(session: FittSession): TakeView | null {
+    return takeViews.get(session)?.() ?? null;
+}
+
 /** The same-id map: one session object per session id in this page. */
 const sessions = new Map<string, FittSession>();
 
@@ -3655,6 +3670,10 @@ export function createSession(
 
     owners.set(created, () => owner);
     lockDecisions.set(created, lockDecision);
+    takeViews.set(created, () => ({
+        recording: recordingLimits(),
+        takeStartMs: lifecycle?.takeStartMs() ?? null,
+    }));
 
     return created;
 }
