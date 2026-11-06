@@ -1410,6 +1410,54 @@ test('a reload into an open take ends its runs as reload, and start() continues 
     );
 });
 
+test('a second reload of an interrupted take that was only prepared still continues it with no countdown', async () => {
+    const { descriptor, store, second } = await interruptedTake(
+        '01jbz8q4w6x0k3m5n7p9r2t4s7',
+        12_000,
+    );
+    // <fitt-recorder> prepares the session as soon as it is bound; nothing is pressed.
+    await second.session.prepare();
+    assert.equal(
+        (await store.getSession(descriptor.session_id))?.take_open,
+        true,
+    );
+
+    const third = sessionRig({
+        descriptor,
+        store,
+        env: fakeEnvironment({ date: second.env.dateNow() + 1000 }),
+        chunks: true,
+    });
+    await third.session.prepare();
+    const milestones: string[] = [];
+    third.session.onMilestone((milestone) => milestones.push(milestone.name));
+    const continuing = third.session.start();
+    await third.env.advance(10);
+    await continuing;
+
+    assert.equal(third.session.state.phase, 'recording');
+    assert.deepEqual(milestones, []);
+});
+
+test('a second start() while an interrupted take is continuing keeps the take open', async () => {
+    const { descriptor, store, second } = await interruptedTake(
+        '01jbz8q4w6x0k3m5n7p9r2t4s8',
+        12_000,
+    );
+    await second.session.prepare();
+    const one = second.session.start();
+    const two = second.session.start().catch((error: unknown) => error);
+    await second.env.advance(10);
+    await one;
+    await two;
+
+    assert.equal(second.session.state.phase, 'recording');
+    assert.equal(
+        (await store.getSession(descriptor.session_id))?.take_open,
+        true,
+    );
+});
+
 test('finalise() of an interrupted take seals it where its last stored segment ends', async () => {
     const { store, second, descriptor } = await interruptedTake(
         '01jbz8q4w6x0k3m5n7p9r2t4s2',

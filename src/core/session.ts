@@ -2052,8 +2052,15 @@ export function createSession(
             void persist();
         }
 
-        if (record !== null && phase === 'ready' && record.take_open) {
-            // The too_short path: the take was reset and nothing is open.
+        if (
+            record !== null &&
+            phase === 'ready' &&
+            record.take_open &&
+            !interrupted
+        ) {
+            // The too_short path: the take was reset and nothing is open. An
+            // interrupted take stays open until it is continued, reset or sealed:
+            // prepare() after a reload reaches ready too.
             record.take_open = false;
             void persist();
         }
@@ -3353,6 +3360,7 @@ export function createSession(
                 if (
                     record !== null &&
                     record.take_open &&
+                    !interrupted &&
                     life.phase() !== 'recording'
                 ) {
                     record.take_open = false;
