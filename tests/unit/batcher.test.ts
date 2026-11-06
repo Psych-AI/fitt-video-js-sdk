@@ -72,7 +72,7 @@ function rig(
         next?: number;
         sync?: number | null;
         take?: () => number;
-        answer?: (token: TokenRef) => WireAnswer;
+        answer?: (token: TokenRef) => WireAnswer | Promise<WireAnswer>;
         token?: ReturnType<typeof stubToken>;
     } = {},
 ) {
@@ -96,7 +96,7 @@ function rig(
         send: async (body, keepalive, token) => {
             sends.push({ body, keepalive, tokenId: token.id });
 
-            return options.answer?.(token) ?? NO_CONTENT;
+            return (await options.answer?.(token)) ?? NO_CONTENT;
         },
         persistNextBatchSeq: async (next) => {
             persisted.push(next);
@@ -379,6 +379,121 @@ test('a 429 waits retry_after from the body', async () => {
 
     await r.env.advance(1);
     await until(() => r.sends.length === 2);
+});
+
+test('heartbeats wait out a 429 retry_after: batch 0 is not sent again before it ends', async () => {
+    const answers = [
+        reply(429, {
+            error: { code: 'rate_limited', message: 'x', retry_after: 30 },
+        }),
+    ];
+    const r = rig({ answer: () => answers.shift() ?? NO_CONTENT });
+    r.batcher.startTimer({ emptyHeartbeats: true });
+    r.batcher.add(event(1));
+    await r.env.advance(5000);
+    await r.env.advance(29_999);
+
+    assert.deepEqual(
+        r.sends.map((send) => JSON.parse(send.body).batch_seq),
+        [0],
+    );
+    assert.equal((await r.store.listBatches(SID)).length, 6);
+
+    await r.env.advance(1);
+    // The retry fires first, then the tick due at the same moment adds batch 6.
+    await until(() => r.sends.length === 8);
+
+    assert.deepEqual(
+        r.sends.map((send) => JSON.parse(send.body).batch_seq),
+        [0, 0, 1, 2, 3, 4, 5, 6],
+    );
+    r.batcher.stop();
+});
+
+test('a flush during a pass that ends in a retry wait does not send again before the wait ends', async () => {
+    let fail = true;
+    let release: () => void = () => {};
+    const held = new Promise<void>((resolve) => {
+        release = resolve;
+    });
+    const r = rig({
+        answer: async () => {
+            await held;
+
+            return fail ? reply(503, null) : NO_CONTENT;
+        },
+    });
+    r.batcher.add(event(1));
+    const first = r.batcher.flush();
+    await settle();
+    r.batcher.add(event(2));
+    const second = r.batcher.flush();
+    await settle();
+    release();
+    await Promise.all([first, second]);
+
+    assert.deepEqual(
+        r.sends.map((send) => JSON.parse(send.body).batch_seq),
+        [0],
+    );
+
+    fail = false;
+    await r.env.advance(30_000);
+    await until(() => r.sends.length === 3);
+
+    assert.deepEqual(
+        r.sends.map((send) => JSON.parse(send.body).batch_seq),
+        [0, 0, 1],
+    );
+});
+
+test('a second pagehide never resends a keepalive batch still in flight, and counts its bytes', async () => {
+    const answered: (() => void)[] = [];
+    const r = rig({
+        next: 1,
+        answer: () =>
+            new Promise<WireAnswer>((resolve) => {
+                answered.push(() => resolve(NO_CONTENT));
+            }),
+    });
+    const seqs = (): number[] =>
+        r.sends.map((send) =>
+            send.body.startsWith('x') ? 0 : JSON.parse(send.body).batch_seq,
+        );
+    await r.store.putBatch({
+        session_id: SID,
+        batch_seq: 0,
+        take: 1,
+        body: 'x'.repeat(30_000),
+        payload_bytes: 29_000,
+    });
+    r.batcher.add(event(1));
+    r.batcher.pagehide();
+    await settle();
+    r.batcher.add(event(2));
+    r.batcher.pagehide();
+    await settle();
+
+    assert.deepEqual(seqs(), [1, 0, 2]);
+    assert.ok(r.sends.every((send) => send.keepalive));
+
+    // 30,000 bytes and two small bodies are in flight: a 31,500 byte
+    // payload would fit alone but not on top of them.
+    r.batcher.add(event(3, { text: 'x'.repeat(31_500) }));
+    r.batcher.pagehide();
+    await settle();
+
+    assert.deepEqual(seqs(), [1, 0, 2]);
+
+    answered.forEach((answer) => answer());
+    await settle();
+    r.batcher.pagehide();
+    await settle();
+
+    assert.deepEqual(seqs(), [1, 0, 2, 3]);
+    answered.forEach((answer) => answer());
+    await settle();
+    assert.equal((await r.store.listBatches(SID)).length, 0);
 });
 
 test('a refused batch is deleted, reported once through onRejected, and the next batch is sent', async () => {

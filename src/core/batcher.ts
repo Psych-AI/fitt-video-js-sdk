@@ -143,6 +143,8 @@ export function createBatcher(deps: BatcherDeps): Batcher {
     let again = false;
     let readyWait: Promise<void> | null = null;
     let parked = false;
+    /** Keepalive sends whose answer has not come yet: batch_seq to body bytes. They share the page's keepalive budget across pagehide() calls. */
+    const keepaliveInFlight = new Map<number, number>();
 
     const clearTimer = (handle: number | null): null => {
         if (handle !== null) {
@@ -371,7 +373,11 @@ export function createBatcher(deps: BatcherDeps): Batcher {
         }
     };
 
-    /** Runs a pass, or asks the running one for another round; resolves when the rounds are done. */
+    /**
+     * Runs a pass, or asks the running one for another round; resolves when
+     * the rounds are done. A pass that ended in a retry wait ends the rounds:
+     * only the retry timer, or a 2xx that clears it, sends again.
+     */
     const kick = (): Promise<void> => {
         if (running !== null) {
             again = true;
@@ -384,7 +390,7 @@ export function createBatcher(deps: BatcherDeps): Batcher {
                 do {
                     again = false;
                     await pass();
-                } while (again && !dead);
+                } while (again && !dead && retryTimer === null);
             } finally {
                 running = null;
             }
@@ -425,8 +431,10 @@ export function createBatcher(deps: BatcherDeps): Batcher {
             return;
         }
 
+        // While a retry waits (a 429's retry_after, a backoff) the tick only
+        // freezes: sending now would spend the session's write budget early.
         void freezeGroups(groups)
-            .then(() => kick())
+            .then(() => (retryTimer === null ? kick() : undefined))
             .catch((error: unknown) => console.error(error));
     };
 
@@ -472,10 +480,20 @@ export function createBatcher(deps: BatcherDeps): Batcher {
                 return;
             }
 
-            let total = 0;
             let full = false;
             const sendKeepalive = (frozen: Frozen): void => {
+                // A keepalive send from an earlier call (visibilitychange,
+                // then pagehide) is still in flight: never send it twice.
+                if (keepaliveInFlight.has(frozen.batch_seq)) {
+                    return;
+                }
+
                 const bytes = bodyBytes(frozen.body);
+                let total = 0;
+
+                for (const pending of keepaliveInFlight.values()) {
+                    total += pending;
+                }
 
                 if (full || total + bytes > KEEPALIVE_BYTES) {
                     full = true;
@@ -483,8 +501,9 @@ export function createBatcher(deps: BatcherDeps): Batcher {
                     return;
                 }
 
-                total += bytes;
+                keepaliveInFlight.set(frozen.batch_seq, bytes);
                 void attemptSend(frozen.batch_seq, frozen.body, true)
+                    .finally(() => keepaliveInFlight.delete(frozen.batch_seq))
                     .then((outcome) => {
                         if (outcome === 'again') {
                             void kick();
