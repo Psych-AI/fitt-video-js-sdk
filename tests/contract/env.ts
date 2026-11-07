@@ -10,7 +10,7 @@ export const CONTRACT_ENV: Record<string, string> = {
     APP_URL: 'http://127.0.0.1:8123',
     VIDEO_API_URL: 'http://127.0.0.1:8123/api/v1',
     QUEUE_CONNECTION: 'sync',
-    VIDEO_PROCESSING_ENABLED: 'false',
+    VIDEO_PROCESSING_ENABLED: 'true',
     CACHE_STORE: 'database',
     VIDEO_UPLOAD_DRIVER: 'passthrough',
     VIDEO_POST_MAX_BYTES: '104857600',

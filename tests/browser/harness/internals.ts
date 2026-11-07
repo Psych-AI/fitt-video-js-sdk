@@ -1558,6 +1558,11 @@ export const e2e = {
     stop: (): Promise<void> => e2eCurrent().stop(),
     reset: (): Promise<void> => e2eCurrent().reset(),
     finalise: (): Promise<void> => e2eCurrent().finalise(),
+    /** waitForReady() on the current session: the track's playback URL once the status carries one. */
+    waitForReady: (
+        track: 'camera' | 'audio',
+        timeoutMs = 60_000,
+    ): Promise<string> => e2eCurrent().waitForReady({ track, timeoutMs }),
     /** A host event on the current session (host. is added). */
     event: (type: string): boolean => e2eCurrent().event(type),
     state: (): SessionState => e2eCurrent().state,

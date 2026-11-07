@@ -44,7 +44,9 @@ test('a 12 s answer take uploads, seals both tracks and finalises', async ({
     request,
     browserName,
 }, testInfo) => {
-    const { descriptor } = await createSession(request);
+    const { descriptor } = await createSession(request, {
+        playback_in_status: true,
+    });
     await installMedia(page, browserName);
     const errors = await openHarness(page);
 
@@ -123,6 +125,17 @@ test('a 12 s answer take uploads, seals both tracks and finalises', async ({
         (await page.evaluate(() => window.internals.e2e.state())).upload
             .sessionFinalised,
     ).toBe(true);
+    const url = await page.evaluate(() =>
+        window.internals.e2e.waitForReady('camera', 60_000),
+    );
+    expect(typeof url).toBe('string');
+    const head = await request.get(url, { headers: { Range: 'bytes=0-99' } });
+    expect(head.status()).toBe(206);
+    await expect
+        .poll(async () => (await status(request, descriptor)).session.status, {
+            timeout: 30_000,
+        })
+        .toBe('ready');
     expect(await page.evaluate(() => window.internals.e2e.events())).toContain(
         'session.environment',
     );
