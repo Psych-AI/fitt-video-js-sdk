@@ -50,7 +50,7 @@ byte-for-byte mirrors of it. SDK version 1.x.
 | Record again | `await s.reset();` from `stopped` or `rejected`, then `start()` again |
 | Throw the session away | `await s.discard();` |
 | Wait for the verdict | `const checks = await s.waitForChecks({ timeoutMs: 60000 });` `checks.verdict` is `accept`, `reject`, `unknown` or null. Act on the webhook, not on this |
-| Get a playback URL | `const url = await s.waitForReady({ track: 'camera' });` Needs `playback_in_status: true` on `POST /api/v1/sessions`. Rejects `playback_not_enabled` with an empty `detail` when the session has no `playback_in_status`, and with `detail.reason: 'timeout'` when no URL came in time |
+| Get a playback URL | `const url = await s.waitForReady({ track: 'camera' });` Needs `playback_in_status: true` on `POST /api/v1/sessions`. Rejects `playback_not_enabled` with an empty `detail` when the session has no `playback_in_status`, and with `detail.reason: 'timeout'` when no URL came in time. Rejects `track_failed` with `detail.reason` (the track's `failure_reason`, for example `no_decodable_run`) as soon as the status shows the track failed |
 | Get a playback URL on your server | `GET /api/v1/videos/{id}/playback` with the API key: `200 {url, expires_at, mime_type}`, valid for the space's `playback_url_lifetime_s`; `409 not_ready`, `410 expired` |
 | Get a still frame on your server | `GET /api/v1/videos/{id}/frame?t_ms=` with the API key: `200 image/jpeg` at session time `t_ms`; `409 not_ready`, `409 no_video`, `422 out_of_range`, `410 expired`, `409 discarded`, `503 frame_failed` (ffmpeg gave no frame; retry later) |
 | Mix interviewer audio | `s.mixAudio(remoteStreamOrTrackOrAudioElement, { role: 'interviewer' });` after `prepare()`, and again after each `reset()` |
@@ -190,8 +190,10 @@ Phases: `idle`, `preparing`, `ready`, `countdown`, `recording`,
   has one. It needs `playback_in_status: true` on `POST /api/v1/sessions`.
   It rejects `playback_not_enabled` with an empty `detail` when the session
   has no `playback_in_status`, and with `detail.reason: 'timeout'` when no
-  URL came in time. A timeout means the track is still processing or has
-  failed: read `tracks[].status` and `failure_reason` from
+  URL came in time. It rejects `track_failed` with `detail.reason` (the
+  track's `failure_reason`, for example `no_decodable_run`) as soon as the
+  status shows the track failed. A timeout means the track is still
+  processing: read `tracks[].status` and `failure_reason` from
   `GET /sessions/{id}` or the webhook. A ready track's URL lasts 2 minutes
   and is minted again on each poll.
 
@@ -241,8 +243,8 @@ never on a message.
 | `stale_take` | no | The server is on a newer take (another tab or a reset); capture stopped | Reload the session state |
 
 Rejected promises carry a `FittVideoError` whose `code` is one of the
-above or `too_short`, `countdown_cancelled`, `invalid_state` or
-`playback_not_enabled`.
+above or `too_short`, `countdown_cancelled`, `invalid_state`,
+`playback_not_enabled` or `track_failed`.
 
 - **On a network that blocks preflights**, segments still go through the
   preflight-free signed POST, but refresh, manifests, events and finalise

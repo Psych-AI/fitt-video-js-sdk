@@ -193,6 +193,9 @@ export function waitForChecks(
  * status has no `playback` key (a session created without
  * `playback_in_status`, or any session until Plan 4), and with the same
  * code (detail `{reason: 'timeout'}`) when no URL arrived by `timeoutMs`.
+ * Rejects `track_failed` (detail `{reason}`, the track's `failure_reason`) as
+ * soon as a status shows the awaited track failed, before it looks for
+ * playback.
  */
 export function waitForReady(
     deps: { env: Environment; status(): Promise<WireAnswer> },
@@ -209,6 +212,25 @@ export function waitForReady(
 
                 if (body === null) {
                     return false;
+                }
+
+                const tracks = Array.isArray(body.tracks) ? body.tracks : [];
+                const awaited = tracks.find(
+                    (entry): entry is Record<string, unknown> =>
+                        isObject(entry) && entry.track === track,
+                );
+
+                if (awaited !== undefined && awaited.status === 'failed') {
+                    reject(
+                        new FittVideoError('track_failed', {
+                            reason:
+                                typeof awaited.failure_reason === 'string'
+                                    ? awaited.failure_reason
+                                    : null,
+                        }),
+                    );
+
+                    return true;
                 }
 
                 if (!('playback' in body)) {

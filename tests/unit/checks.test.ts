@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { isDeepStrictEqual } from 'node:util';
 import { waitForChecks, waitForReady } from '../../src/core/checks.ts';
 import { FittVideoError } from '../../src/core/errors.ts';
 import type { WireAnswer } from '../../src/core/http.ts';
@@ -176,5 +177,95 @@ test('waitForReady resolves the track url once the playback carries it, and reje
             error.detail.reason === 'timeout',
     );
     await late.advance(5000);
+    await settled;
+});
+
+const tracksStatus = (
+    tracks: Record<string, unknown>[],
+    playback: Record<string, unknown> = {},
+): WireAnswer =>
+    statusWith(
+        { status: 'pending', verdict: null, take: 1, reasons: [] },
+        { tracks, playback },
+    );
+
+test('waitForReady rejects track_failed with the reason as soon as the awaited track has failed', async () => {
+    const env = fakeEnvironment();
+    let polls = 0;
+    const processing = tracksStatus([
+        { track: 'camera', status: 'processing', failure_reason: null },
+    ]);
+    const failed = tracksStatus([
+        {
+            track: 'camera',
+            status: 'failed',
+            failure_reason: 'no_decodable_run',
+        },
+    ]);
+    const result = waitForReady(
+        { env, status: async () => (++polls < 2 ? processing : failed) },
+        'camera',
+        60_000,
+    );
+    const settled = assert.rejects(
+        result,
+        (error) =>
+            error instanceof FittVideoError &&
+            error.code === 'track_failed' &&
+            isDeepStrictEqual(error.detail, { reason: 'no_decodable_run' }),
+    );
+    await env.advance(1000);
+    await settled;
+
+    assert.equal(polls, 2);
+});
+
+test('a failed audio track never rejects waitForReady for the camera', async () => {
+    const env = fakeEnvironment();
+    const url = waitForReady(
+        {
+            env,
+            status: async () =>
+                tracksStatus(
+                    [
+                        {
+                            track: 'camera',
+                            status: 'ready',
+                            failure_reason: null,
+                        },
+                        {
+                            track: 'audio',
+                            status: 'failed',
+                            failure_reason: 'no_media',
+                        },
+                    ],
+                    { camera: { url: 'https://media.test/camera.webm' } },
+                ),
+        },
+        'camera',
+    );
+    await env.advance(0);
+
+    assert.equal(await url, 'https://media.test/camera.webm');
+});
+
+test('a failed track with no failure_reason rejects track_failed with a null reason', async () => {
+    const env = fakeEnvironment();
+    const result = waitForReady(
+        {
+            env,
+            status: async () =>
+                tracksStatus([{ track: 'audio', status: 'failed' }]),
+        },
+        'audio',
+    );
+    const settled = assert.rejects(
+        result,
+        (error) =>
+            error instanceof FittVideoError &&
+            error.code === 'track_failed' &&
+            isDeepStrictEqual(error.detail, { reason: null }),
+    );
+    await env.advance(0);
     await settled;
 });

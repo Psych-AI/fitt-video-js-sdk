@@ -24,7 +24,8 @@ export type RejectionCode =
     | 'too_short'
     | 'countdown_cancelled'
     | 'invalid_state'
-    | 'playback_not_enabled';
+    | 'playback_not_enabled'
+    | 'track_failed';
 
 /** The SDK's one error type. Its message is the code itself, so nothing depends on copy. */
 export class FittVideoError extends Error {
