@@ -16,4 +16,9 @@ export const CONTRACT_ENV: Record<string, string> = {
     VIDEO_POST_MAX_BYTES: '104857600',
     PHP_CLI_SERVER_WORKERS: '4',
     XDEBUG_MODE: 'off',
+    VIDEO_AI_FAKE: 'contract',
+    VIDEO_AI_CONCURRENCY: 'sync',
+    OPENAI_API_KEY: 'contract',
+    AININJA_TOKEN: 'contract',
+    AININJA_URL: 'https://aininja.test',
 };
