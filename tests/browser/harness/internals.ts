@@ -1,5 +1,7 @@
 /** What the browser specs call through `window.internals`. Later tasks add the functions their specs need. */
+import type { TranscriptUpload } from '../../../src/core/api.ts';
 import { createBatcher } from '../../../src/core/batcher.ts';
+import type { ChecksResult } from '../../../src/core/checks.ts';
 import { createClock, type Clock } from '../../../src/core/clock.ts';
 import { sha256Hex } from '../../../src/core/crypto.ts';
 import type {
@@ -1563,6 +1565,12 @@ export const e2e = {
         track: 'camera' | 'audio',
         timeoutMs = 60_000,
     ): Promise<string> => e2eCurrent().waitForReady({ track, timeoutMs }),
+    /** waitForChecks() on the current session. */
+    waitForChecks: (timeoutMs = 60_000): Promise<ChecksResult> =>
+        e2eCurrent().waitForChecks({ timeoutMs }),
+    /** uploadTranscript() on the current session. */
+    uploadTranscript: (upload: TranscriptUpload): Promise<void> =>
+        e2eCurrent().uploadTranscript(upload),
     /** A host event on the current session (host. is added). */
     event: (type: string): boolean => e2eCurrent().event(type),
     state: (): SessionState => e2eCurrent().state,

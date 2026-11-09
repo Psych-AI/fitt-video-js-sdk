@@ -580,3 +580,46 @@ test('a reload of the owner while a duplicate tab is hidden gives the lock back 
             ]),
         );
 });
+
+test('an answer take gets its verdict through waitForChecks, and a transcript upload is accepted', async ({
+    page,
+    request,
+    browserName,
+}, testInfo) => {
+    test.skip(measured(testInfo, browserName), 'media in chromium and firefox');
+    const { descriptor, session } = await createSession(request);
+    await installMedia(page, browserName);
+    const errors = await openHarness(page);
+    await skipWithoutRecorder(page);
+    await page.evaluate((d) => window.internals.e2e.open(d, {}), descriptor);
+    await record(page, 12);
+    await page.evaluate(() => window.internals.e2e.stop());
+
+    const checks = await page.evaluate(() =>
+        window.internals.e2e.waitForChecks(60_000),
+    );
+    expect(checks).toMatchObject({
+        status: 'done',
+        verdict: 'accept',
+        take: 1,
+    });
+
+    await page.evaluate(() => window.internals.e2e.finalise());
+    await page.evaluate(() =>
+        window.internals.e2e.uploadTranscript({
+            timing: 'none',
+            segments: [{ text: 'Hi', role: 'candidate' }],
+        }),
+    );
+    const uploaded = await request.get(
+        `${API}/sessions/${session.id}/transcript?source=uploaded`,
+        {
+            headers: {
+                Authorization: `Bearer ${process.env.FITT_CONTRACT_KEY}`,
+                Accept: 'application/json',
+            },
+        },
+    );
+    expect(uploaded.status()).toBe(200);
+    expect(errors).toEqual([]);
+});
