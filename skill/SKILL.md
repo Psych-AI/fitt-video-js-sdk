@@ -186,6 +186,19 @@ Phases: `idle`, `preparing`, `ready`, `countdown`, `recording`,
   `rejected`.
 - **Fail open.** Network trouble, a timeout or an `unknown` verdict must
   never block the candidate. The webhook to your server is authoritative.
+- **The verdict and its reasons.** Only `answer` takes are checked. The
+  server writes one verdict per take, once. `reasons` holds codes:
+  `no_speech`, `incoherent`, `off_topic` and `audio_incomplete` can
+  reject (when the space's `reject_on` lists them); `too_short`,
+  `audio_incomplete`, `provider_unavailable` and `over_cap` can give
+  `unknown`. A lost upload is `audio_incomplete`, never `no_speech`.
+- **It is advisory.** `waitForChecks()` is for the candidate's screen. Act
+  on `GET /api/v1/sessions/{id}/checks` from your server, or on the
+  webhook (Plan 6).
+- **`checks.reason`** (a short sentence from the meaningful check) is in the
+  status payload only when the session was created with
+  `checks: {expose_reason: true}`. Your server with the API key always sees it on
+  `GET /checks`.
 - `waitForReady({track})` resolves with a playback URL once the platform
   has one. It needs `playback_in_status: true` on `POST /api/v1/sessions`.
   It rejects `playback_not_enabled` with an empty `detail` when the session
@@ -214,8 +227,31 @@ Chromium.
 `session.uploadTranscript({timing, offset_ms?, language?, segments})`
 sends a transcript the host already has (`timing` is `exact`,
 `approximate` or `none`; each segment has `text` and optional `start_ms`,
-`end_ms`, `speaker`, `role`). The server route arrives with Plan 5: until
-then the call is refused.
+`end_ms`, `speaker`, `role`). The browser sends it with its upload token;
+the host's server can send the same body to
+`POST /api/v1/sessions/{id}/transcript` with its API key. Both answer
+`201` with the `GET /transcript` body.
+
+- It is accepted while the session is `open`, `finalising`, `processing`,
+  `ready` or `failed`. A discarded session answers `409 discarded`; an
+  abandoned or expired one answers `409 session_closed`.
+- At most 100,000 segments (`422 validation_failed` over that). A text over
+  the 2,000,000-character ceiling answers `413 payload_too_large`.
+- Each upload replaces the take's previous uploaded transcript. When the
+  upload is the take's primary transcript, the text options (translate,
+  summarise, and meaningful when checks are off) are queued again. On a
+  session that asked for `transcribe` (an `answer` session does by
+  default), the platform's own transcript stays primary, and the upload is
+  readable at `GET /transcript?source=uploaded`.
+- Read results on your server with the API key:
+  `GET /sessions/{id}/transcript`, `/summary`, `/analyses`. A result still
+  being made, or still owed while the session processes, answers
+  `409 not_ready`; a `404` is final only once the session has closed.
+- Ask for an option later with `POST /sessions/{id}/analyses
+  {type, take?}` (API key): `202`. It answers `409 not_ready` while the
+  take's checks or source track are not done, and `409 rerun_limit` after a
+  failed analysis was run again 3 times. A skip by a gate (for example
+  `audio_incomplete` or `over_cap`) is final.
 
 ## Errors and what to show
 
