@@ -194,7 +194,20 @@ Phases: `idle`, `preparing`, `ready`, `countdown`, `recording`,
   `unknown`. A lost upload is `audio_incomplete`, never `no_speech`.
 - **It is advisory.** `waitForChecks()` is for the candidate's screen. Act
   on `GET /api/v1/sessions/{id}/checks` from your server, or on the
-  webhook (Plan 6).
+  `session.checks.completed` webhook.
+- **The webhooks.** The platform POSTs the session's `webhook_url` for nine
+  events: `session.ready`, `session.failed`, `session.abandoned`,
+  `session.discarded`, `video.ready` (once per track), `video.failed`,
+  `session.checks.completed`, `transcript.ready` and `analysis.completed`.
+  Each carries `X-Fitt-Event-Id`, `X-Fitt-Timestamp` and `X-Fitt-Signature`
+  (`sha256=` HMAC-SHA256 of the timestamp, a dot and the raw body, keyed with
+  the API key's webhook secret). Verify on your server with
+  `fitt/video-sdk`'s `verifyWebhook()`, then route and dedupe on the
+  verified body's `type` and `id`. Delivery order is not guaranteed: drop a
+  `sequence` below the last one you accepted for the same session and
+  `object_key` (`session` for the four session events, `video:{id}`,
+  `checks:{take}`, `transcript:{id}`, `analysis:{id}`); never compare across
+  objects. The PHP SDK's integration skill has the details.
 - **`checks.reason`** (a short sentence from the meaningful check) is in the
   status payload only when the session was created with
   `checks: {expose_reason: true}`. Your server with the API key always sees it on
@@ -315,5 +328,5 @@ above or `too_short`, `countdown_cancelled`, `invalid_state`,
 - Play a take back from local blobs or `session.stream` recordings:
   MediaRecorder output has no duration header and seeks badly. Use the URL
   from `waitForReady()` or from `GET /api/v1/videos/{id}/playback` on your
-  server (webhooks arrive with Plan 6).
+  server, or after the `video.ready` webhook.
 - Treat the page's verdict as final: the webhook decides.
