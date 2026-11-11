@@ -319,6 +319,16 @@ above or `too_short`, `countdown_cancelled`, `invalid_state`,
   records nothing and passes its descriptor to the first; it takes over
   when the first closes.
 - **Firefox** cannot finish `prepare()` in a tab that is not the front tab.
+- **Direct uploads (SDK 1.2.0).** When the Fitt Video deployment uploads
+  straight to the bucket, the SDK PUTs segments to the media host
+  (`cloudfront`, for example `media.video.fitt.ai`) or to the bucket's host
+  (`s3`, `oss`), then confirms them with the API. A host page with a
+  Content Security Policy adds that host to `connect-src`, beside the Fitt
+  Video API host. Corporate network allowlists need the media host too. If
+  the bucket is blocked, the SDK steps down to the API on its own, and the
+  `upload.transport_fallback` event may now report `from: 'direct'`
+  (`{from, to, reason}`). Nothing else changes for a host: the descriptor
+  carries everything.
 
 ## Never
 
