@@ -22,6 +22,14 @@ export interface TokenKeeper {
     ready(): Promise<void>;
     /** Refreshes at once when Date.now() has passed the stored deadline; cheap when it has not. */
     check(): void;
+    /**
+     * Refreshes at once, or waits for the refresh in flight (the direct
+     * rung's window renewal, author's call 10). Resolves at once while the
+     * keeper is stopped, gone, paused or backing off.
+     */
+    renew(): Promise<void>;
+    /** Date.now() when the held descriptor was received. */
+    receivedAt(): number;
     /** Waits for a refresh in flight and passes its accepted descriptor to onDescriptor before it resolves; schedules nothing after. */
     stop(): Promise<void>;
 }
@@ -311,6 +319,18 @@ export function createTokenKeeper(deps: TokenKeeperDeps): TokenKeeper {
             if (env.dateNow() >= deadlineMs()) {
                 start();
             }
+        },
+        renew(): Promise<void> {
+            if (stopped || gone || paused || waitingOnBackoff) {
+                return Promise.resolve();
+            }
+
+            start();
+
+            return inFlight ?? Promise.resolve();
+        },
+        receivedAt(): number {
+            return receivedAtMs;
         },
         async stop(): Promise<void> {
             stopped = true;

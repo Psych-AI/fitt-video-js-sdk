@@ -4,7 +4,10 @@ import { test } from 'node:test';
 import { readDescriptor, type Descriptor } from '../../src/core/descriptor.ts';
 import { createDirectSlots, type DirectSlot } from '../../src/core/direct.ts';
 import { classifyDirect } from '../../src/core/responses.ts';
+import { createTokenKeeper } from '../../src/core/token.ts';
 import { directPut, segmentConfirm } from '../../src/core/wire.ts';
+import { fakeEnvironment, json, settle } from '../support/fake-env.ts';
+import { add, rig, STORED } from '../support/uploader-rig.ts';
 
 const BUCKET = 'https://fitt-video.s3.test/';
 const SHA = 'ab'.repeat(32);
@@ -207,5 +210,245 @@ test('a segment the confirm refused is PUT again to a fresh slot of the same win
     assert.equal(
         (slots.slotFor('camera', 'a', 1, SHA) as DirectSlot).slot,
         again.slot,
+    );
+});
+
+/** A refreshed answer-s3 descriptor whose camera window has a new attempt and new slots. */
+function renewedS3(): Descriptor {
+    const renewed = fixture('answer-s3');
+    const fresh = '01jbz8q4w6x0k3m5n7p9r2t4df';
+    renewed.token.id = '01jbz8q4w6x0k3m5n7p9r2t4bc';
+    renewed.tracks[0].upload.direct!.attempt = fresh;
+    renewed.tracks[0].upload.direct!.slots = [0, 1, 2, 3].map(
+        (i) =>
+            `${BUCKET}videos/01jbz8q4w6x0k3m5n7p9r2t4aa/camera/take-1/direct/${fresh}-000${i}.bin?X-Amz-Signature=r${i}`,
+    );
+
+    return renewed;
+}
+
+test('on the direct rung a segment is PUT to its slot with no token, then confirmed with the token', async () => {
+    const d = fixture('answer-s3');
+    const r = rig({ rung: 'direct', descriptor: d });
+    r.env.respond((call) =>
+        call.url.startsWith(BUCKET) ? json(200) : STORED(),
+    );
+    const record = await add(r, { seq: 1 });
+    r.uploader.start();
+    await r.uploader.idle();
+
+    const camera = d.tracks[0].upload;
+    const [put, confirm] = r.env.calls;
+    const body = JSON.parse(String(confirm.body));
+
+    assert.equal(r.env.calls.length, 2);
+    assert.equal(put.method, 'PUT');
+    assert.equal(put.url, camera.direct?.slots?.[0]);
+    assert.equal(put.headers.Authorization, undefined);
+    assert.equal(put.headers['Content-Type'], 'application/octet-stream');
+    assert.equal(put.headers['If-None-Match'], '*');
+    assert.equal(confirm.method, 'POST');
+    assert.equal(confirm.url, `${camera.url}/1/confirm`);
+    assert.match(confirm.headers.Authorization, /^Bearer fvt_/);
+    assert.equal(body.attempt, camera.direct?.attempt);
+    assert.equal(body.slot, 0);
+    assert.equal(body.bytes, record.bytes);
+    assert.equal(body.sha256, record.sha256);
+    assert.equal(body.take, '1');
+    assert.equal(
+        r.events.find(([type]) => type === 'upload.chunk_sent')?.[1].transport,
+        'direct',
+    );
+});
+
+test('a 412 from the bucket means the object is there, so the segment is confirmed and not sent again', async () => {
+    const r = rig({ rung: 'direct', descriptor: fixture('answer-s3') });
+    r.env.respond((call) =>
+        call.url.startsWith(BUCKET) ? json(412) : STORED(),
+    );
+    await add(r, { seq: 1 });
+    r.uploader.start();
+    await r.uploader.idle();
+
+    assert.deepEqual(
+        r.env.calls.map((call) => call.method),
+        ['PUT', 'POST'],
+    );
+});
+
+test('a failed confirm is sent again without a second PUT', async () => {
+    const r = rig({ rung: 'direct', descriptor: fixture('answer-s3') });
+    let confirms = 0;
+    r.env.respond((call) => {
+        if (call.url.startsWith(BUCKET)) {
+            return json(200);
+        }
+
+        confirms += 1;
+
+        return confirms === 1
+            ? json(503, { error: { code: 'server_error', message: 'x' } })
+            : STORED();
+    });
+    await add(r, { seq: 1 });
+    r.uploader.start();
+
+    for (let i = 0; i < 40 && r.env.calls.length < 3; i++) {
+        await r.env.advance(1_000);
+        await settle();
+    }
+
+    await r.uploader.idle();
+    assert.deepEqual(
+        r.env.calls.map((call) => call.method),
+        ['PUT', 'POST', 'POST'],
+    );
+});
+
+test('a 403 from the bucket steps down to the passthrough PUT and reports it', async () => {
+    const d = fixture('answer-s3');
+    const r = rig({ rung: 'direct', descriptor: d });
+    r.env.respond((call) =>
+        call.url.startsWith(BUCKET) ? json(403) : STORED(),
+    );
+    const record = await add(r, { seq: 1 });
+    r.uploader.start();
+    await r.uploader.idle();
+
+    const passthrough = r.env.calls[1];
+
+    assert.equal(passthrough.method, 'PUT');
+    assert.equal(passthrough.url, `${d.tracks[0].upload.fallback_url}/1`);
+    assert.equal(passthrough.headers['X-Fitt-Sha256'], record.sha256);
+    assert.deepEqual(r.ladderEvents, [
+        [
+            'upload.transport_fallback',
+            { from: 'direct', to: 'put', reason: 'proxy' },
+        ],
+    ]);
+    assert.equal(
+        r.events.find(([type]) => type === 'upload.chunk_sent')?.[1].transport,
+        'put',
+    );
+});
+
+test('used-up slots renew the descriptor once before more are sent', async () => {
+    const d = fixture('answer-s3');
+    const original = [...(d.tracks[0].upload.direct?.slots ?? [])];
+    const renewed = renewedS3();
+    const env = fakeEnvironment();
+    let refreshes = 0;
+    const token = createTokenKeeper({
+        env,
+        descriptor: d,
+        refresh: async () => {
+            refreshes += 1;
+
+            return {
+                status: 201,
+                body: { descriptor: JSON.parse(JSON.stringify(renewed)) },
+                networkError: false,
+                timedOut: false,
+            };
+        },
+        onDescriptor: (next) => {
+            d.tracks = next.tracks;
+        },
+        emit: () => {},
+        setError: () => {},
+    });
+    const r = rig({ env, token, rung: 'direct', descriptor: d });
+    r.env.respond((call) =>
+        call.url.startsWith(BUCKET) ? json(200) : STORED(),
+    );
+
+    for (const seq of [1, 2, 3, 4, 5]) {
+        await add(r, { seq });
+    }
+
+    r.uploader.start();
+
+    for (
+        let i = 0;
+        i < 40 &&
+        r.env.calls.filter((call) => call.method === 'PUT').length < 5;
+        i++
+    ) {
+        await r.env.advance(1_000);
+        await settle();
+    }
+
+    await r.uploader.idle();
+    const puts = r.env.calls
+        .filter((call) => call.method === 'PUT')
+        .map((call) => call.url);
+
+    assert.equal(refreshes, 1);
+    assert.deepEqual(puts.slice(0, 4), original);
+    assert.equal(puts[4], renewed.tracks[0].upload.direct!.slots![0]);
+});
+
+test('a resumed session renews its window before its first direct PUT, and never reuses a slot of the stored attempt', async () => {
+    const d = fixture('answer-s3');
+    const stored = [
+        d.tracks[0].upload.direct!.attempt,
+        d.tracks[1].upload.direct!.attempt,
+    ];
+    const renewed = renewedS3();
+    const env = fakeEnvironment();
+    const order: string[] = [];
+    const token = createTokenKeeper({
+        env,
+        descriptor: d,
+        refresh: async () => {
+            order.push('refresh');
+
+            return {
+                status: 201,
+                body: { descriptor: JSON.parse(JSON.stringify(renewed)) },
+                networkError: false,
+                timedOut: false,
+            };
+        },
+        onDescriptor: (next) => {
+            d.tracks = next.tracks;
+        },
+        emit: () => {},
+        setError: () => {},
+    });
+    const r = rig({
+        env,
+        token,
+        rung: 'direct',
+        descriptor: d,
+        staleAttempts: stored,
+    });
+    r.env.respond((call) => {
+        order.push(call.method);
+
+        return call.url.startsWith(BUCKET) ? json(200) : STORED();
+    });
+    await add(r, { seq: 1 });
+    r.uploader.start();
+
+    for (
+        let i = 0;
+        i < 40 && !r.env.calls.some((call) => call.method === 'PUT');
+        i++
+    ) {
+        await r.env.advance(1_000);
+        await settle();
+    }
+
+    await r.uploader.idle();
+    const puts = r.env.calls
+        .filter((call) => call.method === 'PUT')
+        .map((call) => call.url);
+
+    assert.equal(order[0], 'refresh');
+    assert.equal(puts[0], renewed.tracks[0].upload.direct!.slots![0]);
+    assert.equal(
+        puts.some((url) => url.includes(`/direct/${stored[0]}-`)),
+        false,
     );
 });

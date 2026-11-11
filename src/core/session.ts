@@ -36,6 +36,7 @@ import {
 import { createClock, type Clock, type ClockJump } from './clock.ts';
 import {
     readDescriptor,
+    startsDirect,
     type ChunkedTrack,
     type Descriptor,
     type RecordingLimits,
@@ -607,6 +608,20 @@ export function createSession(
     let pendingDescriptors: Descriptor[] = [];
     /** The record was read from the store, not created by this page. */
     let recordExisted = false;
+    /**
+     * The direct window attempts this page received (author's call 10): the
+     * descriptor handed to FittVideo.session() with no stored record, and
+     * every descriptor the token keeper accepted. A resumed or stored window
+     * is not here, so its first direct PUT renews it.
+     */
+    const receivedAttempts = new Set<string>();
+    const receiveWindows = (from: Descriptor): void => {
+        for (const track of from.tracks) {
+            if (track.upload.direct !== undefined) {
+                receivedAttempts.add(track.upload.direct.attempt);
+            }
+        }
+    };
     const runIndexes = new Map<string, number>();
     /** `${track}:${take}` of every manifest posted, for the abandon re-post (author's call 8). */
     const posted = new Set<string>();
@@ -946,7 +961,11 @@ export function createSession(
                 take_open: false,
                 take_end_ms: null,
                 next_batch_seq: 0,
-                ladder_rung: settings.forcePost ? 'post' : 'put',
+                ladder_rung: settings.forcePost
+                    ? 'post'
+                    : startsDirect(descriptor)
+                      ? 'direct'
+                      : 'put',
                 ever_succeeded: false,
                 stop_completed: false,
                 rejected_take: null,
@@ -961,6 +980,11 @@ export function createSession(
                 expires_at_ms: null,
             };
             writeItem(storage, epochKey(sessionId), String(inner.epochMs));
+
+            if (opening === null) {
+                // A newer descriptor over a stored record reaches the keeper's onDescriptor instead.
+                receiveWindows(given);
+            }
         }
 
         localTake = Math.max(record.take, given.take);
@@ -2219,6 +2243,7 @@ export function createSession(
             },
             onDescriptor: (next) => {
                 descriptor = next;
+                receiveWindows(next);
 
                 if (record !== null) {
                     record.descriptor = next;
@@ -2338,6 +2363,7 @@ export function createSession(
                     repost(track, take);
                 }
             },
+            freshAttempt: (attempt) => receivedAttempts.has(attempt),
             currentTake: () => localTake,
             onTakeBehind: (current) => {
                 void adoptTake(current).catch((error: unknown) =>
@@ -2877,6 +2903,8 @@ export function createSession(
             batcher?.stop();
             await writes;
             pendingDescriptors.push(descriptor);
+            // Another tab may use these windows' slots now: renew before any later PUT here.
+            receivedAttempts.clear();
             record = null;
             batcher = null;
             token = null;

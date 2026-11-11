@@ -3,7 +3,7 @@ import type { Descriptor, TrackName } from '../../src/core/descriptor.ts';
 import type { Environment } from '../../src/core/env.ts';
 import { createLadder } from '../../src/core/ladder.ts';
 import { createQueue } from '../../src/core/queue.ts';
-import type { SegmentRecord } from '../../src/core/store.ts';
+import type { SegmentRecord, Transport } from '../../src/core/store.ts';
 import { MemoryQueueStore } from '../../src/core/store.ts';
 import type { TokenKeeper } from '../../src/core/token.ts';
 import { createTokenKeeper } from '../../src/core/token.ts';
@@ -63,6 +63,10 @@ export interface RigOptions {
     descriptor?: Descriptor;
     currentTake?: number;
     abandonAfterMs?: number;
+    /** The ladder's first rung; default 'put'. */
+    rung?: Transport;
+    /** Direct attempts the uploader is told this page did not receive; default none. */
+    staleAttempts?: string[];
 }
 
 /** An uploader over a memory store and a fake environment, with everything it reports collected. */
@@ -75,13 +79,15 @@ export function rig(options: RigOptions = {}) {
         budgetBytes: 209_715_200,
         perfNow: () => env.perfNow(),
     });
+    const ladderEvents: [string, Record<string, unknown>][] = [];
     const ladder = createLadder({
-        rung: 'put',
+        rung: options.rung ?? 'put',
         everSucceeded: false,
         forcePost: options.forcePost,
         persist: async () => {},
-        emit: () => {},
+        emit: (type, payload) => ladderEvents.push([type, payload]),
     });
+    const stale = new Set(options.staleAttempts ?? []);
     const events: [string, Record<string, unknown>][] = [];
     const abandoned: TrackName[] = [];
     const behind: number[] = [];
@@ -99,9 +105,20 @@ export function rig(options: RigOptions = {}) {
         currentTake: () => options.currentTake ?? 1,
         onTakeBehind: (take) => behind.push(take),
         warn: (message) => warnings.push(message),
+        freshAttempt: (attempt) => !stale.has(attempt),
     });
 
-    return { env, store, queue, uploader, events, abandoned, behind, warnings };
+    return {
+        env,
+        store,
+        queue,
+        uploader,
+        events,
+        ladderEvents,
+        abandoned,
+        behind,
+        warnings,
+    };
 }
 
 export type Rig = ReturnType<typeof rig>;

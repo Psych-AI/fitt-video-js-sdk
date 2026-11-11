@@ -1,12 +1,13 @@
 import { backoffMs } from './backoff.ts';
 import { sha256Hex } from './crypto.ts';
 import type { DescriptorTrack, TrackName } from './descriptor.ts';
+import { createDirectSlots, RENEW_GAP_MS } from './direct.ts';
 import type { Environment } from './env.ts';
 import { send } from './http.ts';
 import type { FailureKind, Ladder } from './ladder.ts';
 import { partCount, partsOf } from './parts.ts';
 import type { Queue } from './queue.ts';
-import { classify } from './responses.ts';
+import { classify, classifyDirect } from './responses.ts';
 import type {
     QueueStore,
     SegmentKey,
@@ -15,7 +16,7 @@ import type {
 } from './store.ts';
 import type { TokenKeeper } from './token.ts';
 import type { SegmentMeta, TokenRef, WireRequest } from './wire.ts';
-import { segmentPost, segmentPut } from './wire.ts';
+import { directPut, segmentConfirm, segmentPost, segmentPut } from './wire.ts';
 
 /**
  * The uploader (author's call 8): one lane per track, each sending its
@@ -23,6 +24,12 @@ import { segmentPost, segmentPut } from './wire.ts';
  * by the queue's age or budget rules, never by its failure count. Every
  * store write is conditional on the record still being pending, so an
  * answer that lands after the sweep abandoned a record writes nothing back.
+ *
+ * On the direct rung (Plan 8) a whole segment is PUT to a slot of its
+ * track's window with no token (author's calls 1 and 2), then confirmed to
+ * the API with the token; the confirm's answer is read as a passthrough
+ * answer. A window that cannot serve a segment is renewed through the token
+ * keeper, at most once per RENEW_GAP_MS per track (author's call 10).
  */
 export interface UploadStats {
     bytesSent: number;
@@ -61,6 +68,8 @@ export interface UploaderDeps {
     onTakeBehind(currentTake: number): void;
     /** console.warn in the browser (the local_corrupt warning). */
     warn(message: string): void;
+    /** True when this page received the direct window of `attempt` (author's call 10); default never, so every window is renewed before use. */
+    freshAttempt?(attempt: string): boolean;
 }
 
 /** Segments of one track sent at the same time. */
@@ -107,6 +116,11 @@ interface Lane {
 }
 
 type Outcome = 'remove' | 'keep';
+
+/** A segment's key among the direct slots. */
+function directKeyOf(key: SegmentKey): string {
+    return `${key.track}:${key.take}:${key.run_index}:${key.seq}`;
+}
 
 function keyOf(record: SegmentKey): SegmentKey {
     return {
@@ -247,6 +261,14 @@ export function createUploader(deps: UploaderDeps): Uploader {
     let bytesSent = 0;
     let tickTimer: number | null = null;
     let sweeping: Promise<void> | null = null;
+    const slots = createDirectSlots({
+        tracks: deps.tracks,
+        dateNow: () => env.dateNow(),
+        receivedAt: () => token.receivedAt(),
+        fresh: (attempt) => deps.freshAttempt?.(attempt) ?? false,
+    });
+    /** env.perfNow() of each track's last window renewal. */
+    const renewedAt = new Map<TrackName, number>();
 
     /** One controller for the whole uploader: stop() aborts every request still out. */
     const stopping = new AbortController();
@@ -396,10 +418,10 @@ export function createUploader(deps: UploaderDeps): Uploader {
             token.ready().then(end, end);
         });
 
-    /** The segment URL (always the passthrough URL, author's call 9) and the part size of a track. */
+    /** The segment URL (always the passthrough URL, author's call 9), the part size and the confirm URL of a track. */
     const targetOf = (
         track: TrackName,
-    ): { url: string; partSize: number } | null => {
+    ): { url: string; partSize: number; confirmUrl: string | null } | null => {
         const found = deps
             .tracks()
             .find((candidate) => candidate.track === track);
@@ -411,7 +433,43 @@ export function createUploader(deps: UploaderDeps): Uploader {
         return {
             url: found.upload.fallback_url ?? found.upload.url,
             partSize: found.segments.part_size,
+            confirmUrl: found.upload.confirm_url ?? null,
         };
+    };
+
+    /** True when the segment goes to the bucket now: the direct rung, and a track with a direct window and a confirm URL. */
+    const sendsDirect = (track: TrackName): boolean => {
+        if (ladder.rung() !== 'direct') {
+            return false;
+        }
+
+        const found = deps
+            .tracks()
+            .find((candidate) => candidate.track === track);
+
+        return (
+            found?.upload.direct !== undefined &&
+            found.upload.confirm_url !== undefined
+        );
+    };
+
+    /** Waits out the track's renewal gap, then renews its window once. */
+    const renewWindow = async (lane: Lane, entry: Entry): Promise<void> => {
+        const restMs =
+            (renewedAt.get(lane.track) ?? Number.NEGATIVE_INFINITY) +
+            RENEW_GAP_MS -
+            env.perfNow();
+
+        if (restMs > 0) {
+            await sleep(entry, restMs, 'backoff');
+
+            return;
+        }
+
+        renewedAt.set(lane.track, env.perfNow());
+        await waitFor(entry, 'token', (end) => {
+            token.renew().then(end, end);
+        });
     };
 
     const requestFor = async (
@@ -445,6 +503,9 @@ export function createUploader(deps: UploaderDeps): Uploader {
 
         let parts: AsyncGenerator<Part> | null = null;
         let part: Part | null = null;
+        /** The part was cut for the direct rung: always the whole segment (author's call 2). */
+        let partDirect = false;
+        const directKey = directKeyOf(entry.key);
         let lastStartMs = Number.NEGATIVE_INFINITY;
         let sentMs = 0;
 
@@ -520,7 +581,9 @@ export function createUploader(deps: UploaderDeps): Uploader {
 
             if (part === null) {
                 const data = record.data as ArrayBuffer;
+                partDirect = sendsDirect(lane.track);
                 parts =
+                    !partDirect &&
                     partCount(data.byteLength, target.partSize) > 1
                         ? partsOf(data, target.partSize)
                         : null;
@@ -553,14 +616,168 @@ export function createUploader(deps: UploaderDeps): Uploader {
             }
 
             const rung = ladder.rung();
-            const used = token.current();
-            const request = await requestFor(
-                rung,
-                target.url,
-                used,
-                record,
-                part,
-            );
+            const direct = sendsDirect(lane.track);
+
+            if (direct !== partDirect) {
+                // The ladder stepped down, or the window came or went: cut again for this rung.
+                part = null;
+                slots.release(directKey);
+
+                continue;
+            }
+
+            let request: WireRequest;
+            let used = token.current();
+
+            if (direct) {
+                const slot = slots.slotFor(
+                    lane.track,
+                    directKey,
+                    record.take,
+                    record.sha256,
+                );
+
+                if (slot === 'renew') {
+                    await renewWindow(lane, entry);
+
+                    continue;
+                }
+
+                if (slot === 'none') {
+                    part = null;
+
+                    continue;
+                }
+
+                if (!slots.uploaded(directKey)) {
+                    const startedAtMs = env.perfNow();
+                    lastStartMs = startedAtMs;
+                    const answer = await tracked(
+                        flights,
+                        send(
+                            sendEnv,
+                            directPut(
+                                slot.url,
+                                slot.headers,
+                                record.data as ArrayBuffer,
+                            ),
+                            SEND_TIMEOUT_MS,
+                        ),
+                    );
+                    const endedAtMs = env.perfNow();
+
+                    if (gone()) {
+                        return 'remove';
+                    }
+
+                    const current = await store.getSegment(entry.key);
+
+                    if (
+                        gone() ||
+                        current === undefined ||
+                        current.state !== 'pending'
+                    ) {
+                        return 'remove';
+                    }
+
+                    record = current;
+                    const verdict = classifyDirect(answer);
+                    const attempt = { startedAtMs, endedAtMs, rung };
+
+                    if (verdict.kind === 'ok') {
+                        ladder.success();
+                        sentMs += endedAtMs - startedAtMs;
+                        slots.markUploaded(directKey);
+                    } else if (verdict.kind === 'step_down') {
+                        if (
+                            ladder.failure(verdict.reason, true, attempt) ||
+                            ladder.rung() !== rung
+                        ) {
+                            // Bounded: the ladder moves only once per change, and never back up.
+                            part = null;
+                            slots.release(directKey);
+                            lastStartMs = Number.NEGATIVE_INFINITY;
+
+                            continue;
+                        }
+
+                        if (
+                            !(await retryLater(
+                                `http_${answer.status}`,
+                                undefined,
+                                'backoff',
+                            ))
+                        ) {
+                            return 'remove';
+                        }
+
+                        continue;
+                    } else {
+                        const code =
+                            verdict.kind === 'retry'
+                                ? verdict.code
+                                : `http_${answer.status}`;
+                        const network =
+                            code === 'network' || code === 'timeout';
+
+                        if (network) {
+                            ladder.failure('network', env.online(), {
+                                ...attempt,
+                                timedOut: answer.timedOut,
+                            });
+                        }
+
+                        if (
+                            !(await retryLater(
+                                code,
+                                verdict.kind === 'retry'
+                                    ? verdict.waitMs
+                                    : undefined,
+                                network ? 'network' : 'backoff',
+                            ))
+                        ) {
+                            return 'remove';
+                        }
+
+                        continue;
+                    }
+
+                    await whenTokenReady(entry);
+
+                    if (gone()) {
+                        return 'remove';
+                    }
+
+                    used = token.current();
+                }
+
+                const confirmUrl = targetOf(lane.track)?.confirmUrl ?? null;
+
+                if (confirmUrl === null) {
+                    part = null;
+
+                    continue;
+                }
+
+                request = segmentConfirm(
+                    confirmUrl,
+                    used,
+                    metaOf(record, part),
+                    {
+                        attempt: slot.attempt,
+                        slot: slot.slot,
+                        bytes: record.bytes,
+                    },
+                );
+            } else {
+                request = await requestFor(
+                    rung,
+                    target.url,
+                    used,
+                    record,
+                    part,
+                );
+            }
 
             if (gone()) {
                 return 'remove';
@@ -648,6 +865,7 @@ export function createUploader(deps: UploaderDeps): Uploader {
                     return 'remove';
                 }
 
+                slots.release(directKey);
                 bytesSent += written.bytes;
                 deps.emit('upload.chunk_sent', {
                     ...report,
@@ -691,6 +909,15 @@ export function createUploader(deps: UploaderDeps): Uploader {
                     deps.onAbandon(lane.track, written.take);
 
                     return 'remove';
+                }
+
+                if (
+                    rung === 'direct' &&
+                    (verdict.code === 'hash_mismatch' ||
+                        verdict.code === 'size_mismatch')
+                ) {
+                    // The object in the bucket is not the segment: PUT it again, to a fresh slot.
+                    slots.markNotUploaded(directKey);
                 }
 
                 const network =
@@ -822,6 +1049,7 @@ export function createUploader(deps: UploaderDeps): Uploader {
 
                 if (outcome === 'remove') {
                     removeEntry(lane, entry);
+                    slots.release(directKeyOf(entry.key));
                 }
 
                 pump(lane);
