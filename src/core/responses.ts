@@ -112,3 +112,36 @@ export function classify(answer: WireAnswer): Verdict {
 
     return { kind: 'retry', code: `http_${status}` };
 }
+
+/**
+ * Reads the bucket's answer to a direct PUT (Plan 8). The bucket never sends
+ * the Fitt envelope: 2xx stored it, 412 means `If-None-Match: *` found the
+ * object already there (author's call 5), so both go on to the confirm. A 403
+ * or 405 is a bucket or proxy refusing the rung, so it steps down (author's
+ * call 10); everything else is sent again.
+ */
+export function classifyDirect(answer: WireAnswer): Verdict {
+    const { status } = answer;
+
+    if (answer.networkError || status === 0) {
+        return { kind: 'retry', code: answer.timedOut ? 'timeout' : 'network' };
+    }
+
+    if (status >= 200 && status < 300) {
+        return { kind: 'ok', code: 'uploaded' };
+    }
+
+    if (status === 412) {
+        return { kind: 'ok', code: 'already_uploaded' };
+    }
+
+    if (status === 405) {
+        return { kind: 'step_down', reason: 'method' };
+    }
+
+    if (status === 403) {
+        return { kind: 'step_down', reason: 'proxy' };
+    }
+
+    return { kind: 'retry', code: `http_${status}` };
+}

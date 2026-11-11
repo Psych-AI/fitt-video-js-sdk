@@ -180,6 +180,47 @@ export async function segmentPost(
     };
 }
 
+/**
+ * The direct rung's PUT straight to a slot in the bucket (Plan 8): exactly the
+ * slot's headers, so no Authorization and no X-Fitt-* header ever reaches the
+ * bucket. The token goes only to the confirm.
+ */
+export function directPut(
+    url: string,
+    headers: Record<string, string>,
+    body: ArrayBuffer,
+): WireRequest {
+    return { method: 'PUT', url, headers: { ...headers }, body };
+}
+
+/**
+ * The confirm of one direct PUT: `confirmUrl` with `{seq}` replaced, the
+ * canonical fields as strings (whole segments only, so never a part), plus
+ * the object's `bytes` and the `attempt` and `slot` it was PUT to. The server
+ * rebuilds the key from them (author's call 1).
+ */
+export function segmentConfirm(
+    confirmUrl: string,
+    token: TokenRef,
+    meta: SegmentMeta,
+    direct: { attempt: string; slot: number; bytes: number },
+): WireRequest {
+    const body: Record<string, string | number> = Object.fromEntries(
+        fields(meta),
+    );
+
+    body.bytes = direct.bytes;
+    body.attempt = direct.attempt;
+    body.slot = direct.slot;
+
+    return jsonRequest(
+        confirmUrl.replace('{seq}', decimal(meta.seq)),
+        token,
+        'POST',
+        body,
+    );
+}
+
 /** A JSON call with the bearer: Accept always, Content-Type and the JSON body when a body is given. */
 export function jsonRequest(
     url: string,
