@@ -43,7 +43,11 @@ export interface DirectSlots {
     /** The PUT of this segment answered 2xx or 412: a retry only confirms again. */
     markUploaded(key: string): void;
     uploaded(key: string): boolean;
-    /** A size_mismatch: the next attempt PUTs again, to the same slot. */
+    /**
+     * A size_mismatch or hash_mismatch: the next attempt PUTs again, to a
+     * fresh slot. The failed object stays in its slot, and `If-None-Match: *`
+     * would answer 412 to any PUT there, so the same slot never succeeds.
+     */
     markNotUploaded(key: string): void;
     /** The segment is delivered or given up. */
     release(key: string): void;
@@ -116,7 +120,7 @@ export function createDirectSlots(deps: DirectSlotsDeps): DirectSlots {
             // An uploaded object only needs its confirm, which names the
             // attempt and slot it went to, so it keeps them across a renewal.
             // Its URL is empty once its window is gone: it is never PUT again
-            // unless markNotUploaded() hands it a new slot.
+            // unless markNotUploaded() frees it for a new slot.
             if (held !== undefined && done.has(key)) {
                 const same =
                     held.attempt === direct.attempt
@@ -174,6 +178,7 @@ export function createDirectSlots(deps: DirectSlotsDeps): DirectSlots {
         },
         markNotUploaded(key) {
             done.delete(key);
+            assigned.delete(key);
         },
         release(key) {
             assigned.delete(key);

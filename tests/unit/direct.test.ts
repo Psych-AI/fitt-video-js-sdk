@@ -185,3 +185,27 @@ test('the confirm names the slot and the bytes, and an uploaded segment keeps it
     assert.equal(again.attempt, '01jbz8q4w6x0k3m5n7p9r2t4zz');
     assert.equal(again.url, camera.direct.slots![0]);
 });
+
+test('a segment the confirm refused is PUT again to a fresh slot of the same window, never to the slot that holds the refused object', () => {
+    const d = fixture('answer-s3');
+    const slots = createDirectSlots({
+        tracks: () => d.tracks,
+        dateNow: () => 0,
+        receivedAt: () => 0,
+        fresh: () => true,
+    });
+    const first = slots.slotFor('camera', 'a', 1, SHA) as DirectSlot;
+
+    slots.markUploaded('a');
+    slots.markNotUploaded('a');
+
+    assert.equal(slots.uploaded('a'), false);
+    const again = slots.slotFor('camera', 'a', 1, SHA) as DirectSlot;
+    assert.equal(again.attempt, first.attempt);
+    assert.notEqual(again.slot, first.slot);
+    assert.equal(again.slot, 1);
+    assert.equal(
+        (slots.slotFor('camera', 'a', 1, SHA) as DirectSlot).slot,
+        again.slot,
+    );
+});
