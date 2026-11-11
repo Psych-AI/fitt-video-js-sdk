@@ -6,7 +6,7 @@ import type { Descriptor, TrackName } from './descriptor.ts';
  * The local queue's storage (spec 6.3): one interface with an IndexedDB
  * store and a memory store. Bytes are kept as ArrayBuffer, never Blob.
  */
-export type Transport = 'put' | 'post';
+export type Transport = 'direct' | 'put' | 'post';
 export type RunEndedReason =
     | 'stop'
     | 'reload'

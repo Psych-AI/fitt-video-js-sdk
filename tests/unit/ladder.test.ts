@@ -201,3 +201,52 @@ test('on the POST rung a 405 or a proxy 403 changes nothing and returns false', 
         ['post', false, []],
     );
 });
+
+test('the direct rung steps down to the PUT, then to the POST, and never back up', () => {
+    const { ladder, persisted, events } = rig({
+        rung: 'direct',
+        everSucceeded: true,
+    });
+
+    assert.equal(fail(ladder, 'proxy'), true);
+    assert.equal(ladder.rung(), 'put');
+    assert.equal(fail(ladder, 'method'), true);
+    assert.equal(ladder.rung(), 'post');
+    ladder.success();
+    assert.equal(ladder.rung(), 'post');
+    assert.deepEqual(events, [
+        [
+            'upload.transport_fallback',
+            { from: 'direct', to: 'put', reason: 'proxy' },
+        ],
+        [
+            'upload.transport_fallback',
+            { from: 'put', to: 'post', reason: 'method' },
+        ],
+    ]);
+    assert.deepEqual(
+        persisted.map(([rung]) => rung),
+        ['put', 'post'],
+    );
+});
+
+test('two online network errors in a row on the direct rung step down to the PUT', () => {
+    const { ladder, events } = rig({ rung: 'direct' });
+
+    assert.equal(fail(ladder, 'network'), false);
+    assert.equal(fail(ladder, 'network'), true);
+    assert.equal(ladder.rung(), 'put');
+    assert.deepEqual(events, [
+        [
+            'upload.transport_fallback',
+            { from: 'direct', to: 'put', reason: 'network' },
+        ],
+    ]);
+});
+
+test('forcePost wins over a direct start', () => {
+    assert.equal(
+        rig({ rung: 'direct', forcePost: true }).ladder.rung(),
+        'post',
+    );
+});

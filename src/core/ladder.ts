@@ -3,9 +3,10 @@ import type { Transport } from './store.ts';
 /**
  * The transport ladder (author's call 9). A refused origin and a blocked
  * preflight both look like an offline TypeError to a page, so the ladder
- * steps down from the PUT to the preflight-free signed POST after 2 online
- * network errors in a row, at once on a 405 or a proxy 403, and never steps
- * back up. `network_blocked` is not terminal: it is set at once on a
+ * steps down one rung after 2 online network errors in a row, or at once on
+ * a 405 or a proxy 403, and never steps back up. The rungs are the direct
+ * PUT to the bucket (Plan 8, author's call 10), then the passthrough PUT,
+ * then the preflight-free signed POST. `network_blocked` is not terminal: it is set at once on a
  * readable `403 origin_not_allowed`, or when the POST rung fails the same
  * way and no request of the session has ever succeeded.
  */
@@ -40,7 +41,7 @@ export interface LadderOptions {
     onUnblocked?(): void;
 }
 
-/** Failures in a row that step down from the PUT, or set blocked on the POST rung. */
+/** Failures in a row that step down one rung, or set blocked on the POST rung. */
 const IN_A_ROW = 2;
 
 export function createLadder(options: LadderOptions): Ladder {
@@ -70,11 +71,12 @@ export function createLadder(options: LadderOptions): Ladder {
     };
 
     const stepDown = (reason: 'network' | 'method' | 'proxy'): boolean => {
-        rung = 'post';
+        const from = rung;
+        rung = from === 'direct' ? 'put' : 'post';
         count = 0;
         options.emit('upload.transport_fallback', {
-            from: 'put',
-            to: 'post',
+            from,
+            to: rung,
             reason,
         });
         persist();
@@ -120,7 +122,7 @@ export function createLadder(options: LadderOptions): Ladder {
             }
 
             if (kind === 'method' || kind === 'proxy') {
-                if (rung === 'put') {
+                if (rung !== 'post') {
                     return stepDown(kind);
                 }
             } else if (!online || attempt.timedOut === true) {
@@ -132,7 +134,7 @@ export function createLadder(options: LadderOptions): Ladder {
                 return false;
             }
 
-            if (rung === 'put') {
+            if (rung !== 'post') {
                 return stepDown('network');
             }
 

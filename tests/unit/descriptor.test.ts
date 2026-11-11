@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import {
     readDescriptor,
+    startsDirect,
     type ChunkedTrack,
 } from '../../src/core/descriptor.ts';
 
@@ -141,4 +142,52 @@ test('readDescriptor returns a plain copy, never the host object: a reactive Pro
         result.descriptor.token.secret,
         fixture('answer').token.secret,
     );
+});
+
+test('a direct descriptor reads its confirm URL and its slots or its signed base', () => {
+    for (const name of ['answer-s3', 'answer-cloudfront']) {
+        const result = readDescriptor(fixture(name));
+        assert.ok(result.ok, name);
+        assert.equal(startsDirect(result.descriptor), true);
+    }
+
+    const passthrough = readDescriptor(fixture('answer'));
+    assert.ok(passthrough.ok);
+    assert.equal(startsDirect(passthrough.descriptor), false);
+});
+
+test('a direct block names what is wrong with it', () => {
+    const noSlots = fixture('answer-s3');
+    delete noSlots.tracks[0].upload.direct.slots;
+    const both = fixture('answer-cloudfront');
+    both.tracks[0].upload.direct.slots = ['https://x.test/a'];
+    const badAttempt = fixture('answer-s3');
+    badAttempt.tracks[1].upload.direct.attempt = 'NOT-A-ULID';
+    const noConfirm = fixture('answer-s3');
+    noConfirm.tracks[0].upload.confirm_url = 'https://x.test/confirm';
+
+    assert.deepEqual(readDescriptor(noSlots), {
+        ok: false,
+        code: 'config_invalid',
+        path: 'tracks.0.upload.direct.slots',
+        reason: 'missing',
+    });
+    assert.deepEqual(readDescriptor(both), {
+        ok: false,
+        code: 'config_invalid',
+        path: 'tracks.0.upload.direct.slots',
+        reason: 'type',
+    });
+    assert.deepEqual(readDescriptor(badAttempt), {
+        ok: false,
+        code: 'config_invalid',
+        path: 'tracks.1.upload.direct.attempt',
+        reason: 'type',
+    });
+    assert.deepEqual(readDescriptor(noConfirm), {
+        ok: false,
+        code: 'config_invalid',
+        path: 'tracks.0.upload.confirm_url',
+        reason: 'type',
+    });
 });

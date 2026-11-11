@@ -16,7 +16,7 @@ test('the hosted module imports cross-origin, reports its version and defines fi
         };
     }, 'http://127.0.0.1:8123/sdk/v1/fitt-video.js');
 
-    expect(loaded).toEqual({ version: '1.1.0', element: 'function' });
+    expect(loaded).toEqual({ version: '1.2.0', element: 'function' });
 });
 
 test('a Bearer GET from an allowed origin gets a readable status', async ({

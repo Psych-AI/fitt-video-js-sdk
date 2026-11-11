@@ -6,10 +6,29 @@
 export type Recipe = 'answer' | 'monitor' | 'conversation' | 'file';
 export type TrackName = 'camera' | 'audio' | 'screen' | 'upload';
 
+/**
+ * The block a direct driver adds (Plan 8, author's call 1): the take and a
+ * fresh attempt the slots belong to, how long the URLs live, the headers a
+ * direct PUT sends, and either one presigned URL per slot (`s3`, `oss`) or
+ * one signed base and query over the take's direct prefix (`cloudfront`).
+ */
+export interface DirectUpload {
+    take: number;
+    attempt: string;
+    expires_in_s: number;
+    headers: Record<string, string>;
+    content_sha256: boolean;
+    slots?: string[];
+    base?: string;
+    query?: string;
+}
+
 export interface UploadTarget {
     mode: string;
     url: string;
     fallback_url: string | null;
+    confirm_url?: string;
+    direct?: DirectUpload;
 }
 
 export interface ChunkedTrack {
@@ -92,6 +111,8 @@ const RECIPES: readonly string[] = [
 ];
 const CHUNKED_TRACKS: readonly string[] = ['camera', 'audio', 'screen'];
 const VIDEO_TRACKS: readonly string[] = ['camera', 'screen'];
+/** A lower-case ULID, as the server mints an attempt. */
+const ATTEMPT = /^[0-9a-z]{26}$/;
 
 /** Thrown inside the reader only, and always caught there. */
 class Invalid {
@@ -202,12 +223,87 @@ function integers(
     return value;
 }
 
+function boolean(parent: Value, key: string, path: string): boolean {
+    const value = present(parent, key, path);
+
+    if (typeof value !== 'boolean') {
+        throw new Invalid(join(path, key), 'type');
+    }
+
+    return value;
+}
+
+/** An object whose every value is a string (header values may be empty). */
+function stringMap(parent: Value, key: string, path: string): void {
+    const value = object(parent, key, path);
+
+    for (const [name, item] of Object.entries(value)) {
+        if (typeof item !== 'string') {
+            throw new Invalid(join(join(path, key), name), 'type');
+        }
+    }
+}
+
+/** Either `slots` (a non-empty list of URLs) or both `base` and `query`, never both and never neither. */
+function readAuthorisation(direct: Value, path: string): void {
+    const hasSlots = direct.slots !== undefined;
+    const hasBase = direct.base !== undefined || direct.query !== undefined;
+
+    if (hasSlots === hasBase) {
+        throw new Invalid(join(path, 'slots'), hasSlots ? 'type' : 'missing');
+    }
+
+    if (!hasSlots) {
+        string(direct, 'base', path);
+        string(direct, 'query', path);
+
+        return;
+    }
+
+    const slots = direct.slots;
+
+    if (!Array.isArray(slots) || slots.length === 0) {
+        throw new Invalid(join(path, 'slots'), 'type');
+    }
+
+    slots.forEach((slot: unknown, index) => {
+        if (typeof slot !== 'string' || slot === '') {
+            throw new Invalid(join(join(path, 'slots'), index), 'type');
+        }
+    });
+}
+
+function readDirect(upload: Value, path: string): void {
+    const confirm = string(upload, 'confirm_url', path);
+
+    if (!confirm.includes('{seq}')) {
+        throw new Invalid(join(path, 'confirm_url'), 'type');
+    }
+
+    const direct = object(upload, 'direct', path);
+    const directPath = join(path, 'direct');
+    integer(direct, 'take', directPath);
+
+    if (!ATTEMPT.test(string(direct, 'attempt', directPath))) {
+        throw new Invalid(join(directPath, 'attempt'), 'type');
+    }
+
+    integer(direct, 'expires_in_s', directPath);
+    stringMap(direct, 'headers', directPath);
+    boolean(direct, 'content_sha256', directPath);
+    readAuthorisation(direct, directPath);
+}
+
 function readUpload(track: Value, path: string): void {
     const upload = object(track, 'upload', path);
     const uploadPath = join(path, 'upload');
-    string(upload, 'mode', uploadPath);
+    const mode = string(upload, 'mode', uploadPath);
     string(upload, 'url', uploadPath);
     nullableString(upload, 'fallback_url', uploadPath);
+
+    if (mode !== 'passthrough') {
+        readDirect(upload, uploadPath);
+    }
 }
 
 /** Reads one track and says whether it is chunked. */
@@ -355,6 +451,18 @@ function read(input: unknown): Descriptor {
     // persist. A descriptor is JSON by contract, so a JSON round trip is the
     // exact copy and also detaches the SDK from later edits by the host.
     return JSON.parse(JSON.stringify(input)) as Descriptor;
+}
+
+/** True when every track uploads straight to the bucket (Plan 8, author's call 10). */
+export function startsDirect(descriptor: Descriptor): boolean {
+    const chunked = descriptor.tracks.filter(
+        (track): track is ChunkedTrack => track.kind === 'chunked',
+    );
+
+    return (
+        chunked.length > 0 &&
+        chunked.every((track) => track.upload.direct !== undefined)
+    );
 }
 
 /** Never throws. */
