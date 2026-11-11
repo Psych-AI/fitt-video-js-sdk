@@ -437,8 +437,14 @@ export function createUploader(deps: UploaderDeps): Uploader {
         };
     };
 
-    /** True when the segment goes to the bucket now: the direct rung, and a track with a direct window and a confirm URL. */
-    const sendsDirect = (track: TrackName): boolean => {
+    /**
+     * True when the segment goes to the bucket now: the direct rung, and a
+     * track with a direct window and a confirm URL. A window this page
+     * received whose take is above the segment's take carries the server's
+     * take already, so no renewal can serve that segment: it goes on the
+     * passthrough PUT, which answers stale_take as on the PUT rung.
+     */
+    const sendsDirect = (track: TrackName, take: number): boolean => {
         if (ladder.rung() !== 'direct') {
             return false;
         }
@@ -446,10 +452,15 @@ export function createUploader(deps: UploaderDeps): Uploader {
         const found = deps
             .tracks()
             .find((candidate) => candidate.track === track);
+        const held = found?.upload.direct;
 
-        return (
-            found?.upload.direct !== undefined &&
-            found.upload.confirm_url !== undefined
+        if (held === undefined || found?.upload.confirm_url === undefined) {
+            return false;
+        }
+
+        return !(
+            held.take > take &&
+            (deps.freshAttempt?.(held.attempt) ?? false)
         );
     };
 
@@ -581,7 +592,7 @@ export function createUploader(deps: UploaderDeps): Uploader {
 
             if (part === null) {
                 const data = record.data as ArrayBuffer;
-                partDirect = sendsDirect(lane.track);
+                partDirect = sendsDirect(lane.track, record.take);
                 parts =
                     !partDirect &&
                     partCount(data.byteLength, target.partSize) > 1
@@ -616,7 +627,13 @@ export function createUploader(deps: UploaderDeps): Uploader {
             }
 
             const rung = ladder.rung();
-            const direct = sendsDirect(lane.track);
+            const direct = sendsDirect(lane.track, record.take);
+            // The rung this request goes out on: the passthrough PUT while the
+            // ladder is on 'direct' but this segment cannot go to the bucket.
+            // A failure is still reported to the ladder on its own rung, so a
+            // refused PUT steps it down (direct to put, then put to post).
+            const sendRung: Transport =
+                rung === 'direct' && !direct ? 'put' : rung;
 
             if (direct !== partDirect) {
                 // The ladder stepped down, or the window came or went: cut again for this rung.
@@ -771,7 +788,7 @@ export function createUploader(deps: UploaderDeps): Uploader {
                 );
             } else {
                 request = await requestFor(
-                    rung,
+                    sendRung,
                     target.url,
                     used,
                     record,
@@ -870,7 +887,7 @@ export function createUploader(deps: UploaderDeps): Uploader {
                 deps.emit('upload.chunk_sent', {
                     ...report,
                     bytes: written.bytes,
-                    transport: rung,
+                    transport: sendRung,
                     ms: Math.round(sentMs),
                 });
 
@@ -912,7 +929,7 @@ export function createUploader(deps: UploaderDeps): Uploader {
                 }
 
                 if (
-                    rung === 'direct' &&
+                    direct &&
                     (verdict.code === 'hash_mismatch' ||
                         verdict.code === 'size_mismatch')
                 ) {

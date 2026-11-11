@@ -452,3 +452,52 @@ test('a resumed session renews its window before its first direct PUT, and never
         false,
     );
 });
+
+test('on the direct rung a track with no direct window sends its segment on the passthrough PUT and reports put', async () => {
+    const d = fixture('answer-s3');
+    delete d.tracks[0].upload.direct;
+    delete d.tracks[0].upload.confirm_url;
+    const r = rig({ rung: 'direct', descriptor: d });
+    r.env.respond(() => STORED());
+    const record = await add(r, { seq: 1 });
+    r.uploader.start();
+    await r.uploader.idle();
+
+    assert.equal(r.env.calls.length, 1);
+    assert.equal(r.env.calls[0].method, 'PUT');
+    assert.equal(r.env.calls[0].url, `${d.tracks[0].upload.fallback_url}/1`);
+    assert.equal(r.env.calls[0].headers['X-Fitt-Sha256'], record.sha256);
+    assert.deepEqual(r.ladderEvents, []);
+    assert.equal(
+        r.events.find(([type]) => type === 'upload.chunk_sent')?.[1].transport,
+        'put',
+    );
+});
+
+test('a segment of a take older than its received window goes on the passthrough PUT, so stale_take reaches it with no renewal', async () => {
+    const d = fixture('answer-s3');
+    d.tracks[0].upload.direct!.take = 2;
+    const r = rig({ rung: 'direct', descriptor: d });
+    r.env.respond((call) =>
+        call.url.startsWith(BUCKET)
+            ? json(200)
+            : json(409, {
+                  error: { code: 'stale_take', message: 'x', current_take: 2 },
+              }),
+    );
+    await add(r, { seq: 1 });
+    r.uploader.start();
+
+    for (let i = 0; i < 40 && r.behind.length === 0; i++) {
+        await r.env.advance(1_000);
+        await settle();
+    }
+
+    assert.equal(r.env.calls[0].method, 'PUT');
+    assert.equal(r.env.calls[0].url, `${d.tracks[0].upload.fallback_url}/1`);
+    assert.equal(
+        r.env.calls.some((call) => call.url.startsWith(BUCKET)),
+        false,
+    );
+    assert.deepEqual(r.behind, [2]);
+});
