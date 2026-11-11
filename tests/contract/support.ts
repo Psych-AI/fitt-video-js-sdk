@@ -6,13 +6,14 @@ export const API = 'http://127.0.0.1:8123/api/v1';
 
 const PROXY = 'http://127.0.0.1:8125';
 
-/** Creates an `answer` session with a space key (the contract space's by default). */
+/** Creates an `answer` session with a space key (the contract space's by default), on the passthrough server unless `api` names another. */
 export async function createSession(
     request: APIRequestContext,
     body: Record<string, unknown> = {},
     key: string | undefined = process.env.FITT_CONTRACT_KEY,
+    api: string = API,
 ): Promise<{ descriptor: Descriptor; session: { id: string } }> {
-    const response = await request.post(`${API}/sessions`, {
+    const response = await request.post(`${api}/sessions`, {
         headers: { Authorization: `Bearer ${key}`, Accept: 'application/json' },
         data: { recipe: 'answer', tags: ['sdk-contract'], ...body },
     });

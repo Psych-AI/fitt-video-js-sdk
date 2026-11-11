@@ -1,15 +1,18 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { CONTRACT_ENV, REPO_ROOT } from './env.ts';
+import { CONTRACT_DIRECT_ENV, CONTRACT_ENV, REPO_ROOT } from './env.ts';
 import { assertTestingDatabase } from './guard.ts';
 import { videoDirNames } from './video-dirs.ts';
 
 export const VIDEO_DIR = `${REPO_ROOT}storage/app/private/videos`;
 
-function artisan(args: string[]): string {
+function artisan(
+    args: string[],
+    env: Record<string, string> = CONTRACT_ENV,
+): string {
     return execFileSync('php', args, {
         cwd: REPO_ROOT,
-        env: { ...process.env, ...CONTRACT_ENV },
+        env: { ...process.env, ...env },
         encoding: 'utf8',
     });
 }
@@ -43,6 +46,8 @@ export default async function globalSetup(): Promise<void> {
         existsSync(`${REPO_ROOT}bootstrap/cache/config.php`),
     );
     artisan(['artisan', 'migrate:fresh', '--force']);
+    // The direct server's bucket on MinIO. It is kept between runs; each run's objects sit under new session ids.
+    artisan(['artisan', 'video:storage:bucket'], CONTRACT_DIRECT_ENV);
 
     process.env.FITT_CONTRACT_KEY = spaceKey(
         'SDK contract',
