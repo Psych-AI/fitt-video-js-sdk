@@ -125,7 +125,9 @@ export interface FittSession {
     /**
      * Plays the stopped take in `video` (spec 6.10): the server file if it is ready, else the
      * local copy, else preparing until the server file is ready. Switches to the server file
-     * only while the video is paused or ended. Never calls play().
+     * only while the video is paused or ended. Never calls play(). A preview element (one
+     * passed to attachPreview(), or any with a srcObject) is refused with `invalid_state`,
+     * reason `preview_element`: its srcObject would hide the review.
      */
     playback(video: HTMLVideoElement): Promise<'local' | 'server'>;
     reset(): Promise<void>;
@@ -3623,6 +3625,17 @@ export function createSession(
                 phase === 'stopping'
             ) {
                 return rejectWith('invalid_state', { phase });
+            }
+
+            // A preview shows the camera: srcObject wins over src, so the review would never show.
+            if (
+                previews.includes(video) ||
+                (video as { srcObject?: unknown }).srcObject != null
+            ) {
+                return rejectWith('invalid_state', {
+                    phase,
+                    reason: 'preview_element',
+                });
             }
 
             // A later call cancels the earlier player (author's call 7).

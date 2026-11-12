@@ -303,6 +303,55 @@ test('an expired server URL is fetched again and keeps the place', async () => {
     assert.equal(video.currentTime, 4);
 });
 
+test('a refetched server URL that errors before its metadata is not fetched again, and the place stays', async () => {
+    const r = reviewRig();
+    await recordTake(r, 6000);
+    r.server.url = SERVER;
+    const video = new FakeVideo();
+    const playing = r.session.playback(video as unknown as HTMLVideoElement);
+    await r.env.advance(100);
+    await playing;
+    video.loaded(9);
+    video.currentTime = 4;
+    r.server.url = 'https://media.test/camera-2.webm';
+    video.dispatchEvent(new Event('error'));
+    await r.env.advance(100);
+    assert.equal(video.src, 'https://media.test/camera-2.webm');
+
+    video.currentTime = 0;
+    r.server.url = 'https://media.test/camera-3.webm';
+    video.dispatchEvent(new Event('error'));
+    await r.env.advance(10_000);
+    video.dispatchEvent(new Event('error'));
+    await r.env.advance(10_000);
+
+    assert.equal(video.src, 'https://media.test/camera-2.webm');
+    video.loaded(9);
+    assert.equal(video.currentTime, 4);
+});
+
+test('playback() on a preview element is refused and never touches it', async () => {
+    const r = reviewRig();
+    await recordTake(r, 6000);
+    const preview = Object.assign(new FakeVideo(), { style: {} });
+    r.session.attachPreview(preview as unknown as HTMLVideoElement);
+    const streamed = Object.assign(new FakeVideo(), { srcObject: {} });
+
+    for (const video of [preview, streamed]) {
+        const before = video.src;
+        await assert.rejects(
+            r.session.playback(video as unknown as HTMLVideoElement),
+            (error) =>
+                error instanceof FittVideoError &&
+                error.code === 'invalid_state' &&
+                error.detail.reason === 'preview_element',
+        );
+        assert.equal(video.src, before);
+    }
+
+    assert.equal(r.session.state.playback.source, 'none');
+});
+
 test('destroy() clears the copy, revokes its URL and ends the wait for the server', async () => {
     const r = reviewRig();
     await recordTake(r, 6000);

@@ -60,20 +60,8 @@ export async function startPlayback(
         deps.onSource(source);
     };
 
-    const listen = (
-        type: string,
-        handler: () => void,
-        once = false,
-    ): Listener => {
-        const entry: Listener = {
-            type,
-            handler: once
-                ? (): void => {
-                      forget(entry);
-                      handler();
-                  }
-                : handler,
-        };
+    const listen = (type: string, handler: () => void): Listener => {
+        const entry: Listener = { type, handler };
         listeners.push(entry);
         video.addEventListener(type, entry.handler);
 
@@ -104,40 +92,57 @@ export async function startPlayback(
         return true;
     };
 
-    /** Sets the place once the new src has its metadata; nothing when the result is not finite. */
-    const seekOnLoad = (target: number | 'end'): void => {
-        listen(
-            'loadedmetadata',
-            () => {
-                if (!live()) {
-                    return;
-                }
+    /** The one pending place for the next src's metadata; a later seek replaces it, never stacks beside it. */
+    let pendingSeek: number | 'end' | null = null;
+    /** True from setting a refetched URL until its metadata loads: an error then is not an expiry. */
+    let retried = false;
+    let seeking: Listener | null = null;
 
-                const duration = video.duration;
-                const at =
-                    target === 'end'
-                        ? duration
-                        : Number.isFinite(duration)
-                          ? Math.min(target, duration)
-                          : target;
+    const onMetadata = (): void => {
+        if (!live()) {
+            return;
+        }
 
-                if (Number.isFinite(at)) {
-                    video.currentTime = at;
-                }
-            },
-            true,
-        );
+        retried = false;
+        const target = pendingSeek;
+        pendingSeek = null;
+
+        if (target === null) {
+            return;
+        }
+
+        const duration = video.duration;
+        const at =
+            target === 'end'
+                ? duration
+                : Number.isFinite(duration)
+                  ? Math.min(target, duration)
+                  : target;
+
+        if (Number.isFinite(at)) {
+            video.currentTime = at;
+        }
     };
 
-    /** A media error on the server source fetches the URL again (it lives 120 s) and keeps the place. */
+    /** Sets the place once the new src has its metadata; nothing when the result is not finite. */
+    const seekOnLoad = (target: number | 'end'): void => {
+        pendingSeek = target;
+        seeking ??= listen('loadedmetadata', onMetadata);
+    };
+
+    /**
+     * A media error on the server source fetches the URL again (it lives 120 s) and keeps the place.
+     * A refetched URL that errors before its metadata loads is not an expired one (a file the engine
+     * cannot decode, a URL that always fails): it is not fetched again, so nothing loops.
+     */
     const watchExpiry = (): void => {
         listen('error', () => {
-            if (!live() || current !== 'server' || fetching) {
+            if (!live() || current !== 'server' || fetching || retried) {
                 return;
             }
 
             fetching = true;
-            const at = video.currentTime;
+            const at = pendingSeek ?? video.currentTime;
 
             void deps
                 .waitServer(REFETCH_MS, deps.cancelled)
@@ -148,6 +153,7 @@ export async function startPlayback(
                         }
 
                         seekOnLoad(at);
+                        retried = true;
                         video.src = next;
                     },
                     () => undefined,
