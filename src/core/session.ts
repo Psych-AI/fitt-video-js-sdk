@@ -65,11 +65,23 @@ import { resolveSettings, type SessionOptions } from './options.ts';
 import { createQueue, type Queue } from './queue.ts';
 import { classify } from './responses.ts';
 import { planResume } from './resume-plan.ts';
-import { createState, type Phase, type SessionState } from './state.ts';
+import {
+    createLocalCopy,
+    dropPageCopy,
+    type LocalCopy,
+    type ObjectUrls,
+} from './review.ts';
+import {
+    createState,
+    type Phase,
+    type PlaybackState,
+    type SessionState,
+} from './state.ts';
 import {
     MemoryQueueStore,
     openStore,
     type QueueStore,
+    type RunEndedReason,
     type RunRecord,
     type SegmentRecord,
     type SessionRecord,
@@ -85,7 +97,11 @@ export interface FittSession {
     readonly stream: MediaStream | null;
     readonly devices: DevicesView;
     readonly audioLevel: number;
-    readonly debug?: { dropNextSegment(track?: TrackName): void };
+    readonly debug?: {
+        dropNextSegment(track?: TrackName): void;
+        /** Starts a second run on the open take, as a camera switch would (the playground's multi-run case, Plan 9). */
+        restartRun(reason?: RunEndedReason): Promise<void>;
+    };
     prepare(): Promise<void>;
     /** srcObject = the capture stream, muted, playsInline, autoplay, mirrored unless mirror is false; followed on every re-acquire. */
     attachPreview(
@@ -143,6 +159,8 @@ export interface SessionSeams {
     store?: QueueStore;
     /** navigator.locks: one owning tab per session (author's call 15). null: every session owns its id. */
     locks: Pick<LockManager, 'request' | 'query'> | null;
+    /** URL.createObjectURL and revokeObjectURL for the review copy (Plan 9); null: no copy (unsupported). */
+    objectUrls?: ObjectUrls | null;
     /** BroadcastChannel: the relay between a second tab and the owner. null outside a browser. */
     channel:
         | ((
@@ -447,6 +465,15 @@ function invalidSession(detail: Record<string, unknown>): FittSession {
         checks: null,
         error: { code: 'config_invalid' as ErrorCode, detail },
         audio: 'ok' as const,
+        // An unreadable descriptor never allows a review copy (Plan 9, author's call 4).
+        playback: {
+            source: 'none' as const,
+            local: 'off' as const,
+            localBytes: 0,
+            localReason: 'not_allowed' as const,
+            objectUrls: 0,
+            revoked: 0,
+        },
     });
     const refuse = (): Promise<never> => rejectWith('config_invalid', detail);
     const none = (): (() => void) => () => undefined;
@@ -572,6 +599,36 @@ export function createSession(
     const readyListeners = listenerSet<{ track: TrackName; url: string }>();
     const levelListeners = listenerSet<number>();
     const state = createState((next) => statusListeners.call(next));
+    const patchPlayback = (change: Partial<PlaybackState>): void =>
+        state.patch({ playback: { ...state.get().playback, ...change } });
+
+    // The review copy, in memory only (Plan 9, author's calls 1, 4 and 6).
+    const copy: LocalCopy = createLocalCopy({
+        sessionId,
+        off:
+            descriptor.playback?.local !== true
+                ? 'not_allowed'
+                : options.playback?.local === false
+                  ? 'host_off'
+                  : seams.objectUrls == null || typeof Blob === 'undefined'
+                    ? 'unsupported'
+                    : null,
+        maxBytes: descriptor.playback?.local_max_bytes ?? 0,
+        objectUrls: seams.objectUrls ?? null,
+        win: page?.win ?? null,
+        onChange: (view) =>
+            patchPlayback({
+                local: view.state,
+                localBytes: view.bytes,
+                localReason: view.reason,
+                objectUrls: view.objectUrls,
+                revoked: view.revoked,
+            }),
+    });
+    patchPlayback({
+        local: copy.view().state,
+        localReason: copy.view().reason,
+    });
 
     let store: QueueStore = new MemoryQueueStore();
     let record: SessionRecord | null = null;
@@ -681,6 +738,11 @@ export function createSession(
         clock,
         groups: settings.groups,
         onQueued: (event) => {
+            if (event.type.startsWith('playback.')) {
+                // Local only (Plan 9, author's call 9): listeners saw it; no batch carries it.
+                return;
+            }
+
             // A finished session queues nothing more: the last flush is behind it (item 10).
             // Listeners still see the event; no batch carries it.
             const sending = !tombstoned && !tombstoning && !closed;
@@ -698,6 +760,11 @@ export function createSession(
     });
     const emit = (type: string, payload?: Record<string, unknown>): void => {
         bus.emit(type, payload);
+
+        if (type === 'recorder.fallback' && payload?.track === 'camera') {
+            // A blob fallback on the camera turns the review copy off (Plan 9, author's call 5).
+            copy.fellBack(localTake);
+        }
     };
 
     // Record writes: one at a time, each the whole current record, so none is lost.
@@ -2089,6 +2156,16 @@ export function createSession(
             void persist();
         }
 
+        if (phase === 'stopped' && activeTake === localTake) {
+            // The take stopped: the copy builds its one file (Plan 9, author's call 1).
+            copy.complete(localTake, record?.take_start_ms ?? null);
+        }
+
+        if (phase === 'ready') {
+            // The host's reset and the too_short reset both return to ready (Plan 9, author's call 6).
+            copy.clear('reset');
+        }
+
         if (phase === 'stopped') {
             maybeStartChecks();
         }
@@ -2140,10 +2217,16 @@ export function createSession(
     };
 
     /** Every cut: stored, then handed to the uploader; the clock and the limits are read again. */
-    const addSegment = async (segment: SegmentRecord): Promise<unknown> => {
+    const addSegment = async (
+        segment: SegmentRecord,
+        nonKeyframeStart = false,
+    ): Promise<unknown> => {
         if (closed || segment.take < localTake || queue === null) {
             return 'dropped';
         }
+
+        // Before the queue, so a segment it abandons stays in the copy (Plan 9, author's call 5).
+        copy.add(segment, nonKeyframeStart);
 
         const result = await queue.add(segment);
 
@@ -3234,6 +3317,14 @@ export function createSession(
                       dropNextSegment(track?: TrackName): void {
                           uploader?.dropNext(track);
                       },
+                      /** Starts a second run on the open take, as a camera switch would (the playground's multi-run case, Plan 9). */
+                      restartRun(
+                          reason: RunEndedReason = 'device_switch',
+                      ): Promise<void> {
+                          return (
+                              engine?.restartRuns(reason) ?? Promise.resolve()
+                          );
+                      },
                   },
               }
             : {}),
@@ -3591,6 +3682,9 @@ export function createSession(
                 return otherTabRefusal();
             }
 
+            // A discard clears the review copy (Plan 9, author's call 6).
+            copy.clear('discard');
+
             return runDiscard();
         },
 
@@ -3658,6 +3752,8 @@ export function createSession(
         },
 
         destroy(): void {
+            // destroy() clears the review copy first (Plan 9, author's call 6).
+            copy.clear('destroy');
             destroyed = true;
             engine?.release();
             detachPage();
@@ -3739,6 +3835,8 @@ export function sessionWith(
         return existing;
     }
 
+    // A new session on the page drops another session's copy (Plan 9, author's call 6).
+    dropPageCopy(key, 'next_session');
     const created = createSession(read.descriptor, options, seams);
     sessions.set(key, created);
 
@@ -3794,6 +3892,8 @@ export function browserSeams(): SessionSeams {
             // No Node run ever opens a BroadcastChannel: an open one keeps the process alive.
             locks: null,
             channel: null,
+            // No document, no review copy (Plan 9).
+            objectUrls: null,
         };
     }
 
@@ -3841,6 +3941,15 @@ export function browserSeams(): SessionSeams {
             typeof BroadcastChannel === 'undefined'
                 ? null
                 : (name) => new BroadcastChannel(name),
+        // The review copy's object URLs (Plan 9), read when called.
+        objectUrls:
+            typeof URL !== 'undefined' &&
+            typeof URL.createObjectURL === 'function'
+                ? {
+                      create: (blob) => URL.createObjectURL(blob),
+                      revoke: (url) => URL.revokeObjectURL(url),
+                  }
+                : null,
     };
 }
 

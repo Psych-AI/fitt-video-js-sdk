@@ -15,7 +15,14 @@ export type { Milestone, MilestoneName } from './core/lifecycle.ts';
 export type { SessionOptions } from './core/options.ts';
 export type { ResumeEntry, ResumeState } from './core/resume.ts';
 export type { FittSession } from './core/session.ts';
-export type { Phase, SessionState } from './core/state.ts';
+export type {
+    LocalReason,
+    LocalState,
+    Phase,
+    PlaybackSource,
+    PlaybackState,
+    SessionState,
+} from './core/state.ts';
 export type { MixSource } from './recorder/audio.ts';
 export type { DevicesView } from './recorder/devices.ts';
 export type { ActionResult } from './signals/fullscreen.ts';

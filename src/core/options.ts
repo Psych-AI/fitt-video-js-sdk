@@ -18,6 +18,8 @@ export interface SessionOptions {
     };
     upload?: { transport?: 'put' | 'post' };
     checks?: { wait?: boolean; timeoutMs?: number };
+    /** `local: false` turns the review copy off on this page (Plan 9). */
+    playback?: { local?: boolean };
     ui?: Record<string, unknown>;
     /** Overrides of the browser's fetch and online state: the playground's faults (author's call 14). Tests inject a whole fake through SessionSeams.env instead. */
     environment?: EnvironmentOverrides;

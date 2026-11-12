@@ -1,5 +1,6 @@
 import type { Descriptor } from '../../src/core/descriptor.ts';
 import type { SessionOptions } from '../../src/core/options.ts';
+import type { ObjectUrls } from '../../src/core/review.ts';
 import type { SessionSeams } from '../../src/core/session.ts';
 import { createSession } from '../../src/core/session.ts';
 import { MemoryQueueStore } from '../../src/core/store.ts';
@@ -280,6 +281,8 @@ export function sessionRig(
         options?: SessionOptions;
         locks?: SessionSeams['locks'];
         channel?: SessionSeams['channel'];
+        /** The review copy's object URLs; null (the default) holds no copy: off with unsupported. */
+        objectUrls?: ObjectUrls | null;
     } = {},
 ) {
     const env = options.env ?? fakeEnvironment();
@@ -298,14 +301,17 @@ export function sessionRig(
     const descriptor =
         options.descriptor ?? descriptorFixture(options.recipe ?? 'monitor');
     env.respond(router());
-    const seams = rigSeams(
-        env,
-        store,
-        media,
-        storage,
-        options.locks ?? null,
-        options.channel ?? null,
-    );
+    const seams: SessionSeams = {
+        ...rigSeams(
+            env,
+            store,
+            media,
+            storage,
+            options.locks ?? null,
+            options.channel ?? null,
+        ),
+        objectUrls: options.objectUrls ?? null,
+    };
     const session = createSession(descriptor, options.options ?? {}, seams);
     const calls = (pattern: RegExp): FetchCall[] =>
         env.calls.filter((call) => pattern.test(call.url));

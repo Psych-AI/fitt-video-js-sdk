@@ -30,6 +30,20 @@ export type LocalReason =
     | 'destroy'
     | 'unload';
 
+/** Where the review plays from (Plan 9): nothing yet, waiting for the server file, the local copy, or the server file. */
+export type PlaybackSource = 'none' | 'preparing' | 'local' | 'server';
+
+/** The fourth part of the state (spec 6.5, Plan 9). */
+export interface PlaybackState {
+    source: PlaybackSource;
+    local: LocalState;
+    localBytes: number;
+    localReason: LocalReason | null;
+    /** Object URLs of the copy handed out, and how many were revoked. */
+    objectUrls: number;
+    revoked: number;
+}
+
 export interface SessionState {
     phase: Phase;
     upload: {
@@ -48,6 +62,8 @@ export interface SessionState {
     } | null;
     error: { code: ErrorCode; detail?: Record<string, unknown> } | null;
     audio: 'ok' | 'silent';
+    /** The review (Plan 9, author's call 10): a state part, not a phase. */
+    playback: PlaybackState;
 }
 
 export interface StateHolder {
@@ -68,6 +84,14 @@ function initialState(): SessionState {
         checks: null,
         error: null,
         audio: 'ok',
+        playback: {
+            source: 'none',
+            local: 'empty',
+            localBytes: 0,
+            localReason: null,
+            objectUrls: 0,
+            revoked: 0,
+        },
     };
 }
 
