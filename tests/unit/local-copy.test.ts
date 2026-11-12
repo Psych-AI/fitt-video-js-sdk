@@ -269,3 +269,42 @@ test('a copy that may not hold never holds, and audio segments are never held', 
         ['empty', 0],
     );
 });
+
+test('a late segment or fallback of an older take never starts the copy over', () => {
+    const r = copyRig();
+    const records = cameraRecords().map((record) => ({ ...record, take: 2 }));
+    const older = cameraRecords();
+
+    for (const record of records.slice(0, 3)) {
+        r.copy.add(record);
+    }
+
+    r.copy.add(older[3]);
+    r.copy.fellBack(1);
+
+    assert.deepEqual(
+        [r.copy.view().state, r.copy.view().take, r.copy.view().reason],
+        ['recording', 2, null],
+    );
+
+    for (const record of records.slice(3)) {
+        r.copy.add(record);
+    }
+
+    r.copy.complete(2, 2);
+    assert.deepEqual(
+        [r.copy.view().state, r.copy.view().bytes],
+        ['held', HELD],
+    );
+});
+
+test('a take with an init and no media segment is never held', () => {
+    const r = copyRig();
+    r.copy.add(cameraRecords()[0]);
+    r.copy.complete(1, 2);
+
+    assert.deepEqual(
+        [r.copy.view().state, r.copy.view().reason, r.copy.objectUrl()],
+        ['off', 'unreadable', null],
+    );
+});

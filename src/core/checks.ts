@@ -73,8 +73,9 @@ function readChecks(body: Value): ChecksResult | null {
  * while the elapsed time (on performance.now()) is below `timeoutMs`. A
  * slow answer is never overlapped: the next poll waits for it. `look`
  * returns true once it has settled the wait. When `cancelled` is true at the
- * start of a poll, the wait settles silently: it never resolves or rejects
- * and polls no more (Plan 9, a replaced or destroyed player).
+ * start of a poll, when an answer in flight arrives, or at the deadline, the
+ * wait settles silently: it never resolves or rejects and polls no more
+ * (Plan 9, a replaced or destroyed player).
  */
 function poll(
     env: Environment,
@@ -90,7 +91,10 @@ function poll(
     const deadline = env.timers.setTimeout(() => {
         if (!settled) {
             settled = true;
-            onTimeout();
+
+            if (!cancelled()) {
+                onTimeout();
+            }
         }
     }, timeoutMs);
 
@@ -111,6 +115,13 @@ function poll(
             }))
             .then((answer) => {
                 if (settled) {
+                    return;
+                }
+
+                if (cancelled()) {
+                    settled = true;
+                    env.timers.clearTimeout(deadline);
+
                     return;
                 }
 

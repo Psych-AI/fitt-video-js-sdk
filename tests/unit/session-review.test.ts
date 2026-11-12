@@ -282,3 +282,25 @@ test('a host that turns local playback off, a descriptor that does not allow it,
         ],
     );
 });
+
+test('a stale_take that moves the take on clears the copy as a reset', async () => {
+    const r = answerRig();
+    r.respond({
+        '/segments/': () =>
+            json(409, {
+                error: { code: 'stale_take', message: 'x', current_take: 2 },
+            }),
+    });
+    await recordTake(r, 6000);
+    await until(() => r.session.state.error?.code === 'stale_take');
+    await r.env.advance(100);
+
+    assert.deepEqual(
+        [
+            r.session.state.playback.local,
+            r.session.state.playback.localReason,
+            r.session.state.playback.localBytes,
+        ],
+        ['cleared', 'reset', 0],
+    );
+});

@@ -138,7 +138,10 @@ export function createLocalCopy(deps: LocalCopyDeps): LocalCopy {
         changed();
     }
 
-    /** A segment or a fallback of another take starts the copy over. */
+    /**
+     * A segment or a fallback of a later take starts the copy over. One of an older take (a late
+     * cut of the take before) is ignored, as the session never goes back a take.
+     */
     function startOver(nextTake: number): void {
         release();
         drop();
@@ -167,6 +170,10 @@ export function createLocalCopy(deps: LocalCopyDeps): LocalCopy {
 
         add(segment: SegmentRecord, nonKeyframeStart = false): void {
             if (deps.off !== null || retired || segment.track !== 'camera') {
+                return;
+            }
+
+            if (take !== null && segment.take < take) {
                 return;
             }
 
@@ -239,6 +246,10 @@ export function createLocalCopy(deps: LocalCopyDeps): LocalCopy {
                 return;
             }
 
+            if (take !== null && fellBackTake < take) {
+                return;
+            }
+
             if (fellBackTake !== take) {
                 startOver(fellBackTake);
             }
@@ -254,6 +265,12 @@ export function createLocalCopy(deps: LocalCopyDeps): LocalCopy {
                 completedTake !== take ||
                 init === null
             ) {
+                return;
+            }
+
+            if (parts.length === 0) {
+                turnOff('unreadable');
+
                 return;
             }
 
@@ -275,7 +292,7 @@ export function createLocalCopy(deps: LocalCopyDeps): LocalCopy {
             }
 
             const last = parts[parts.length - 1];
-            duration = last === undefined ? 0 : last.startMs + last.durationMs;
+            duration = last.startMs + last.durationMs;
             leadIn =
                 takeStartMs === null
                     ? 0

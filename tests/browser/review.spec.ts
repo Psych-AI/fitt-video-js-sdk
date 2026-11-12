@@ -459,3 +459,58 @@ for (const leave of ['swap the session', 'remove the review attribute']) {
         ).toBe(1);
     });
 }
+
+test('switching controls to none during a review unbinds the element player, so the host binds the only one', async ({
+    page,
+    browserName,
+}) => {
+    test.skip(
+        browserName !== 'chromium',
+        'the element logic is the same in every engine; Chromium records fastest',
+    );
+    await installMedia(page, browserName);
+    await openHarness(page, '/tests/browser/harness/element.html');
+    await page.evaluate(
+        (recording) =>
+            window.mount({
+                recording,
+                controls: 'full',
+                review: true,
+                slots: ['review'],
+            }),
+        SHORT,
+    );
+    const recorder = page.locator('fitt-recorder');
+    await expect(recorder).toHaveAttribute('data-phase', 'ready');
+    await recorder.locator('[part=record]').click();
+    await expect(recorder).toHaveAttribute('data-phase', 'recording');
+    await page.waitForTimeout(3000);
+    await recorder.locator('[part=stop]').click();
+    await expect(recorder).toHaveAttribute('data-review', 'local', {
+        timeout: 15_000,
+    });
+    expect(
+        await recorder.evaluate((el) =>
+            el
+                .shadowRoot!.querySelector('[part=review]')!
+                .getAttribute('src')
+                ?.startsWith('blob:'),
+        ),
+    ).toBe(true);
+
+    await recorder.evaluate((el) => el.setAttribute('controls', 'none'));
+
+    expect(
+        await recorder.evaluate((el) => {
+            const videos = el.shadowRoot!.querySelectorAll('[part=review]');
+
+            return {
+                count: videos.length,
+                src: videos[0].getAttribute('src'),
+                display: getComputedStyle(
+                    el.shadowRoot!.querySelector('[part=view]')!,
+                ).display,
+            };
+        }),
+    ).toEqual({ count: 1, src: null, display: 'block' });
+});

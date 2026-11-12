@@ -11,7 +11,13 @@ const SERVER = 'https://media.test/camera-1.webm';
 const HELD = 959_046;
 
 /** An answer session whose status carries the camera URL once the test sets it. */
-function reviewRig(options: { local?: boolean; inStatus?: boolean } = {}) {
+function reviewRig(
+    options: {
+        local?: boolean;
+        inStatus?: boolean;
+        routes?: Parameters<ReturnType<typeof sessionRig>['respond']>[0];
+    } = {},
+) {
     const descriptor = descriptorFixture('answer');
     descriptor.playback = {
         local: options.local ?? true,
@@ -40,6 +46,7 @@ function reviewRig(options: { local?: boolean; inStatus?: boolean } = {}) {
                           },
                 ),
             ),
+        ...options.routes,
     });
 
     return { ...r, urls, server };
@@ -381,4 +388,67 @@ test('playback() during a take is refused', async () => {
         (error) =>
             error instanceof FittVideoError && error.code === 'invalid_state',
     );
+});
+
+test('a discard the server holds ends the wait for the server file, and the source is none', async () => {
+    const r = reviewRig({
+        routes: {
+            '/finalise': () =>
+                json(409, { error: { code: 'discarded', message: 'x' } }),
+        },
+    });
+    await recordTake(r, 6000);
+    const video = new FakeVideo();
+    await playLocal(r, video);
+    const finalising = r.session.finalise().catch(() => undefined);
+    await r.env.advance(10);
+    await finalising;
+    const polls = r.calls(/\/status$/).length;
+    r.server.url = SERVER;
+    await r.env.advance(10_000);
+
+    assert.equal(r.calls(/\/status$/).length, polls);
+    assert.equal(video.src, 'blob:fake/1');
+    assert.deepEqual(
+        [
+            r.session.state.playback.source,
+            r.session.state.playback.local,
+            r.session.state.playback.localReason,
+        ],
+        ['none', 'cleared', 'discard'],
+    );
+});
+
+test('a reset after a review returns the source to none', async () => {
+    const r = reviewRig();
+    await recordTake(r, 6000);
+    await playLocal(r, new FakeVideo());
+    const resetting = r.session.reset();
+    await r.env.advance(10);
+    await resetting;
+
+    assert.deepEqual(
+        [r.session.state.playback.source, r.session.state.playback.local],
+        ['none', 'cleared'],
+    );
+});
+
+test('a player replaced while its status answer is in flight never settles', async () => {
+    const r = reviewRig({ local: false });
+    await recordTake(r, 6000);
+    r.server.url = SERVER;
+    const first = new FakeVideo();
+    const second = new FakeVideo();
+    const settledFirst = { value: false };
+    void r.session.playback(first as unknown as HTMLVideoElement).then(
+        () => (settledFirst.value = true),
+        () => (settledFirst.value = true),
+    );
+    const playing = r.session.playback(second as unknown as HTMLVideoElement);
+    await r.env.advance(2000);
+
+    assert.equal(await playing, 'server');
+    assert.equal(settledFirst.value, false);
+    assert.deepEqual([first.src, second.src], ['', SERVER]);
+    assert.equal(r.session.state.playback.source, 'server');
 });

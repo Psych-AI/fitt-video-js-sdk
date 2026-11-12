@@ -666,7 +666,7 @@ export function createSession(
     let tombstoning = false;
     let finalised = false;
     let destroyed = false;
-    /** Bumped by every playback() call, a return to ready, discard() and destroy(): an older player is cancelled (author's call 7). */
+    /** Bumped by every playback() call, a return to ready, discard(), a discard the server holds and destroy(): an older player is cancelled (author's call 7). */
     let playbackRound = 0;
     let heartbeats = false;
     let environmentSent = false;
@@ -1443,6 +1443,8 @@ export function createSession(
         void persist();
         uploader?.dropTakesBelow(current);
         setError('stale_take');
+        // The take was reset elsewhere: its copy is cleared as a reset (Plan 9, author's call 6).
+        copy.clear('reset');
         const phase = lifecycle?.phase();
 
         if (
@@ -1483,8 +1485,11 @@ export function createSession(
         const phase = lifecycle?.phase();
 
         if (code === 'discarded') {
-            // A discard the server holds (another tab, the host's server) clears the copy too (Plan 9, author's call 6).
+            // A discard the server holds (another tab, the host's server) clears the copy too (Plan 9, author's call 6),
+            // and ends the player: no server file will come.
             copy.clear('discard');
+            playbackRound += 1;
+            patchPlayback({ source: 'none' });
         }
 
         if (
@@ -2183,6 +2188,7 @@ export function createSession(
             // The host's reset and the too_short reset both return to ready (Plan 9, author's call 6).
             copy.clear('reset');
             playbackRound += 1;
+            patchPlayback({ source: 'none' });
         }
 
         if (phase === 'stopped') {
@@ -3753,6 +3759,7 @@ export function createSession(
             // A discard clears the review copy (Plan 9, author's call 6) and ends the player.
             copy.clear('discard');
             playbackRound += 1;
+            patchPlayback({ source: 'none' });
 
             return runDiscard();
         },

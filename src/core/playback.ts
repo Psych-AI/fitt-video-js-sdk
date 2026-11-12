@@ -51,6 +51,8 @@ export async function startPlayback(
     deps: PlayerDeps,
 ): Promise<'local' | 'server'> {
     let current: PlaybackSource = 'none';
+    /** What a cancelled call returns: a promise that never settles, so it never reports or sets a source. */
+    const never = (): Promise<never> => new Promise<never>(() => undefined);
     let listeners: Listener[] = [];
     let fetching = false;
     const playing = !video.paused && !video.ended;
@@ -290,6 +292,10 @@ export async function startPlayback(
             ),
         ]);
 
+        if (!live()) {
+            return never();
+        }
+
         if (first !== null) {
             startServer(first);
 
@@ -323,9 +329,17 @@ export async function startPlayback(
     try {
         url = await server;
     } catch (error) {
+        if (!live()) {
+            return never();
+        }
+
         setSource('none');
 
         throw error;
+    }
+
+    if (!live()) {
+        return never();
     }
 
     startServer(url);

@@ -469,11 +469,16 @@ function createRecorderClass(): CustomElementConstructor {
 
             const review = this.#reviewVideo();
             this.dataset.review = state.playback.source;
+            const none = controlsOf(this.getAttribute('controls')) === 'none';
 
-            if (
-                !this.#reviewing &&
-                controlsOf(this.getAttribute('controls')) !== 'none'
-            ) {
+            if (none) {
+                // controls="none" mid review: the host binds its own player, so the element lets go of its one.
+                this.#endReview();
+
+                return;
+            }
+
+            if (!this.#reviewing) {
                 this.#reviewing = true;
                 session.playback(review).catch(() => undefined);
             }
