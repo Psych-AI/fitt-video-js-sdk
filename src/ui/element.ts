@@ -17,6 +17,7 @@ const SLOTS = [
     'controls',
     'no-audio',
     'rejected',
+    'review',
 ] as const;
 
 /** How often the timers, the progress bar and the stop rule are drawn again. */
@@ -178,7 +179,7 @@ function make<K extends keyof HTMLElementTagNameMap>(
 function createRecorderClass(): CustomElementConstructor {
     return class FittRecorderElement extends HTMLElement {
         static get observedAttributes(): string[] {
-            return ['controls'];
+            return ['controls', 'review'];
         }
 
         #session: FittSession | null = null;
@@ -188,6 +189,15 @@ function createRecorderClass(): CustomElementConstructor {
         #labelTimer: number | null = null;
         #root: ShadowRoot;
         #view: HTMLVideoElement;
+        /**
+         * The review video (Plan 9), bound once per stop with session.playback(),
+         * and the pulse drawn over the view while the review is preparing. Both
+         * are made the first time the review attribute is in use, so an element
+         * without it draws exactly the parts it drew before.
+         */
+        #review: HTMLVideoElement | null = null;
+        /** True once this stop's review video is bound. */
+        #reviewing = false;
         #firstSlot: HTMLElement;
         #controlNodes: Node[] = [];
         #pieces: Pieces = NO_PIECES;
@@ -239,6 +249,7 @@ function createRecorderClass(): CustomElementConstructor {
 
             this.#unbind();
             this.#session = next ?? null;
+            this.#endReview();
             this.#lastPhase = null;
             this.#lastError = null;
             this.#startedAtMs = null;
@@ -252,6 +263,7 @@ function createRecorderClass(): CustomElementConstructor {
                     'upload',
                     'audio',
                     'error',
+                    'review',
                 ]) {
                     delete this.dataset[name];
                 }
@@ -276,6 +288,14 @@ function createRecorderClass(): CustomElementConstructor {
             if (name === 'controls') {
                 this.#build();
                 this.#draw();
+            }
+
+            if (
+                (name === 'controls' || name === 'review') &&
+                this.#bound &&
+                this.#session !== null
+            ) {
+                this.#reviewState(this.#session.state);
             }
         }
 
@@ -378,6 +398,8 @@ function createRecorderClass(): CustomElementConstructor {
                 this.dataset.error = code;
             }
 
+            this.#reviewState(state);
+
             if (
                 state.phase === 'ready' ||
                 state.phase === 'idle' ||
@@ -409,6 +431,73 @@ function createRecorderClass(): CustomElementConstructor {
             if (state.phase === 'idle' && previous !== 'idle') {
                 session.prepare().catch(() => undefined);
             }
+        }
+
+        /**
+         * The review state (author's call 10): with the review attribute, in
+         * stopped or rejected, data-review is the playback source, and with
+         * controls other than none the review video is bound once per stop.
+         * The element plays nothing: the person presses play.
+         */
+        #reviewState(state: SessionState): void {
+            const session = this.#session;
+            const held =
+                state.phase === 'stopped' || state.phase === 'rejected';
+
+            if (session === null || !held || !this.hasAttribute('review')) {
+                delete this.dataset.review;
+                this.#endReview();
+
+                return;
+            }
+
+            const review = this.#reviewVideo();
+            this.dataset.review = state.playback.source;
+
+            if (
+                !this.#reviewing &&
+                controlsOf(this.getAttribute('controls')) !== 'none'
+            ) {
+                this.#reviewing = true;
+                session.playback(review).catch(() => undefined);
+            }
+        }
+
+        /** The review video and the skeleton, made once and placed right after the view. */
+        #reviewVideo(): HTMLVideoElement {
+            if (this.#review !== null) {
+                return this.#review;
+            }
+
+            const review = make('video', {
+                part: 'review',
+                playsinline: '',
+                preload: 'metadata',
+                controls: '',
+                controlslist: 'nodownload noremoteplayback',
+                disablepictureinpicture: '',
+            });
+            review.playsInline = true;
+            review.controls = true;
+            const skeleton = make('div', {
+                class: 'review-skeleton',
+                'aria-hidden': 'true',
+            });
+            this.#view.after(review, skeleton);
+            this.#review = review;
+
+            return review;
+        }
+
+        /** Unbinds the review video, so the next stop binds it again. */
+        #endReview(): void {
+            if (!this.#reviewing || this.#review === null) {
+                return;
+            }
+
+            this.#reviewing = false;
+            this.#review.removeAttribute('src');
+            this.#review.load();
         }
 
         #milestone(milestone: Milestone): void {

@@ -23,6 +23,7 @@ export const STYLES = `
     --fitt-recorder-track: rgba(255, 255, 255, 0.25);
     --fitt-recorder-selected: #edf7f7;
     --fitt-recorder-muted-ink: #4e4d6b;
+    --fitt-recorder-skeleton: #2a2852;
     --fitt-recorder-inset: 10px;
     --fitt-recorder-button-size: 44px;
     --fitt-recorder-countdown-size: 88px;
@@ -88,6 +89,59 @@ button:focus-visible {
 
 :host([mirror='false']) [part='view'] {
     transform: none;
+}
+
+/* The review video (Plan 9), placed as the view is, never mirrored. */
+[part='review'] {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    background: #000;
+    display: none;
+}
+
+:host([data-review='local']:not([controls='none'])) [part='review'],
+:host([data-review='server']:not([controls='none'])) [part='review'] {
+    display: block;
+}
+
+:host([data-review='local']:not([controls='none'])) [part='view'],
+:host([data-review='server']:not([controls='none'])) [part='view'],
+:host([data-review='preparing']:not([controls='none'])) [part='view'] {
+    display: none;
+}
+
+/* Preparing: the view area pulses as a skeleton with no words (RecorderReview frame 3). */
+.review-skeleton {
+    position: absolute;
+    inset: 0;
+    display: none;
+    background: var(--fitt-recorder-skeleton);
+    pointer-events: none;
+    animation: fitt-recorder-pulse 1.6s ease-in-out infinite;
+}
+
+:host([data-review='preparing']:not([controls='none'])) .review-skeleton {
+    display: block;
+}
+
+@keyframes fitt-recorder-pulse {
+    0%,
+    100% {
+        opacity: 1;
+    }
+
+    50% {
+        opacity: 0.45;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .review-skeleton {
+        animation: none;
+    }
 }
 
 [part='record'],
@@ -376,6 +430,12 @@ button:focus-visible {
     top: 48px;
 }
 
+.slot-review {
+    left: var(--fitt-recorder-inset);
+    right: var(--fitt-recorder-inset);
+    top: var(--fitt-recorder-inset);
+}
+
 .slot-error,
 .slot-checking,
 .slot-rejected {
@@ -398,5 +458,9 @@ button:focus-visible {
 :host([data-audio='silent']) .slot-no-audio,
 :host([data-phase='rejected']) .slot-rejected {
     display: block;
+}
+
+:host([data-review]) .slot-review {
+    display: flex;
 }
 `;

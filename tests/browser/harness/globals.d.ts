@@ -15,10 +15,14 @@ interface Window {
         recording?: Record<string, number>;
         /** Merged into the descriptor's clock, e.g. a short session_cap_ms. */
         clock?: Record<string, number>;
+        /** Merged into the descriptor's playback block, e.g. no local copy. */
+        playback?: Record<string, unknown>;
         controls?: string;
         mirror?: string;
         statusBody?: unknown;
         startLabel?: string;
+        /** Sets the boolean review attribute (Plan 9). */
+        review?: boolean;
         slots?: string[];
     }): void;
     /** element.html: every data-phase value any mounted element took, in order. */

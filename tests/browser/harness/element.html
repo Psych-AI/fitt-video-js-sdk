@@ -109,16 +109,19 @@
             window.mount = ({
                 recording,
                 clock,
+                playback,
                 controls,
                 mirror,
                 statusBody,
                 startLabel,
+                review,
                 slots = [],
             } = {}) => {
                 const descriptor = {
                     ...base,
                     recording: { ...base.recording, ...(recording ?? {}) },
                     clock: { ...base.clock, ...(clock ?? {}) },
+                    playback: { ...base.playback, ...(playback ?? {}) },
                 };
                 const session = FittVideo.session(descriptor, {
                     environment: { fetch: answer(statusBody) },
@@ -135,6 +138,10 @@
 
                 if (startLabel !== undefined) {
                     element.setAttribute('start-label', startLabel);
+                }
+
+                if (review) {
+                    element.setAttribute('review', '');
                 }
 
                 for (const name of slots) {
