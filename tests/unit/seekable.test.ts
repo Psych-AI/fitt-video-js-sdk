@@ -270,3 +270,153 @@ test('an init that is not WebM, or a type that is neither WebM nor MP4, gives nu
     );
     assert.equal(seekableHead('video/x-unknown', init, media), null);
 });
+
+/* A small ISO BMFF reader for the MP4 cases. */
+
+interface Box {
+    type: string;
+    at: number;
+    end: number;
+}
+
+function boxes(bytes: Uint8Array, from: number, to: number): Box[] {
+    const view = new DataView(bytes.buffer, bytes.byteOffset);
+    const out: Box[] = [];
+
+    for (let at = from; at < to;) {
+        const size = view.getUint32(at);
+        out.push({
+            type: String.fromCharCode(...bytes.subarray(at + 4, at + 8)),
+            at,
+            end: at + size,
+        });
+        at += size;
+    }
+
+    return out;
+}
+
+function u32(bytes: Uint8Array, at: number): number {
+    return new DataView(bytes.buffer, bytes.byteOffset).getUint32(at);
+}
+
+function u64(bytes: Uint8Array, at: number): number {
+    return Number(
+        new DataView(bytes.buffer, bytes.byteOffset).getBigUint64(at),
+    );
+}
+
+/** The sidx box's fields (version 1). */
+function readSidx(bytes: Uint8Array, box: Box) {
+    const at = box.at + 12;
+    const count = new DataView(bytes.buffer, bytes.byteOffset).getUint16(
+        at + 26,
+    );
+    const refs = Array.from({ length: count }, (_, i) => ({
+        size: u32(bytes, at + 28 + i * 12) & 0x7fffffff,
+        duration: u32(bytes, at + 32 + i * 12),
+        sap: u32(bytes, at + 36 + i * 12),
+    }));
+
+    return {
+        version: bytes[box.at + 8],
+        referenceId: u32(bytes, at),
+        timescale: u32(bytes, at + 4),
+        earliest: u64(bytes, at + 8),
+        firstOffset: u64(bytes, at + 16),
+        refs,
+    };
+}
+
+test('a fragmented MP4 head adds mehd and a sidx over every media segment', () => {
+    const { mime, init, media } = cutSet('webkit-mp4');
+    const head = seekableHead(mime, init, media);
+    assert.ok(head !== null);
+    assert.equal(head.byteLength, 1339);
+
+    const file = concat([head, ...media.map((part) => part.bytes)]);
+    const top = boxes(file, 0, head.byteLength);
+    assert.deepEqual(
+        top.map((box) => box.type),
+        ['ftyp', 'moov', 'sidx'],
+    );
+    const moov = top[1];
+    assert.equal(moov.end - moov.at, 1127);
+
+    const mvex = boxes(file, moov.at + 8, moov.end).find(
+        (box) => box.type === 'mvex',
+    )!;
+    const mvexKids = boxes(file, mvex.at + 8, mvex.end);
+    assert.deepEqual(
+        mvexKids.map((box) => box.type),
+        ['mehd', 'trex', 'trex'],
+    );
+    const mehd = mvexKids[0];
+    assert.equal(mehd.end - mehd.at, 20);
+    assert.equal(file[mehd.at + 8], 1);
+    // round(60,043 ms x 600 / 1000)
+    assert.equal(u64(file, mehd.at + 12), 36_026);
+
+    const sidx = readSidx(file, top[2]);
+    assert.equal(top[2].end - top[2].at, 40 + 12 * media.length);
+    assert.deepEqual(
+        [
+            sidx.version,
+            sidx.referenceId,
+            sidx.timescale,
+            sidx.earliest,
+            sidx.firstOffset,
+        ],
+        [1, 2, 600, 26, 0],
+    );
+    assert.deepEqual(
+        sidx.refs.map((ref) => ref.size),
+        media.map((part) => part.bytes.byteLength),
+    );
+    assert.equal(
+        sidx.refs.reduce((sum, ref) => sum + ref.duration, 0),
+        36_026 - 26,
+    );
+    assert.ok(sidx.refs.every((ref) => ref.sap === 0x90000000));
+
+    assert.equal(
+        boxes(file, head.byteLength, head.byteLength + 8)[0].type,
+        'moof',
+    );
+    assert.equal(
+        Buffer.compare(
+            Buffer.from(file.subarray(head.byteLength)),
+            Buffer.from(concat(media.map((part) => part.bytes))),
+        ),
+        0,
+    );
+});
+
+test('a segment that does not start on a sync sample has no SAP', () => {
+    const { mime, init, media } = cutSet('webkit-mp4');
+    media[2] = { ...media[2], nonKeyframeStart: true };
+    const head = seekableHead(mime, init, media)!;
+    const sidx = readSidx(head, boxes(head, 0, head.byteLength)[2]);
+
+    assert.deepEqual(
+        sidx.refs.map((ref) => ref.sap),
+        media.map((_, i) => (i === 2 ? 0 : 0x90000000)),
+    );
+});
+
+test('an MP4 init with no moov, no mvex, no video track or no media gives null', () => {
+    const { mime, init, media } = cutSet('webkit-mp4');
+    // The positive control: this init does make a head (fails before this task).
+    assert.notEqual(seekableHead(mime, init, media), null);
+
+    // Measured: ftyp 0 to 28; moov at 28 (1107 bytes); the video trak's hdlr at 712; mvex at 1063 (72 bytes, moov's last child).
+    const noMvex = init.slice(0, 1063);
+    new DataView(noMvex.buffer).setUint32(28, 1107 - 72);
+    const noVideo = init.slice();
+    noVideo.set([0x73, 0x6f, 0x75, 0x6e], 712 + 16); // handler_type 'soun'
+
+    assert.equal(seekableHead(mime, init.subarray(0, 28), media), null);
+    assert.equal(seekableHead(mime, noMvex, media), null);
+    assert.equal(seekableHead(mime, noVideo, media), null);
+    assert.equal(seekableHead(mime, init, []), null);
+});

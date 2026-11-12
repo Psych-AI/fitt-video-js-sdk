@@ -12,7 +12,9 @@
  * unknown size. Every element the writer makes has an 8-byte size field and every uint is 8
  * bytes, so the size of Cues is known before the cluster offsets and one pass is enough.
  *
- * Fragmented MP4 (author's call 3): an `mehd` in `mvex` and a `sidx` after `moov` (Task 3).
+ * Fragmented MP4 (author's call 3): an `mehd` with the duration in `mvex`, and a `sidx` after
+ * `moov` with one reference per media segment (`starts_with_SAP` 1 and `SAP_type` 1 unless
+ * `nonKeyframeStart`). No Media Source Extensions are needed in any engine.
  */
 
 /** One media segment of a run, as the cutter cut it. */
@@ -366,6 +368,245 @@ export function seekableWebmHead(
     ]);
 }
 
+/* Fragmented MP4 (author's call 3). */
+
+interface Box {
+    type: string;
+    /** Offset of the box's size field. */
+    at: number;
+    /** Offset just past the box. */
+    end: number;
+}
+
+/** The most references one sidx can carry (reference_count is 16 bits). */
+const MAX_SIDX_REFERENCES = 65_535;
+/** referenced_size is 31 bits. */
+const MAX_REFERENCED_SIZE = 2 ** 31;
+/** starts_with_SAP 1, SAP_type 1, SAP_delta_time 0. */
+const SAP_TYPE_1 = 0x90000000;
+
+/** The box at `at`, or null for a size of 0 or 1 (64-bit), below 8, or past `limit`. */
+function readBox(bytes: Uint8Array, at: number, limit: number): Box | null {
+    if (at + 8 > limit) {
+        return null;
+    }
+
+    const size = new DataView(bytes.buffer, bytes.byteOffset).getUint32(at);
+
+    if (size < 8 || at + size > limit) {
+        return null;
+    }
+
+    return {
+        type: String.fromCharCode(...bytes.subarray(at + 4, at + 8)),
+        at,
+        end: at + size,
+    };
+}
+
+/** Every box from `from` to `to`, or null when one does not read. */
+function boxList(bytes: Uint8Array, from: number, to: number): Box[] | null {
+    const out: Box[] = [];
+
+    for (let at = from; at < to;) {
+        const found = readBox(bytes, at, to);
+
+        if (found === null) {
+            return null;
+        }
+
+        out.push(found);
+        at = found.end;
+    }
+
+    return out;
+}
+
+function u16(n: number): Uint8Array {
+    return Uint8Array.from([(n >>> 8) & 0xff, n & 0xff]);
+}
+
+function u32(n: number): Uint8Array {
+    const out = new Uint8Array(4);
+    new DataView(out.buffer).setUint32(0, n >>> 0);
+
+    return out;
+}
+
+function readU32(bytes: Uint8Array, at: number): number {
+    return new DataView(bytes.buffer, bytes.byteOffset).getUint32(at);
+}
+
+/** A box with a 32-bit size and a four-letter ASCII type. */
+function box(type: string, ...body: (Uint8Array | number[])[]): Uint8Array {
+    const data = join(body.map((part) => Uint8Array.from(part)));
+    const typeBytes = Uint8Array.from(type, (char) => char.charCodeAt(0));
+
+    return join([u32(8 + data.byteLength), typeBytes, data]);
+}
+
+/** A full box's field at `v0` (version 0) or `v1` (version 1) past the box start. */
+function versioned(
+    bytes: Uint8Array,
+    found: Box,
+    v0: number,
+    v1: number,
+): number | null {
+    const at = found.at + (bytes[found.at + 8] === 1 ? v1 : v0);
+
+    return at + 4 <= found.end ? readU32(bytes, at) : null;
+}
+
+function child(bytes: Uint8Array, parent: Box, type: string): Box | null {
+    return (
+        (boxList(bytes, parent.at + 8, parent.end) ?? []).find(
+            (kid) => kid.type === type,
+        ) ?? null
+    );
+}
+
+/** The video track's track_ID and media timescale, or null when the moov has no readable video track. */
+function videoTrack(
+    bytes: Uint8Array,
+    moovKids: readonly Box[],
+): { trackId: number; scale: number } | null {
+    for (const trak of moovKids) {
+        if (trak.type !== 'trak') {
+            continue;
+        }
+
+        const mdia = child(bytes, trak, 'mdia');
+        const hdlr = mdia === null ? null : child(bytes, mdia, 'hdlr');
+
+        if (mdia === null || hdlr === null || hdlr.at + 20 > hdlr.end) {
+            continue;
+        }
+
+        if (
+            String.fromCharCode(
+                ...bytes.subarray(hdlr.at + 16, hdlr.at + 20),
+            ) !== 'vide'
+        ) {
+            continue;
+        }
+
+        const tkhd = child(bytes, trak, 'tkhd');
+        const mdhd = child(bytes, mdia, 'mdhd');
+        const trackId = tkhd === null ? null : versioned(bytes, tkhd, 20, 28);
+        const scale = mdhd === null ? null : versioned(bytes, mdhd, 20, 28);
+
+        return trackId === null || scale === null || scale === 0
+            ? null
+            : { trackId, scale };
+    }
+
+    return null;
+}
+
+/**
+ * The fragmented MP4 head: an `mehd` with the duration in `mvex`, and a `sidx` with one
+ * reference per media segment after `moov` (author's call 3); null when the init cannot be read.
+ * Every `tfhd` of these fragments sets default-base-is-moof, so bytes added before the first
+ * `moof` move no data offset.
+ */
+export function seekableMp4Head(
+    init: Uint8Array,
+    media: readonly SeekablePart[],
+): Uint8Array | null {
+    if (
+        media.length === 0 ||
+        media.length > MAX_SIDX_REFERENCES ||
+        media.some((part) => part.bytes.byteLength >= MAX_REFERENCED_SIZE)
+    ) {
+        return null;
+    }
+
+    const top = boxList(init, 0, init.length);
+
+    if (
+        top === null ||
+        top.some((found) => found.type === 'moof' || found.type === 'mdat')
+    ) {
+        return null;
+    }
+
+    const moov = top.find((found) => found.type === 'moov');
+    const moovKids =
+        moov === undefined ? null : boxList(init, moov.at + 8, moov.end);
+
+    if (moov === undefined || moovKids === null) {
+        return null;
+    }
+
+    const mvhd = moovKids.find((found) => found.type === 'mvhd');
+    const mvex = moovKids.find((found) => found.type === 'mvex');
+    const movieScale =
+        mvhd === undefined ? null : versioned(init, mvhd, 20, 28);
+    const mvexKids =
+        mvex === undefined ? null : boxList(init, mvex.at + 8, mvex.end);
+    const video = videoTrack(init, moovKids);
+
+    if (
+        movieScale === null ||
+        movieScale === 0 ||
+        mvexKids === null ||
+        video === null
+    ) {
+        return null;
+    }
+
+    const last = media[media.length - 1];
+    const endMs = last.startMs + last.durationMs;
+    const mehd = box(
+        'mehd',
+        [1, 0, 0, 0],
+        uint64(Math.round((endMs * movieScale) / 1000)),
+    );
+    const newMvex = box(
+        'mvex',
+        mehd,
+        ...mvexKids
+            .filter((kid) => kid.type !== 'mehd')
+            .map((kid) => init.subarray(kid.at, kid.end)),
+    );
+    const newMoov = box(
+        'moov',
+        ...moovKids.map((kid) =>
+            kid.type === 'mvex' ? newMvex : init.subarray(kid.at, kid.end),
+        ),
+    );
+
+    const ticks = (ms: number): number => Math.round((ms * video.scale) / 1000);
+    const bounds = [...media.map((part) => ticks(part.startMs)), ticks(endMs)];
+    const refs = media.map((part, i) =>
+        join([
+            u32(part.bytes.byteLength),
+            u32(bounds[i + 1] - bounds[i]),
+            u32(part.nonKeyframeStart ? 0 : SAP_TYPE_1),
+        ]),
+    );
+    const sidx = box(
+        'sidx',
+        [1, 0, 0, 0],
+        u32(video.trackId),
+        u32(video.scale),
+        uint64(bounds[0]),
+        uint64(0),
+        u16(0),
+        u16(media.length),
+        ...refs,
+    );
+
+    return join([
+        ...top.map((found) =>
+            found.type === 'moov'
+                ? newMoov
+                : init.subarray(found.at, found.end),
+        ),
+        sidx,
+    ]);
+}
+
 /**
  * The bytes that replace the run's init so the joined file has a duration and an index; null
  * when the init cannot be read or the type is neither WebM nor MP4. The joined file is this head
@@ -381,8 +622,7 @@ export function seekableHead(
     }
 
     if (/^(video|audio)\/mp4/i.test(mimeType)) {
-        // Task 3 fills the fragmented MP4 head.
-        return null;
+        return seekableMp4Head(init, media);
     }
 
     return null;
