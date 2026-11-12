@@ -91,6 +91,8 @@ function rig(
         return recorder;
     };
     const stored: SegmentRecord[] = [];
+    /** The nonKeyframeStart argument of each stored add(), in order. */
+    const flags: (boolean | undefined)[] = [];
     const events: [string, Record<string, unknown>][] = [];
     const run = createRun({
         env,
@@ -103,7 +105,7 @@ function rig(
         mimeType: 'video/webm;codecs=vp8,opus',
         bitrates: { video: 300_000, audio: 32_000 },
         recorderFactory: factory,
-        add: async (record) => {
+        add: async (record, nonKeyframeStart) => {
             const failure = options.addFails?.(record) ?? null;
 
             if (failure !== null) {
@@ -111,6 +113,7 @@ function rig(
             }
 
             stored.push(record);
+            flags.push(nonKeyframeStart);
         },
         putRun: async (record) => {
             const failure = options.putRunFails?.(record) ?? null;
@@ -124,7 +127,7 @@ function rig(
         ua: 'Mozilla/5.0 (test)',
     });
 
-    return { env, clock, run, made, stored, events };
+    return { env, clock, run, made, stored, flags, events };
 }
 
 test('a replayed recording becomes the init at the anchor and media at anchor plus media time', async () => {
@@ -194,6 +197,19 @@ test('a replayed recording becomes the init at the anchor and media at anchor pl
         r.stored.map((s) => s.seq),
         expected.map((_, i) => i),
     );
+});
+
+test('every stored segment hands add() its non-keyframe flag, false for keyframe-led cuts', async () => {
+    const r = rig();
+    r.env.stall(10);
+    await r.run.start();
+    await r.env.advance(59_000);
+    const stopping = r.run.stop('stop');
+    await r.env.advance(500);
+    await stopping;
+
+    assert.equal(r.flags.length, r.stored.length);
+    assert.ok(r.flags.every((flag) => flag === false));
 });
 
 test('stop() resolves only after the last blob, 500 ms later, is cut and stored', async () => {

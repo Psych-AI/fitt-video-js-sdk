@@ -11,6 +11,25 @@ export type Phase =
     | 'rejected'
     | 'error';
 
+/** The review copy's state (Plan 9): off for the session or the take, empty, recording, held as one file, or cleared. */
+export type LocalState = 'off' | 'empty' | 'recording' | 'held' | 'cleared';
+
+/** Why the copy is off or was cleared. */
+export type LocalReason =
+    | 'not_allowed'
+    | 'host_off'
+    | 'unsupported'
+    | 'second_run'
+    | 'fallback'
+    | 'over_budget'
+    | 'unreadable'
+    | 'server'
+    | 'next_session'
+    | 'reset'
+    | 'discard'
+    | 'destroy'
+    | 'unload';
+
 export interface SessionState {
     phase: Phase;
     upload: {

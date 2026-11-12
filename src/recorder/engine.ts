@@ -52,7 +52,11 @@ export interface RecorderEngineDeps {
     /** navigator.permissions, for device.permission_granted; undefined where it is missing. */
     permissions: Permissions | undefined;
     nextRunIndex(track: ChunkedTrack['track']): number;
-    add(record: SegmentRecord): Promise<unknown>;
+    /**
+     * `nonKeyframeStart` is true for a media segment cut past max_ms at a non-keyframe Cluster;
+     * the review copy reads it, nothing stores it (Plan 9).
+     */
+    add(record: SegmentRecord, nonKeyframeStart?: boolean): Promise<unknown>;
     putRun(record: RunRecord): Promise<void>;
     emit(type: string, payload: Record<string, unknown>): void;
     /** null clears it (a device came back). */
@@ -652,7 +656,8 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
 
                 return made;
             },
-            add: (record) => deps.add(record),
+            add: (record, nonKeyframeStart) =>
+                deps.add(record, nonKeyframeStart),
             putRun: (record) => deps.putRun(record),
             emit: (type, payload) => deps.emit(type, payload),
             // onRunError() has already handed the track to a replacement.

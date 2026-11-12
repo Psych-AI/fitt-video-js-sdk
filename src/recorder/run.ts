@@ -56,7 +56,11 @@ export interface RunDeps {
     mimeType: string;
     bitrates: { video?: number; audio: number };
     recorderFactory: RecorderFactory;
-    add(record: SegmentRecord): Promise<unknown>;
+    /**
+     * `nonKeyframeStart` is true for a media segment cut past max_ms at a non-keyframe Cluster;
+     * the review copy reads it, nothing stores it (Plan 9).
+     */
+    add(record: SegmentRecord, nonKeyframeStart?: boolean): Promise<unknown>;
     putRun(record: RunRecord): Promise<void>;
     emit(type: string, payload: Record<string, unknown>): void;
     /** The recorder fired `error` and the run stopped itself with recorder_error. */
@@ -233,7 +237,7 @@ export function createRun(deps: RunDeps): Run {
         }
 
         try {
-            await deps.add(segmentRecord);
+            await deps.add(segmentRecord, segment.nonKeyframeStart === true);
         } catch (error) {
             storeFailed(seq, error);
         }
