@@ -176,6 +176,22 @@ function make<K extends keyof HTMLElementTagNameMap>(
  * The element class, built when defineFittRecorder() runs: HTMLElement does
  * not exist in Node or in an SSR render, so nothing here runs at import.
  */
+/** The review video (Plan 9): the browser's own controls, never mirrored, never played by the element. */
+function makeReviewVideo(): HTMLVideoElement {
+    const review = make('video', {
+        part: 'review',
+        playsinline: '',
+        preload: 'metadata',
+        controls: '',
+        controlslist: 'nodownload noremoteplayback',
+        disablepictureinpicture: '',
+    });
+    review.playsInline = true;
+    review.controls = true;
+
+    return review;
+}
+
 function createRecorderClass(): CustomElementConstructor {
     return class FittRecorderElement extends HTMLElement {
         static get observedAttributes(): string[] {
@@ -469,16 +485,7 @@ function createRecorderClass(): CustomElementConstructor {
                 return this.#review;
             }
 
-            const review = make('video', {
-                part: 'review',
-                playsinline: '',
-                preload: 'metadata',
-                controls: '',
-                controlslist: 'nodownload noremoteplayback',
-                disablepictureinpicture: '',
-            });
-            review.playsInline = true;
-            review.controls = true;
+            const review = makeReviewVideo();
             const skeleton = make('div', {
                 class: 'review-skeleton',
                 'aria-hidden': 'true',
@@ -489,15 +496,25 @@ function createRecorderClass(): CustomElementConstructor {
             return review;
         }
 
-        /** Unbinds the review video, so the next stop binds it again. */
+        /**
+         * Unbinds the review video, so the next stop binds it again. The bound
+         * video is swapped for a fresh one: a player left running (a session
+         * swap, or the review attribute removed while it still waits for the
+         * server file) only ever reaches the detached video, never the next
+         * review (author's call 10: one session has one player).
+         */
         #endReview(): void {
             if (!this.#reviewing || this.#review === null) {
                 return;
             }
 
             this.#reviewing = false;
-            this.#review.removeAttribute('src');
-            this.#review.load();
+            const bound = this.#review;
+            const fresh = makeReviewVideo();
+            bound.replaceWith(fresh);
+            this.#review = fresh;
+            bound.removeAttribute('src');
+            bound.load();
         }
 
         #milestone(milestone: Milestone): void {

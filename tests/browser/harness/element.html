@@ -75,22 +75,23 @@
                 if (/\/status$/.test(url)) {
                     return json(
                         200,
-                        statusBody ?? {
-                            session: {
-                                id: base.session_id,
-                                status: 'recording',
-                                take: 1,
-                                end_ms: null,
+                        window.__statusOverride ??
+                            statusBody ?? {
+                                session: {
+                                    id: base.session_id,
+                                    status: 'recording',
+                                    take: 1,
+                                    end_ms: null,
+                                },
+                                tracks: [],
+                                checks: {
+                                    status: 'pending',
+                                    verdict: null,
+                                    take: 1,
+                                    reasons: [],
+                                },
+                                upload: { bytes_received: 0 },
                             },
-                            tracks: [],
-                            checks: {
-                                status: 'pending',
-                                verdict: null,
-                                take: 1,
-                                reasons: [],
-                            },
-                            upload: { bytes_received: 0 },
-                        },
                     );
                 }
 
@@ -166,6 +167,13 @@
                 document.body.append(element);
                 element.session = session;
             };
+
+            /** A second session with its own id, for swapping element.session (Plan 9). */
+            window.otherSession = () =>
+                FittVideo.session(
+                    { ...base, session_id: '01jbz8q4w6x0k3m5n7p9r2t4zz' },
+                    { environment: { fetch: answer() } },
+                );
 
             import * as internals from './internals.ts';
             window.internals = internals;

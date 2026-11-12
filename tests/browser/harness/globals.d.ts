@@ -25,6 +25,10 @@ interface Window {
         review?: boolean;
         slots?: string[];
     }): void;
+    /** element.html: when set, every status answer is this body instead of the mount's. */
+    __statusOverride?: unknown;
+    /** element.html: a second session, with its own id, answered locally as mount's is. */
+    otherSession(): unknown;
     /** element.html: every data-phase value any mounted element took, in order. */
     __phases: string[];
     /** element.html: every data-upload value any mounted element took, in order. */

@@ -163,8 +163,24 @@ test('with review, data-review follows the playback source, the recorded take se
             src: (root.querySelector('[part=review]') as HTMLVideoElement).src,
             controls: (root.querySelector('[part=review]') as HTMLVideoElement)
                 .controls,
+            record: display('[part=record]'),
+            timer: display('[part=timer]'),
         };
     });
+    // The stopped-phase record button and timer step aside for the browser's control bar.
+    expect(shown.record).toBe('none');
+    expect(shown.timer).toBe('none');
+    const barHit = await recorder.evaluate((el) => {
+        const root = el.shadowRoot!;
+        const video = root.querySelector('[part=review]')!;
+        const box = video.getBoundingClientRect();
+
+        return (
+            root.elementFromPoint(box.left + box.width / 2, box.bottom - 12) ===
+            video
+        );
+    });
+    expect(barHit).toBe(true);
     expect(shown.view).toBe('none');
     expect(shown.review).not.toBe('none');
     expect(shown.slot).not.toBe('none');
@@ -319,5 +335,127 @@ for (const controls of ['full', 'none']) {
         expect(shown.src).toBeNull();
         expect(shown.view).toBe(controls === 'none' ? 'block' : 'none');
         expect(shown.skeleton).toBe(controls === 'none' ? 'none' : 'block');
+    });
+}
+
+for (const leave of ['swap the session', 'remove the review attribute']) {
+    test(`after review ends (${leave}), the earlier player never reaches the element's review video`, async ({
+        page,
+        browserName,
+    }) => {
+        test.skip(
+            browserName !== 'chromium',
+            'the element logic is the same in every engine; Chromium records fastest',
+        );
+        await installMedia(page, browserName);
+        await openHarness(page, '/tests/browser/harness/element.html');
+        const waiting = await page.evaluate(async () => {
+            const base = await (
+                await fetch('/tests/fixtures/descriptor-answer.json')
+            ).json();
+
+            return {
+                session: {
+                    id: base.session_id,
+                    status: 'finalising',
+                    take: 1,
+                    end_ms: null,
+                },
+                tracks: [],
+                checks: {
+                    status: 'pending',
+                    verdict: null,
+                    take: 1,
+                    reasons: [],
+                },
+                upload: { bytes_received: 0 },
+                playback: {},
+            };
+        });
+        await page.evaluate(
+            (options) =>
+                window.mount({
+                    recording: options.recording,
+                    playback: { local: false, in_status: true },
+                    // Status playback is on and the server file is not ready yet.
+                    statusBody: options.waiting,
+                    controls: 'full',
+                    review: true,
+                    slots: ['review'],
+                }),
+            { recording: SHORT, waiting },
+        );
+        const recorder = page.locator('fitt-recorder');
+        await expect(recorder).toHaveAttribute('data-phase', 'ready');
+
+        type Driven = HTMLElement & {
+            session: {
+                start(): Promise<void>;
+                stop(): Promise<void>;
+                state: { playback: { source: string } };
+            };
+        };
+        await page.evaluate(() =>
+            (document.querySelector('fitt-recorder') as Driven).session.start(),
+        );
+        await expect(recorder).toHaveAttribute('data-phase', 'recording', {
+            timeout: 10_000,
+        });
+        await page.waitForTimeout(3000);
+        await page.evaluate(() =>
+            (document.querySelector('fitt-recorder') as Driven).session.stop(),
+        );
+        await expect(recorder).toHaveAttribute('data-review', 'preparing', {
+            timeout: 15_000,
+        });
+
+        await page.evaluate((how) => {
+            const element = document.querySelector('fitt-recorder') as Driven;
+            (window as unknown as { __earlier: unknown }).__earlier =
+                element.session;
+
+            if (how === 'swap the session') {
+                (element as unknown as { session: unknown }).session =
+                    window.otherSession();
+            } else {
+                element.removeAttribute('review');
+            }
+        }, leave);
+        await expect(recorder).not.toHaveAttribute('data-review', /.*/);
+
+        // The earlier session's server file is ready now: its player switches to it.
+        await page.evaluate((body) => {
+            window.__statusOverride = {
+                ...body,
+                session: { ...body.session, status: 'ready' },
+                playback: {
+                    camera: { url: '/tests/fixtures/earlier-take.webm' },
+                },
+            };
+        }, waiting);
+        await expect
+            .poll(
+                () =>
+                    page.evaluate(
+                        () =>
+                            (
+                                window as unknown as {
+                                    __earlier: Driven['session'];
+                                }
+                            ).__earlier.state.playback.source,
+                    ),
+                { timeout: 10_000 },
+            )
+            .toBe('server');
+
+        const src = await recorder.evaluate((el) =>
+            el.shadowRoot!.querySelector('[part=review]')!.getAttribute('src'),
+        );
+        expect(src).toBeNull();
+        expect(
+            await recorder.evaluate(
+                (el) => el.shadowRoot!.querySelectorAll('[part=review]').length,
+            ),
+        ).toBe(1);
     });
 }

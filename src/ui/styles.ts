@@ -25,6 +25,8 @@ export const STYLES = `
     --fitt-recorder-muted-ink: #4e4d6b;
     --fitt-recorder-skeleton: #2a2852;
     --fitt-recorder-inset: 10px;
+    /* Clears the browser's own video control bar in review. */
+    --fitt-recorder-review-bar: 56px;
     --fitt-recorder-button-size: 44px;
     --fitt-recorder-countdown-size: 88px;
     --fitt-recorder-font: Inter, 'Helvetica Neue', Arial, sans-serif;
@@ -125,6 +127,20 @@ button:focus-visible {
 
 :host([data-review='preparing']:not([controls='none'])) .review-skeleton {
     display: block;
+}
+
+/*
+ * In review the stopped-phase record button and timer step aside, so the
+ * browser's own control bar takes every click (RecorderReview frames 1 to 4).
+ * The host's controls slot sits above that bar.
+ */
+:host([data-review='local']:not([controls='none'])) [part='record'],
+:host([data-review='server']:not([controls='none'])) [part='record'],
+:host([data-review='preparing']:not([controls='none'])) [part='record'],
+:host([data-review='local']:not([controls='none'])) [part='timer'],
+:host([data-review='server']:not([controls='none'])) [part='timer'],
+:host([data-review='preparing']:not([controls='none'])) [part='timer'] {
+    display: none;
 }
 
 @keyframes fitt-recorder-pulse {
@@ -449,6 +465,11 @@ button:focus-visible {
     display: block;
     right: var(--fitt-recorder-inset);
     bottom: var(--fitt-recorder-inset);
+}
+
+:host([data-review='local']:not([controls='none'])) .slot-controls,
+:host([data-review='server']:not([controls='none'])) .slot-controls {
+    bottom: var(--fitt-recorder-review-bar);
 }
 
 :host([data-phase='idle']) .slot-instructions,
