@@ -72,7 +72,9 @@ function readChecks(body: Value): ChecksResult | null {
  * Polls the status at 0, every second until 10 s, then every two seconds,
  * while the elapsed time (on performance.now()) is below `timeoutMs`. A
  * slow answer is never overlapped: the next poll waits for it. `look`
- * returns true once it has settled the wait.
+ * returns true once it has settled the wait. When `cancelled` is true at the
+ * start of a poll, the wait settles silently: it never resolves or rejects
+ * and polls no more (Plan 9, a replaced or destroyed player).
  */
 function poll(
     env: Environment,
@@ -80,6 +82,7 @@ function poll(
     timeoutMs: number,
     look: (answer: WireAnswer) => boolean,
     onTimeout: () => void,
+    cancelled: () => boolean = () => false,
 ): void {
     const startedAt = env.perfNow();
     let settled = false;
@@ -92,6 +95,13 @@ function poll(
     }, timeoutMs);
 
     const once = (pollAt: number): void => {
+        if (cancelled()) {
+            settled = true;
+            env.timers.clearTimeout(deadline);
+
+            return;
+        }
+
         status()
             .catch((): WireAnswer => ({
                 status: 0,
@@ -195,12 +205,14 @@ export function waitForChecks(
  * code (detail `{reason: 'timeout'}`) when no URL arrived by `timeoutMs`.
  * Rejects `track_failed` (detail `{reason}`, the track's `failure_reason`) as
  * soon as a status shows the awaited track failed, before it looks for
- * playback.
+ * playback. Once `cancelled` returns true it polls no more and never
+ * settles.
  */
 export function waitForReady(
     deps: { env: Environment; status(): Promise<WireAnswer> },
     track: TrackName,
     timeoutMs: number = DEFAULT_TIMEOUT_MS,
+    cancelled: () => boolean = () => false,
 ): Promise<string> {
     return new Promise((resolve, reject) => {
         poll(
@@ -256,6 +268,7 @@ export function waitForReady(
                         reason: 'timeout',
                     }),
                 ),
+            cancelled,
         );
     });
 }

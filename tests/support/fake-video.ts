@@ -26,3 +26,35 @@ export function fakeObjectUrls(): ObjectUrls & {
         },
     };
 }
+
+/** The parts of a video element session.playback() uses; play, pause, end and loaded act as the browser does. */
+export class FakeVideo extends EventTarget {
+    src = '';
+    currentTime = 0;
+    paused = true;
+    ended = false;
+    duration = Number.NaN;
+
+    play(): void {
+        this.paused = false;
+        this.dispatchEvent(new Event('play'));
+    }
+
+    pause(): void {
+        this.paused = true;
+        this.dispatchEvent(new Event('pause'));
+    }
+
+    end(): void {
+        this.paused = true;
+        this.ended = true;
+        this.dispatchEvent(new Event('ended'));
+    }
+
+    /** The current src loaded its metadata. */
+    loaded(duration: number): void {
+        this.duration = duration;
+        this.ended = false;
+        this.dispatchEvent(new Event('loadedmetadata'));
+    }
+}

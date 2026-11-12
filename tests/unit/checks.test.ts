@@ -269,3 +269,37 @@ test('a failed track with no failure_reason rejects track_failed with a null rea
     await env.advance(0);
     await settled;
 });
+
+test('a cancelled waitForReady polls no more and never settles', async () => {
+    const env = fakeEnvironment();
+    let polls = 0;
+    let cancelled = false;
+    let settled = false;
+    void waitForReady(
+        {
+            env,
+            status: async () => {
+                polls++;
+
+                return statusWith(
+                    { status: 'pending', verdict: null, take: 1, reasons: [] },
+                    { playback: {} },
+                );
+            },
+        },
+        'camera',
+        60_000,
+        () => cancelled,
+    ).then(
+        () => (settled = true),
+        () => (settled = true),
+    );
+    await env.advance(2500);
+    cancelled = true;
+    const before = polls;
+    await env.advance(60_000);
+
+    assert.equal(before, 3);
+    assert.equal(polls, before);
+    assert.equal(settled, false);
+});

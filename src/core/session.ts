@@ -62,6 +62,7 @@ import {
 } from './lifecycle.ts';
 import { buildManifest } from './manifest.ts';
 import { resolveSettings, type SessionOptions } from './options.ts';
+import { startPlayback } from './playback.ts';
 import { createQueue, type Queue } from './queue.ts';
 import { classify } from './responses.ts';
 import { planResume } from './resume-plan.ts';
@@ -121,6 +122,12 @@ export interface FittSession {
         track: TrackName;
         timeoutMs?: number;
     }): Promise<string>;
+    /**
+     * Plays the stopped take in `video` (spec 6.10): the server file if it is ready, else the
+     * local copy, else preparing until the server file is ready. Switches to the server file
+     * only while the video is paused or ended. Never calls play().
+     */
+    playback(video: HTMLVideoElement): Promise<'local' | 'server'>;
     reset(): Promise<void>;
     discard(): Promise<void>;
     event(type: string, payload?: Record<string, unknown> | unknown[]): boolean;
@@ -495,6 +502,7 @@ function invalidSession(detail: Record<string, unknown>): FittSession {
         finalise: refuse,
         waitForChecks: refuse,
         waitForReady: refuse,
+        playback: refuse,
         reset: refuse,
         discard: refuse,
         event: () => false,
@@ -656,6 +664,8 @@ export function createSession(
     let tombstoning = false;
     let finalised = false;
     let destroyed = false;
+    /** Bumped by every playback() call, a return to ready, discard() and destroy(): an older player is cancelled (author's call 7). */
+    let playbackRound = 0;
     let heartbeats = false;
     let environmentSent = false;
     let storageReported = false;
@@ -2170,6 +2180,7 @@ export function createSession(
         if (phase === 'ready') {
             // The host's reset and the too_short reset both return to ready (Plan 9, author's call 6).
             copy.clear('reset');
+            playbackRound += 1;
         }
 
         if (phase === 'stopped') {
@@ -3597,6 +3608,44 @@ export function createSession(
             return url;
         },
 
+        async playback(video): Promise<'local' | 'server'> {
+            await whenReady();
+
+            if (!owner) {
+                return otherTabRefusal();
+            }
+
+            const phase = lifecycle?.phase() ?? 'idle';
+
+            if (
+                phase === 'countdown' ||
+                phase === 'recording' ||
+                phase === 'stopping'
+            ) {
+                return rejectWith('invalid_state', { phase });
+            }
+
+            // A later call cancels the earlier player (author's call 7).
+            playbackRound += 1;
+            const round = playbackRound;
+
+            return startPlayback(video, {
+                env,
+                copy,
+                inStatus: descriptor.playback?.in_status === true,
+                waitServer: (timeoutMs, cancelled) =>
+                    pollReady(
+                        { env, status: () => api!.status() },
+                        'camera',
+                        timeoutMs,
+                        cancelled,
+                    ),
+                cancelled: () => destroyed || round !== playbackRound,
+                onSource: (source) => patchPlayback({ source }),
+                emit,
+            });
+        },
+
         async reset(): Promise<void> {
             await whenReady();
 
@@ -3688,8 +3737,9 @@ export function createSession(
                 return otherTabRefusal();
             }
 
-            // A discard clears the review copy (Plan 9, author's call 6).
+            // A discard clears the review copy (Plan 9, author's call 6) and ends the player.
             copy.clear('discard');
+            playbackRound += 1;
 
             return runDiscard();
         },
@@ -3761,6 +3811,7 @@ export function createSession(
             // destroy() clears the review copy first (Plan 9, author's call 6).
             copy.clear('destroy');
             destroyed = true;
+            playbackRound += 1;
             engine?.release();
             detachPage();
         },
