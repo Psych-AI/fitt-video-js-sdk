@@ -61,6 +61,11 @@
         "extension_ms": 30000,
         "warning_before_end_ms": 15000
     },
+    "playback": {
+        "local": true,
+        "local_max_bytes": 100000000,
+        "in_status": false
+    },
     "signals": { "groups": ["device", "recorder", "net", "attention"] },
     "enforce": {},
     "events": { "batch_ms": 5000 },

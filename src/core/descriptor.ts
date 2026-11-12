@@ -71,6 +71,16 @@ export interface RecordingLimits {
     warning_before_end_ms: number;
 }
 
+/**
+ * The review rule the server computed (Plan 9, author's call 4). Absent from
+ * servers before Plan 9: no local copy and no status playback.
+ */
+export interface PlaybackBlock {
+    local: boolean;
+    local_max_bytes: number;
+    in_status: boolean;
+}
+
 export interface Descriptor {
     session_id: string;
     recipe: Recipe;
@@ -85,6 +95,7 @@ export interface Descriptor {
     endpoints: { api: string; media: string | null };
     tracks: DescriptorTrack[];
     recording?: RecordingLimits;
+    playback?: PlaybackBlock;
     signals: { groups: string[] };
     enforce: Record<string, unknown>;
     events: { batch_ms: number };
@@ -440,6 +451,13 @@ function read(input: unknown): Descriptor {
 
     if (input.checks !== undefined) {
         object(input, 'checks', '');
+    }
+
+    if (input.playback !== undefined) {
+        const playback = object(input, 'playback', '');
+        boolean(playback, 'local', 'playback');
+        integer(playback, 'local_max_bytes', 'playback', true);
+        boolean(playback, 'in_status', 'playback');
     }
 
     integers(input, 'queue', '', ['abandon_after_ms', 'buffer_budget_bytes']);

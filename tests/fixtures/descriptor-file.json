@@ -27,6 +27,11 @@
             }
         }
     ],
+    "playback": {
+        "local": false,
+        "local_max_bytes": 100000000,
+        "in_status": false
+    },
     "signals": { "groups": [] },
     "enforce": {},
     "events": { "batch_ms": 5000 },

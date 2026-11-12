@@ -44,6 +44,11 @@
         "extension_ms": 0,
         "warning_before_end_ms": 0
     },
+    "playback": {
+        "local": false,
+        "local_max_bytes": 100000000,
+        "in_status": false
+    },
     "signals": {
         "groups": [
             "attention",

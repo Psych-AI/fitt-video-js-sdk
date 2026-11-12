@@ -191,3 +191,30 @@ test('a direct block names what is wrong with it', () => {
         reason: 'type',
     });
 });
+
+test('the playback block reads, an older descriptor without it reads, and a bad one names its path', () => {
+    const answer = readDescriptor(fixture('answer'));
+    assert.ok(answer.ok);
+    assert.deepEqual(answer.descriptor.playback, {
+        local: true,
+        local_max_bytes: 100_000_000,
+        in_status: false,
+    });
+
+    const monitor = readDescriptor(fixture('monitor'));
+    assert.ok(monitor.ok);
+    assert.equal(monitor.descriptor.playback?.local, false);
+
+    const older = fixture('answer');
+    delete older.playback;
+    assert.equal(readDescriptor(older).ok, true);
+
+    const bad = fixture('answer');
+    bad.playback.local = 'yes';
+    assert.deepEqual(readDescriptor(bad), {
+        ok: false,
+        code: 'config_invalid',
+        path: 'playback.local',
+        reason: 'type',
+    });
+});
