@@ -36,6 +36,7 @@ import {
     jsonRequest,
     segmentPut,
 } from '../../../src/core/wire.ts';
+import { seekableHead, type SeekablePart } from '../../../src/cut/seekable.ts';
 import { FittVideo } from '../../../src/index.ts';
 import {
     createRecorderEngine,
@@ -251,6 +252,130 @@ export function fromBase64(text: string): ArrayBuffer {
     }
 
     return bytes.buffer;
+}
+
+/** The mean luma of the video's current frame, drawn into a 64 x 48 canvas (the playback gate's measure). */
+function frameLuma(video: HTMLVideoElement): number {
+    const canvas = Object.assign(document.createElement('canvas'), {
+        width: 64,
+        height: 48,
+    });
+    const context = canvas.getContext('2d')!;
+    context.drawImage(video, 0, 0, 64, 48);
+    const data = context.getImageData(0, 0, 64, 48).data;
+    let sum = 0;
+
+    for (let i = 0; i < data.length; i += 4) {
+        sum += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+    }
+
+    return sum / (data.length / 4);
+}
+
+/** Plays a seekable review copy built in this page from cut segments (Plan 9): its duration, where each seek landed and the frame luma there, and how far one play moved. */
+export async function reviewFixture(options: {
+    mime: string;
+    init: string;
+    media: { base64: string; startMs: number; durationMs: number }[];
+    seeks: number[];
+}): Promise<{
+    src: string;
+    duration: number;
+    seeks: { at: number; currentTime: number; luma: number }[];
+    played: number;
+    error: string | null;
+}> {
+    const parts: SeekablePart[] = options.media.map((each) => ({
+        bytes: new Uint8Array(fromBase64(each.base64)),
+        startMs: each.startMs,
+        durationMs: each.durationMs,
+        nonKeyframeStart: false,
+    }));
+    const head = seekableHead(
+        options.mime,
+        new Uint8Array(fromBase64(options.init)),
+        parts,
+    );
+
+    if (head === null) {
+        return { src: '', duration: 0, seeks: [], played: 0, error: 'no head' };
+    }
+
+    const src = URL.createObjectURL(
+        new Blob(
+            [head as BlobPart, ...parts.map((part) => part.bytes as BlobPart)],
+            { type: options.mime },
+        ),
+    );
+    const video = document.createElement('video');
+    video.muted = true;
+    video.preload = 'auto';
+    video.src = src;
+    document.body.appendChild(video);
+
+    const once = (type: string): Promise<void> =>
+        new Promise((resolve, reject) => {
+            const done = (): void => {
+                clearTimeout(timer);
+                video.removeEventListener(type, onEvent);
+                video.removeEventListener('error', onError);
+            };
+            const onEvent = (): void => {
+                done();
+                resolve();
+            };
+            const onError = (): void => {
+                done();
+                reject(new Error(`media error ${video.error?.code ?? 0}`));
+            };
+            const timer = setTimeout(() => {
+                done();
+                reject(new Error(`${type} timed out`));
+            }, 8000);
+            video.addEventListener(type, onEvent);
+            video.addEventListener('error', onError);
+        });
+    const wait = (ms: number): Promise<void> =>
+        new Promise((resolve) => setTimeout(resolve, ms));
+    const seeks: { at: number; currentTime: number; luma: number }[] = [];
+    let duration = 0;
+    let played = 0;
+
+    try {
+        await once('loadedmetadata');
+        duration = video.duration;
+
+        for (const at of options.seeks) {
+            const seeked = once('seeked');
+            video.currentTime = at;
+            await seeked;
+            await wait(120);
+            seeks.push({
+                at,
+                currentTime: video.currentTime,
+                luma: frameLuma(video),
+            });
+        }
+
+        const from = video.currentTime;
+        await video.play();
+        await wait(700);
+        played = video.currentTime - from;
+        video.pause();
+
+        return { src, duration: video.duration, seeks, played, error: null };
+    } catch (error) {
+        return {
+            src,
+            duration,
+            seeks,
+            played,
+            error: error instanceof Error ? error.message : String(error),
+        };
+    } finally {
+        video.remove();
+        URL.revokeObjectURL(src);
+    }
 }
 
 /** One segment a contract spec hands the page: its bytes as base64. */
