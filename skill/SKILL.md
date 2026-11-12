@@ -11,7 +11,9 @@ description: >-
   fitt-event, fitt-milestone, fitt-checks, fitt-ready), iframe
   allow="camera; microphone; fullscreen", and error codes such as
   network_blocked, token_expired, token_refresh_blocked, manifests_blocked,
-  permission_denied, too_short.
+  permission_denied, too_short; review right after recording with
+  session.playback(video), <fitt-recorder review>, data-review, the review
+  slot, playback.source, state.playback and playback_in_status (SDK 1.3.0).
 ---
 
 # Fitt Video SDK integration (version 1)
@@ -48,6 +50,8 @@ byte-for-byte mirrors of it. SDK version 1.x.
 | Start a take | Server: `POST /api/v1/sessions`. Page: `const s = FittVideo.session(descriptor); el.session = s;` then the element's record button, or `await s.prepare(); await s.start();` |
 | Stop and hand in | `await s.stop();` then `await s.finalise();` once the candidate is done with every take |
 | Record again | `await s.reset();` from `stopped` or `rejected`, then `start()` again |
+| Review the take right after stop | Create the session with `playback_in_status: true`, then `await s.finalise();` at stop and `await s.playback(videoEl);` (or `<fitt-recorder review>`). See "Review right after recording" |
+| Retake after finalise | A new session from your server (`POST /api/v1/sessions` again), then `FittVideo.session(newDescriptor)` |
 | Throw the session away | `await s.discard();` |
 | Wait for the verdict | `const checks = await s.waitForChecks({ timeoutMs: 60000 });` `checks.verdict` is `accept`, `reject`, `unknown` or null. Act on the webhook, not on this |
 | Get a playback URL | `const url = await s.waitForReady({ track: 'camera' });` Needs `playback_in_status: true` on `POST /api/v1/sessions`. Rejects `playback_not_enabled` with an empty `detail` when the session has no `playback_in_status`, and with `detail.reason: 'timeout'` when no URL came in time. Rejects `track_failed` with `detail.reason` (the track's `failure_reason`, for example `no_decodable_run`) as soon as the status shows the track failed |
@@ -223,6 +227,43 @@ Phases: `idle`, `preparing`, `ready`, `countdown`, `recording`,
   `GET /sessions/{id}` or the webhook. A ready track's URL lasts 2 minutes
   and is minted again on each poll.
 
+## Review right after recording (SDK 1.3.0)
+
+In the `answer` recipe the person can watch the take at once after stop,
+even while segments still upload.
+
+- **Create the session with `playback_in_status: true`.** Without it the
+  page can show only the browser's own copy and never switches to the
+  server file (the PHP SDK's `Recipe::answer()` leaves it off).
+- **Finalise at stop**, then call `await s.playback(videoEl)` on your own
+  `<video controls>`. It plays the server file when it is ready, else a
+  seekable copy the browser holds in memory (when the descriptor's
+  `playback.local` is true), else it waits for the server file. It
+  switches from the copy to the server file only while the video is paused
+  or ended, and keeps the place. It never calls `play()`. It resolves
+  `'local'` or `'server'`, and rejects `playback_not_enabled`
+  (`detail.reason: 'no_local_copy'`) with no copy and no
+  `playback_in_status`, or `invalid_state` during a take or on the preview
+  element.
+- **Or let the element review:** `<fitt-recorder review>`. After stop it
+  sets `data-review` (`preparing`, `local`, `server` or `none`) and shows
+  your `review` slot for your words ("Record again" stays yours). With
+  `controls="full"` or `"minimal"` it hides the camera view and plays the
+  take in its own video. With `controls="none"` it binds no player: call
+  `s.playback()` on your element, and `data-review` follows it. One
+  session has one player: a later `playback()` call replaces the earlier
+  one.
+- **What to listen to:** the `playback.source` event (`onEvent` or
+  `fitt-event`; never uploaded) and `state.playback` in `fitt-state`
+  (`source`, `local`, `localBytes`, `localReason`).
+- **A retake after finalise is a new session** created by your server.
+- **Only the server file after a reload,** for a monitor session, a
+  multi-run take, or a take over the server's budget: the copy lives in
+  memory for one take with one run, and a reset, a discard, `destroy()`,
+  leaving the page or a new session clears it.
+- To keep a page server-only, pass `{ playback: { local: false } }` to
+  `FittVideo.session()`.
+
 ## Conversation: `mixAudio()`
 
 For the `conversation` recipe, pass the interviewer's audio
@@ -335,8 +376,9 @@ above or `too_short`, `countdown_cancelled`, `invalid_state`,
 - Send the API key to the page.
 - Depend on an error's message text: match `code`.
 - Mirror the recording: only the preview is mirrored.
-- Play a take back from local blobs or `session.stream` recordings:
-  MediaRecorder output has no duration header and seeks badly. Use the URL
+- Play a take back from your own local blobs or `session.stream`
+  recordings: MediaRecorder output has no duration header and seeks badly.
+  Use `session.playback(video)`, which builds a seekable copy, or the URL
   from `waitForReady()` or from `GET /api/v1/videos/{id}/playback` on your
   server, or after the `video.ready` webhook.
 - Treat the page's verdict as final: the webhook decides.
