@@ -1470,6 +1470,11 @@ export function createSession(
         removeOnline = null;
         const phase = lifecycle?.phase();
 
+        if (code === 'discarded') {
+            // A discard the server holds (another tab, the host's server) clears the copy too (Plan 9, author's call 6).
+            copy.clear('discard');
+        }
+
         if (
             phase === 'countdown' ||
             phase === 'recording' ||
@@ -2156,8 +2161,9 @@ export function createSession(
             void persist();
         }
 
-        if (phase === 'stopped' && activeTake === localTake) {
+        if (phase === 'stopped' && activeTake === localTake && !closed) {
             // The take stopped: the copy builds its one file (Plan 9, author's call 1).
+            // A stop forced by the server's close never builds one: the take's tail is dropped.
             copy.complete(localTake, record?.take_start_ms ?? null);
         }
 

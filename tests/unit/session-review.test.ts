@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { sessionWith } from '../../src/core/session.ts';
 import { MemoryQueueStore, type SegmentRecord } from '../../src/core/store.ts';
-import { fakeEnvironment } from '../support/fake-env.ts';
+import { fakeEnvironment, json, until } from '../support/fake-env.ts';
 import { fakeMedia } from '../support/fake-media.ts';
 import { fakeObjectUrls } from '../support/fake-video.ts';
 import { descriptorFixture } from '../support/records.ts';
@@ -171,6 +171,67 @@ test('a too_short stop clears the copy as a reset', async () => {
             r.session.state.playback.localBytes,
         ],
         ['cleared', 'reset', 0],
+    );
+});
+
+/** Delivers the recorders' chunks now, as a recorder with a timeslice does while recording. */
+function deliverChunks(r: ReturnType<typeof answerRig>): void {
+    for (const recorder of r.media.recorders) {
+        const chunks = (recorder as unknown as { chunks: Uint8Array[] }).chunks;
+
+        for (const chunk of chunks) {
+            const event = new Event('dataavailable');
+            Object.defineProperty(event, 'data', {
+                value: new Blob([chunk as BlobPart]),
+            });
+            recorder.dispatchEvent(event);
+        }
+    }
+}
+
+for (const code of ['discarded', 'session_closed'] as const) {
+    test(`a ${code} answer on a camera segment while recording never leaves a held copy`, async () => {
+        const r = answerRig();
+        r.respond({
+            '/segments/': () => json(409, { error: { code, message: 'x' } }),
+        });
+        await r.session.prepare();
+        const starting = r.session.start();
+        await r.env.advance(3000);
+        await starting;
+        await r.env.advance(2000);
+        deliverChunks(r);
+        await until(() => r.session.state.phase === 'stopped');
+        await r.env.advance(100);
+
+        assert.ok(r.segmentCalls().length > 0);
+        assert.notEqual(r.session.state.playback.local, 'held');
+
+        if (code === 'discarded') {
+            assert.deepEqual(
+                [
+                    r.session.state.playback.local,
+                    r.session.state.playback.localReason,
+                    r.session.state.playback.localBytes,
+                ],
+                ['cleared', 'discard', 0],
+            );
+        }
+    });
+}
+
+test('a discarded answer after the take stopped clears the held copy', async () => {
+    const r = answerRig();
+    r.respond({
+        '/segments/': () =>
+            json(409, { error: { code: 'discarded', message: 'x' } }),
+    });
+    await recordTake(r, 6000);
+    await until(() => r.session.state.playback.local !== 'held');
+
+    assert.deepEqual(
+        [r.session.state.playback.local, r.session.state.playback.localReason],
+        ['cleared', 'discard'],
     );
 });
 
