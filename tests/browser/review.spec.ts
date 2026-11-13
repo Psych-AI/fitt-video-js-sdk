@@ -50,26 +50,29 @@ for (const { set, endMs } of CASES) {
         page,
         browserName,
     }, testInfo) => {
+        // On Linux the WebKit engine is WebKitGTK, which fails to play these WebM sets even
+        // uncut. FITT_REVIEW_WEBKIT_ALL=1 runs them anyway (on a Mac, where WebKit is close to Safari).
+        const owed =
+            browserName === 'webkit' &&
+            process.env.FITT_REVIEW_WEBKIT_ALL !== '1';
         test.fixme(
-            browserName === 'webkit' && set === 'chrome-vp8-kf',
-            'webkit does not seek a local copy of chrome-vp8-kf: the owner decides, https://github.com/Psych-AI/fitt-video/pull/18#issuecomment-6818077890',
+            owed &&
+                ['chrome-vp8-kf', 'chrome-vp9-kf', 'chrome-vp8-nokf'].includes(
+                    set,
+                ),
+            `webkit seeks a local copy of ${set} but fails to play it ("Could not demultiplex stream."), as it does the uncut recording: the owner decides, https://github.com/Psych-AI/fitt-video/pull/18#issuecomment-6818077890`,
         );
         test.fixme(
-            browserName === 'webkit' && set === 'chrome-vp9-kf',
-            'webkit does not seek a local copy of chrome-vp9-kf: the owner decides, https://github.com/Psych-AI/fitt-video/pull/18#issuecomment-6818077890',
-        );
-        test.fixme(
-            browserName === 'webkit' && set === 'chrome-vp8-nokf',
-            'webkit does not seek a local copy of chrome-vp8-nokf: the owner decides, https://github.com/Psych-AI/fitt-video/pull/18#issuecomment-6818077890',
-        );
-        test.fixme(
-            browserName === 'webkit' && set === 'firefox-vp8',
-            'webkit does not seek a local copy of firefox-vp8: the owner decides, https://github.com/Psych-AI/fitt-video/pull/18#issuecomment-6818187709',
+            owed && set === 'firefox-vp8',
+            'webkit loads a local copy of firefox-vp8 only some of the time, as it does the uncut recording: the owner decides, https://github.com/Psych-AI/fitt-video/pull/18#issuecomment-6818187709',
         );
         if (browserName === 'webkit') {
             testInfo.annotations.push({
                 type: 'engine',
-                description: 'WebKitGTK on Linux, not Safari',
+                description:
+                    process.platform === 'darwin'
+                        ? 'WebKit on macOS, the engine Safari uses'
+                        : 'WebKitGTK on Linux, not Safari',
             });
         }
 
