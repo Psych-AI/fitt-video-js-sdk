@@ -23,6 +23,7 @@ export type LocalReason =
     | 'fallback'
     | 'over_budget'
     | 'unreadable'
+    | 'unplayable'
     | 'server'
     | 'next_session'
     | 'reset'

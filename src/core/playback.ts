@@ -17,6 +17,7 @@ import type { PlaybackSource } from './state.ts';
 export type PlaybackElement = Pick<
     HTMLVideoElement,
     | 'src'
+    | 'preload'
     | 'currentTime'
     | 'paused'
     | 'ended'
@@ -166,6 +167,66 @@ export async function startPlayback(
         });
     };
 
+    /**
+     * A media error on the local copy (Safari 18.6 raises one on the first ranged read of a
+     * blob: URL it preloaded metadata-only, even though the bytes play with preload auto):
+     * the copy is cleared as `unplayable` and the player falls back to the server file at the
+     * same place, or to no source when the status carries no playback.
+     */
+    const watchLocal = (): void => {
+        listen('error', () => {
+            if (!live() || current !== 'local') {
+                return;
+            }
+
+            const at = video.currentTime;
+            const lead = deps.copy.leadInMs();
+            deps.copy.clear('unplayable');
+
+            if (server === null) {
+                setSource('none');
+                deps.emit('playback.source', {
+                    source: 'none',
+                    from: 'local',
+                    at: 'error',
+                });
+
+                return;
+            }
+
+            setSource('preparing');
+            deps.emit('playback.source', {
+                source: 'preparing',
+                from: 'local',
+                at: 'error',
+            });
+
+            server.then(
+                (url) => {
+                    if (!live() || current !== 'preparing') {
+                        return;
+                    }
+
+                    seekOnLoad(at + lead / 1000);
+                    video.src = url;
+                    setSource('server');
+                    deps.emit('playback.source', {
+                        source: 'server',
+                        from: 'local',
+                        at: 'error',
+                        offset_ms: lead,
+                    });
+                    watchExpiry();
+                },
+                () => {
+                    if (live() && current === 'preparing') {
+                        setSource('none');
+                    }
+                },
+            );
+        });
+    };
+
     const toServer = (url: string, at: 'start' | 'paused' | 'ended'): void => {
         if (!live()) {
             return;
@@ -269,17 +330,18 @@ export async function startPlayback(
         return wait;
     };
 
+    const server = waitServer();
+
     if (playing && held) {
         // Never set src while the video plays: keep the local copy and wait for a pause.
         setSource('local');
-        const server = waitServer();
+        watchLocal();
         server?.then(switchWhenIdle, () => undefined);
 
         return 'local';
     }
 
     setSource('preparing');
-    const server = waitServer();
 
     if (held && server !== null) {
         const first = await Promise.race([
@@ -307,8 +369,12 @@ export async function startPlayback(
         const url = deps.copy.objectUrl();
 
         if (url !== null) {
+            // The copy is already in memory, so load it whole. Safari 18.6 fails a blob: URL with
+            // preload metadata on its first ranged read (media error 2, "Media failed to load").
+            video.preload = 'auto';
             video.src = url;
             setSource('local');
+            watchLocal();
             deps.emit('playback.source', { source: 'local', at: 'start' });
             server?.then(switchWhenIdle, () => undefined);
 

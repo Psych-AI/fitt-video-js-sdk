@@ -30,6 +30,7 @@ export function fakeObjectUrls(): ObjectUrls & {
 /** The parts of a video element session.playback() uses; play, pause, end and loaded act as the browser does. */
 export class FakeVideo extends EventTarget {
     src = '';
+    preload = 'metadata';
     currentTime = 0;
     paused = true;
     ended = false;
@@ -49,6 +50,11 @@ export class FakeVideo extends EventTarget {
         this.paused = true;
         this.ended = true;
         this.dispatchEvent(new Event('ended'));
+    }
+
+    /** The engine refused the current src: a media error, as Safari 18.6 raises on a blob: URL it preloaded metadata-only. */
+    fail(): void {
+        this.dispatchEvent(new Event('error'));
     }
 
     /** The current src loaded its metadata. */

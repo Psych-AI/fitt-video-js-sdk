@@ -133,6 +133,77 @@ test('the local copy plays while the server file is not ready', async () => {
     );
 });
 
+test('the local copy is loaded whole: preload is auto before its src is set (Safari 18.6 fails a metadata-only blob on play)', async () => {
+    const r = reviewRig();
+    await recordTake(r, 6000);
+    const video = new FakeVideo();
+    assert.equal(video.preload, 'metadata');
+    await playLocal(r, video);
+
+    assert.equal(video.preload, 'auto');
+    assert.equal(video.src, 'blob:fake/1');
+});
+
+test('a media error on the local copy clears it as unplayable and falls back to the server file at the same place', async () => {
+    const r = reviewRig();
+    const seen = sources(r);
+    await recordTake(r, 6000);
+    const video = new FakeVideo();
+    await playLocal(r, video);
+    video.play();
+    video.currentTime = 2;
+    video.fail();
+
+    assert.deepEqual(
+        [
+            r.session.state.playback.source,
+            r.session.state.playback.local,
+            r.session.state.playback.localReason,
+        ],
+        ['preparing', 'cleared', 'unplayable'],
+    );
+    assert.deepEqual(r.urls.revoked, ['blob:fake/1']);
+    assert.deepEqual(seen.at(-1), {
+        source: 'preparing',
+        from: 'local',
+        at: 'error',
+    });
+
+    r.server.url = SERVER;
+    await r.env.advance(4000);
+
+    assert.equal(video.src, SERVER);
+    video.loaded(9);
+    const lead = await leadIn(r);
+    assert.equal(video.currentTime, 2 + lead / 1000);
+    assert.deepEqual(seen.at(-1), {
+        source: 'server',
+        from: 'local',
+        at: 'error',
+        offset_ms: lead,
+    });
+    assert.equal(r.session.state.playback.source, 'server');
+});
+
+test('a media error on the local copy with no server playback leaves no source and keeps the reason', async () => {
+    const r = reviewRig({ inStatus: false });
+    const seen = sources(r);
+    await recordTake(r, 6000);
+    const video = new FakeVideo();
+    await playLocal(r, video);
+    video.fail();
+
+    assert.deepEqual(
+        [r.session.state.playback.source, r.session.state.playback.localReason],
+        ['none', 'unplayable'],
+    );
+    assert.deepEqual(seen.at(-1), {
+        source: 'none',
+        from: 'local',
+        at: 'error',
+    });
+});
+
 test('the switch waits for a pause, keeps the place plus the lead-in, and never cuts in mid play', async () => {
     const r = reviewRig();
     const seen = sources(r);

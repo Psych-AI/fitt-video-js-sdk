@@ -181,7 +181,8 @@ function makeReviewVideo(): HTMLVideoElement {
     const review = make('video', {
         part: 'review',
         playsinline: '',
-        preload: 'metadata',
+        // auto, never metadata: Safari 18.6 fails a metadata-only blob: URL on its first ranged read.
+        preload: 'auto',
         controls: '',
         controlslist: 'nodownload noremoteplayback',
         disablepictureinpicture: '',
