@@ -48,7 +48,9 @@ import {
     type ActionResult,
 } from '../../../src/signals/fullscreen.ts';
 import { startSignals } from '../../../src/signals/index.ts';
+import answerAudioDescriptor from '../../fixtures/descriptor-answer-audio.json';
 import answerDescriptor from '../../fixtures/descriptor-answer.json';
+import conversationAudioDescriptor from '../../fixtures/descriptor-conversation-audio.json';
 import conversationDescriptor from '../../fixtures/descriptor-conversation.json';
 import monitorDescriptor from '../../fixtures/descriptor-monitor.json';
 import { STORE_CASES } from '../../shared/store-suite.ts';
@@ -811,6 +813,8 @@ const RECORDING_DESCRIPTORS: Record<string, Descriptor> = {
     answer: answerDescriptor as Descriptor,
     monitor: monitorDescriptor as Descriptor,
     conversation: conversationDescriptor as Descriptor,
+    'answer-audio': answerAudioDescriptor as Descriptor,
+    'conversation-audio': conversationAudioDescriptor as Descriptor,
 };
 
 /** Base64 of an ArrayBuffer, in slices so a large segment never overflows the argument list. */
