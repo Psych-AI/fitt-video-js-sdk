@@ -136,3 +136,16 @@ test('the first supported MIME type wins, in the spec order', () => {
         'audio/webm;codecs=opus',
     );
 });
+
+test('a missing device is no_microphone when no camera was asked for, even with no camera plugged in', () => {
+    const notFound = new DOMException('none', 'NotFoundError');
+    const camera = { kind: 'videoinput' } as MediaDeviceInfo;
+
+    assert.equal(captureError(notFound, [], { video: false }), 'no_microphone');
+    assert.equal(captureError(notFound, [], { video: true }), 'no_camera');
+    assert.equal(
+        captureError(notFound, [camera], { video: true }),
+        'no_microphone',
+    );
+    assert.equal(captureError(notFound, []), 'no_camera');
+});

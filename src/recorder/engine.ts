@@ -115,6 +115,8 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
     /** A take is open: from startTake() until stopTake(). */
     let recording = false;
     let currentTake = 0;
+    /** Whether the take records a camera track at all (Plan 10: audio only has none). */
+    const usesCamera = deps.tracks.some((track) => track.track === 'camera');
     let suspended: Suspended = null;
     /** Device changes, restarts and the stop, one at a time. */
     let ops: Promise<void> = Promise.resolve();
@@ -127,10 +129,20 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
     let graph: AudioGraph | null = null;
     /** Whether this take already reported a stereo mix it could not record. */
     let mixUnavailable = false;
-    const stereo = deps.tracks.some(
-        (track) =>
-            track.track === 'camera' && track.capture.audio.channels === 2,
-    );
+    /** Whether a camera choice in a session with no camera was already warned about. */
+    let cameraChoiceWarned = false;
+    /**
+     * The track that records the D20 mix: a stereo camera track, else a stereo
+     * audio track that is the only track (audio-only conversation, Plan 10).
+     */
+    const mixTrack =
+        deps.tracks.find(
+            (track) =>
+                track.capture.audio.channels === 2 &&
+                (track.track === 'camera' ||
+                    (track.track === 'audio' && !usesCamera)),
+        )?.track ?? null;
+    const stereo = mixTrack !== null;
     const permissions: Record<
         'camera' | 'microphone',
         PermissionState | 'unknown'
@@ -339,7 +351,7 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
     /** A permission that was granted and is now denied is device.permission_lost. True when one was. */
     async function recheckPermissions(): Promise<boolean> {
         const [camera, microphone] = await Promise.all([
-            permissionState(deps.permissions, 'camera'),
+            cameraPermission(),
             permissionState(deps.permissions, 'microphone'),
         ]);
         let lost = false;
@@ -348,6 +360,11 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
             ['camera', camera],
             ['microphone', microphone],
         ] as const) {
+            if (kind === 'camera' && !usesCamera) {
+                // A take with no camera never rechecks it: an old denial elsewhere is not a loss here.
+                continue;
+            }
+
             if (permissions[kind] === 'granted' && state === 'denied') {
                 lost = true;
                 permissionLost(kind);
@@ -464,13 +481,20 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
         acquired = acquired.filter((held) => held !== previous);
     }
 
+    /** The camera permission, or `unknown` without a query when the take records no camera. */
+    function cameraPermission(): Promise<PermissionState | 'unknown'> {
+        return usesCamera
+            ? permissionState(deps.permissions, 'camera')
+            : Promise.resolve<PermissionState | 'unknown'>('unknown');
+    }
+
     async function acquireOnce(): Promise<void> {
         const asked = generation;
         const next = await capture();
         adopt(next);
 
         const [camera, microphone] = await Promise.all([
-            permissionState(deps.permissions, 'camera'),
+            cameraPermission(),
             permissionState(deps.permissions, 'microphone'),
         ]);
         permissions.camera = camera;
@@ -528,7 +552,12 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
     /** The stream a track's run records: video plus the camera audio, or the microphone alone. */
     function streamFor(track: ChunkedTrack, source: MediaStream): MediaStream {
         if (track.track === 'audio') {
-            return deps.makeStream(source.getAudioTracks().slice(0, 1));
+            return deps.makeStream(
+                (mixTrack === 'audio'
+                    ? cameraAudioOf(source)
+                    : source.getAudioTracks()
+                ).slice(0, 1),
+            );
         }
 
         return deps.makeStream([
@@ -543,7 +572,8 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
      * output device) carries silence on both channels and passes no level
      * to the dead microphone detector, so the candidate's voice would be
      * lost without a word. Such a run records the microphone as is, and the
-     * take reports the missing D20 mix once.
+     * take reports the missing D20 mix once. It also serves an audio-only
+     * conversation's audio track (Plan 10).
      */
     function cameraAudioOf(source: MediaStream): MediaStreamTrack[] {
         if (graph === null) {
@@ -559,7 +589,7 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
         if (!mixUnavailable) {
             mixUnavailable = true;
             console.warn(
-                `Fitt Video: the audio context is ${state}, so this camera run records the microphone without the interviewer mix.`,
+                `Fitt Video: the audio context is ${state}, so this ${mixTrack} run records the microphone without the interviewer mix.`,
             );
             deps.emit('recorder.mix_unavailable', { context_state: state });
         }
@@ -791,6 +821,17 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
         kind: 'camera' | 'microphone',
         deviceId: string,
     ): Promise<void> {
+        if (kind === 'camera' && !usesCamera) {
+            if (!cameraChoiceWarned) {
+                cameraChoiceWarned = true;
+                console.warn(
+                    'Fitt Video: this session records no camera, so a camera choice is ignored.',
+                );
+            }
+
+            return;
+        }
+
         selection[kind] = deviceId;
 
         if (stream === null) {
@@ -884,7 +925,7 @@ export function createRecorderEngine(deps: RecorderEngineDeps): RecorderEngine {
         devices(): DevicesView {
             return {
                 get cameras(): MediaDeviceInfo[] {
-                    return deviceList.cameras;
+                    return usesCamera ? deviceList.cameras : [];
                 },
                 get microphones(): MediaDeviceInfo[] {
                     return deviceList.microphones;

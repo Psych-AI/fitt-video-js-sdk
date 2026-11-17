@@ -1,2 +1,2 @@
 /** The SDK's version. Kept equal to package.json by tests/unit/version.test.ts. */
-export const VERSION = '1.3.1';
+export const VERSION = '1.4.0';

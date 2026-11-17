@@ -159,3 +159,73 @@ test('an interviewer media element mixed into a take, a stop and a second take r
     // The element still plays after both graphs closed, so the candidate keeps hearing the interviewer.
     expect(result.elementPlaying).toBe(true);
 });
+
+test('an audio-only conversation records the D20 mix on its one audio track', async ({
+    page,
+    browserName,
+}, testInfo) => {
+    await installMedia(page, browserName, { prefer: 'synthetic' });
+    const errors = await openHarness(page);
+    const unsupported = await assertsUnsupported(page);
+
+    if (!unsupported) {
+        await skipWithoutRecorder(page);
+    }
+
+    await page.click('#gesture');
+    const take = await page.evaluate(() =>
+        window.internals.mixedTake({ seconds: 7, micGain: 0, audioOnly: true }),
+    );
+    testInfo.annotations.push({
+        type: 'mix',
+        description: JSON.stringify({
+            events: take.events,
+            errors: take.errors,
+            context: take.context,
+            contextState: take.contextState,
+            leftRms: take.leftRms,
+            rightRms: take.rightRms,
+            audioTrackRms: take.audioTrackRms,
+            audioChannels:
+                take.audioInit === null
+                    ? null
+                    : audioChannels(bytes(take.audioInit)),
+        }),
+    });
+
+    expect(errors).toEqual([]);
+
+    if (unsupported) {
+        // Owner decision 2: Linux WebKit has no MediaRecorder, so the take is refused and records nothing.
+        expect(browserName).toBe('webkit');
+        expect(take.errors).toEqual(['recorder_unsupported']);
+        expect(take.cameraInit).toBeNull();
+        expect(take.audioInit).toBeNull();
+        expect(take.contextState).toBe('closed');
+        // The graph needs no recorder: the dead microphone and the D20 mix hold on WebKit too.
+        expect(take.events).toContain('device.no_audio');
+        expect(take.leftRms).toBeLessThan(0.01);
+        expect(take.rightRms).toBeGreaterThan(0.01);
+
+        return;
+    }
+
+    if (audioMeasured(testInfo, browserName, take.context)) {
+        // Owner decision 1: a suspended context records the microphone as is.
+        expect(take.cameraInit).toBeNull();
+        expect(take.audioInit).not.toBeNull();
+
+        return;
+    }
+
+    if (measured(testInfo, browserName)) {
+        return;
+    }
+
+    expect(take.cameraInit).toBeNull();
+    expect(audioChannels(bytes(take.audioInit!))).toBe(2);
+    expect(take.events).toContain('device.no_audio');
+    // D20: the microphone (gain 0 here) on the left, the interviewer on the right.
+    expect(take.leftRms).toBeLessThan(0.01);
+    expect(take.rightRms).toBeGreaterThan(0.01);
+});

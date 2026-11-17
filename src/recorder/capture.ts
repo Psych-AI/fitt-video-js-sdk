@@ -75,13 +75,16 @@ function errorName(error: unknown): string | undefined {
 
 /**
  * Maps a capture failure to an SDK code by its name only, never its
- * message. A NotFoundError is the camera when no videoinput is listed, and
- * the microphone otherwise. Anything else, a missing getUserMedia too, is
- * recorder_unsupported.
+ * message. A NotFoundError is the camera when a camera was asked for and
+ * no videoinput is listed, and the microphone otherwise. A missing device
+ * is named by what was asked for (Plan 10, author's call 5): an audio-only
+ * capture never reports `no_camera`. Anything else, a missing getUserMedia
+ * too, is recorder_unsupported.
  */
 export function captureError(
     error: unknown,
     devices: MediaDeviceInfo[],
+    asked: { video: boolean } = { video: true },
 ): ErrorCode {
     switch (errorName(error)) {
         case 'NotAllowedError':
@@ -91,9 +94,10 @@ export function captureError(
         case 'AbortError':
             return 'device_busy';
         case 'NotFoundError':
-            return devices.some((device) => device.kind === 'videoinput')
-                ? 'no_microphone'
-                : 'no_camera';
+            return asked.video &&
+                !devices.some((device) => device.kind === 'videoinput')
+                ? 'no_camera'
+                : 'no_microphone';
         default:
             return 'recorder_unsupported';
     }
@@ -102,6 +106,7 @@ export function captureError(
 async function failure(
     media: MediaDevicesLike,
     error: unknown,
+    asked: { video: boolean },
 ): Promise<FittVideoError> {
     let devices: MediaDeviceInfo[] = [];
 
@@ -111,7 +116,7 @@ async function failure(
         devices = [];
     }
 
-    return new FittVideoError(captureError(error, devices), {
+    return new FittVideoError(captureError(error, devices, asked), {
         name: errorName(error) ?? null,
     });
 }
@@ -122,21 +127,27 @@ export async function acquire(
     tracks: DescriptorTrack[],
     selected: Selection,
 ): Promise<MediaStream> {
+    const constraints = constraintsFor(tracks, selected);
+    // The retry without deviceId asks for the same kinds.
+    const asked = {
+        video: constraints.video !== undefined && constraints.video !== false,
+    };
+
     try {
-        return await media.getUserMedia(constraintsFor(tracks, selected));
+        return await media.getUserMedia(constraints);
     } catch (error) {
         const chosen =
             selected.camera !== undefined || selected.microphone !== undefined;
 
         if (errorName(error) !== 'OverconstrainedError' || !chosen) {
-            throw await failure(media, error);
+            throw await failure(media, error, asked);
         }
     }
 
     try {
         return await media.getUserMedia(constraintsFor(tracks, {}));
     } catch (error) {
-        throw await failure(media, error);
+        throw await failure(media, error, asked);
     }
 }
 

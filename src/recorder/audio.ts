@@ -11,7 +11,10 @@ export interface AudioGraph {
     onLevel(listener: (level: number) => void): () => void;
     /** Resume after a user gesture (start()). */
     resume(): Promise<void>;
-    /** D20: the microphone on the left, the interviewer on the right, into the camera track only. */
+    /**
+     * D20: the microphone on the left, the interviewer on the right, into the
+     * camera track, or into the audio track when it is the only track.
+     */
     mix(source: MixSource): void;
     cameraAudio(): MediaStreamTrack[];
     /**
@@ -331,7 +334,7 @@ export function createAudioGraph(deps: AudioGraphDeps): AudioGraph {
         mix(input: MixSource): void {
             if (interviewer === null) {
                 console.warn(
-                    'Fitt Video: mix() is ignored, because this camera track is mono.',
+                    'Fitt Video: mix() is ignored, because this session records mono audio.',
                 );
 
                 return;

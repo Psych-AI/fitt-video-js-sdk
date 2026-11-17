@@ -1211,10 +1211,17 @@ export async function audioProbe(): Promise<{
  * `context` is the graph's state during the take and `contextState` its
  * state after stopTake(). A take refused as recorder_unsupported (Linux
  * WebKit, owner decision 2) still runs the graph for `seconds`.
+ *
+ * With `audioOnly` (Plan 10) the descriptor is the audio-only conversation
+ * fixture, one stereo audio track and no camera. `cameraInit` is then null,
+ * and the left, right and audio track levels are read on the audio run's
+ * recorded stream (on cameraAudio() when no run recorded, as on Linux
+ * WebKit, where the audio track would record that same mix).
  */
 export async function mixedTake(options: {
     seconds: number;
     micGain: number;
+    audioOnly?: boolean;
 }): Promise<{
     cameraInit: string | null;
     audioInit: string | null;
@@ -1226,6 +1233,7 @@ export async function mixedTake(options: {
     rightRms: number;
     audioTrackRms: number | null;
 }> {
+    const audioOnly = options.audioOnly === true;
     const conversation = RECORDING_DESCRIPTORS.conversation;
     const audioTrack = RECORDING_DESCRIPTORS.answer.tracks.find(
         (track) => track.track === 'audio',
@@ -1235,10 +1243,12 @@ export async function mixedTake(options: {
         throw new Error('The answer fixture has no audio track.');
     }
 
-    const descriptor: Descriptor = {
-        ...conversation,
-        tracks: [...conversation.tracks, audioTrack],
-    };
+    const descriptor: Descriptor = audioOnly
+        ? RECORDING_DESCRIPTORS['conversation-audio']
+        : {
+              ...conversation,
+              tracks: [...conversation.tracks, audioTrack],
+          };
     let phase: Phase = 'ready';
     const audioStreams: MediaStream[] = [];
     window.__fakeMicGain?.(options.micGain);
@@ -1281,9 +1291,11 @@ export async function mixedTake(options: {
     const splitter = meters.createChannelSplitter(2);
     const left = analyserOn(meters);
     const right = analyserOn(meters);
-    meters
-        .createMediaStreamSource(new MediaStream(graph.cameraAudio()))
-        .connect(splitter);
+    const mixed =
+        audioOnly && audioStreams.length > 0
+            ? audioStreams[0]
+            : new MediaStream(graph.cameraAudio());
+    meters.createMediaStreamSource(mixed).connect(splitter);
     splitter.connect(left, 0);
     splitter.connect(right, 1);
     let microphone: AnalyserNode | null = null;

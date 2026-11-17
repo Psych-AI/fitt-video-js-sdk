@@ -5,6 +5,7 @@ import type { ChunkedTrack } from '../../src/core/descriptor.ts';
 import { FittVideoError } from '../../src/core/errors.ts';
 import type { RunRecord, SegmentRecord } from '../../src/core/store.ts';
 import { createRecorderEngine } from '../../src/recorder/engine.ts';
+import { fakeAudioContext } from '../support/fake-audio.ts';
 import { fakeEnvironment, settle } from '../support/fake-env.ts';
 import { fakeMedia } from '../support/fake-media.ts';
 import { readSet } from '../support/fixtures.ts';
@@ -48,6 +49,8 @@ function engineRig(
     const samples: [number, number][] = [];
     /** Every stream a run was given, in order. */
     const made: MediaStream[] = [];
+    /** Every permission name queried, in order. */
+    const queries: string[] = [];
     let runIndex = 0;
     const engine = createRecorderEngine({
         env,
@@ -74,9 +77,11 @@ function engineRig(
             return made_;
         },
         permissions: {
-            query: async ({ name }: { name: string }) => ({
-                state: permission[name],
-            }),
+            query: async ({ name }: { name: string }) => {
+                queries.push(name);
+
+                return { state: permission[name] };
+            },
         } as unknown as Permissions,
         nextRunIndex: () => runIndex++,
         putRun: async (record) => {
@@ -115,69 +120,10 @@ function engineRig(
         added,
         samples,
         made,
+        queries,
         cameraReasons,
         stop,
     };
-}
-
-/** A node that only remembers what it was connected to. */
-class FakeAudioNode {
-    connections: unknown[] = [];
-    fftSize = 0;
-
-    connect(target: unknown): unknown {
-        this.connections.push(target);
-
-        return target;
-    }
-
-    disconnect(): void {
-        this.connections = [];
-    }
-
-    getFloatTimeDomainData(buffer: Float32Array): void {
-        buffer.fill(0.5);
-    }
-}
-
-/** The AudioContext members the graph uses, recording each stream it was given. */
-function fakeAudioContext(
-    options: {
-        state?: AudioContextState;
-        /** resume() never settles, as in Firefox with no audio output device. */
-        stuck?: boolean;
-    } = {},
-) {
-    const sources: MediaStream[] = [];
-    /** The stereo destination's track: what a camera run records when the mix is live. */
-    const mixTrack = {
-        kind: 'audio',
-        id: 'mix',
-    } as unknown as MediaStreamTrack;
-    const context = {
-        state: options.state ?? ('running' as AudioContextState),
-        createAnalyser: () => new FakeAudioNode(),
-        createChannelMerger: () => new FakeAudioNode(),
-        createGain: () => new FakeAudioNode(),
-        createMediaStreamDestination: () =>
-            Object.assign(new FakeAudioNode(), {
-                channelCount: 0,
-                channelCountMode: 'max',
-                stream: { getAudioTracks: () => [mixTrack] },
-            }),
-        createMediaStreamSource: (stream: MediaStream) => {
-            sources.push(stream);
-
-            return new FakeAudioNode();
-        },
-        resume: (): Promise<void> =>
-            options.stuck === true ? new Promise(() => {}) : Promise.resolve(),
-        close: async () => {
-            context.state = 'closed';
-        },
-    };
-
-    return { context: context as unknown as AudioContext, sources, mixTrack };
 }
 
 test('prepare reports the permission states as device.permission_granted', async () => {
@@ -659,4 +605,104 @@ test('a stereo take whose audio context never resumes records the microphone as 
         [['recorder.mix_unavailable', { context_state: 'suspended' }]],
     );
     assert.equal(warnings.length, 1);
+});
+
+test('an audio-only conversation records the stereo mix on its one audio track, and an audio-only answer records the microphone', async () => {
+    const audio = fakeAudioContext();
+    const r = engineRig({
+        recipe: 'conversation-audio',
+        audioContext: () => audio.context,
+    });
+    await r.engine.startTake(0);
+    await r.stop();
+
+    assert.equal(r.made.length, 1);
+    assert.deepEqual(r.made[0].getVideoTracks(), []);
+    assert.deepEqual(r.made[0].getAudioTracks(), [audio.mixTrack]);
+
+    const mono = fakeAudioContext();
+    const answer = engineRig({
+        recipe: 'answer-audio',
+        audioContext: () => mono.context,
+    });
+    await answer.engine.startTake(0);
+    await answer.stop();
+    const microphone = answer.media.acquired[0].find(
+        (track) => track.kind === 'audio',
+    );
+
+    assert.deepEqual(answer.made[0].getAudioTracks(), [microphone]);
+});
+
+test('an audio-only conversation whose context never resumes records the microphone as is and says so once', async () => {
+    const audio = fakeAudioContext({ state: 'suspended', stuck: true });
+    const r = engineRig({
+        recipe: 'conversation-audio',
+        audioContext: () => audio.context,
+    });
+    const warn = console.warn;
+    console.warn = () => undefined;
+
+    try {
+        const starting = r.engine.startTake(0);
+        await r.env.advance(1000);
+        await starting;
+        const microphone = r.media.acquired[0].find(
+            (track) => track.kind === 'audio',
+        );
+        assert.deepEqual(r.made[0].getAudioTracks(), [microphone]);
+        await r.stop();
+    } finally {
+        console.warn = warn;
+    }
+
+    assert.deepEqual(
+        r.events.filter(([type]) => type === 'recorder.mix_unavailable'),
+        [['recorder.mix_unavailable', { context_state: 'suspended' }]],
+    );
+});
+
+test('an audio-only take never queries or loses the camera permission, lists no camera and ignores a camera choice', async () => {
+    const r = engineRig({ recipe: 'answer-audio' });
+    // Count permission queries by name. If engineRig does not expose its query, add a `queries: string[]` the rig's `permissions.query` pushes to.
+    const queried: string[] = r.queries;
+    const warn = console.warn;
+    const warnings: unknown[][] = [];
+    console.warn = (...args: unknown[]) => warnings.push(args);
+
+    try {
+        await r.engine.startTake(0);
+        assert.deepEqual(
+            r.events.find(([type]) => type === 'device.permission_granted'),
+            [
+                'device.permission_granted',
+                { camera: 'unknown', microphone: 'granted' },
+            ],
+        );
+
+        // An earlier video session on this origin granted the camera; now it is denied.
+        r.permission.camera = 'denied';
+        r.doc.dispatchEvent(new Event('visibilitychange'));
+        await r.env.advance(10);
+
+        const calls = r.media.calls();
+        await r.engine.devices().select('camera', 'Integrated Camera');
+        await r.engine.devices().select('camera', 'Integrated Camera');
+        assert.equal(r.media.calls(), calls);
+        assert.deepEqual(r.engine.devices().cameras, []);
+        await r.stop();
+    } finally {
+        console.warn = warn;
+    }
+
+    assert.equal(
+        r.events.some(([type]) => type === 'device.permission_lost'),
+        false,
+    );
+    assert.deepEqual(
+        [...r.runs.values()].map((run) => [run.track, run.ended_reason]),
+        [['audio', 'stop']],
+    );
+    assert.equal(warnings.length, 1);
+    assert.equal(queried.includes('camera'), false);
 });
