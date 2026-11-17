@@ -1,0 +1,79 @@
+{
+    "session_id": "01jbz8q4w6x0k3m5n7p9r2t4aa",
+    "recipe": "answer",
+    "take": 1,
+    "clock": {
+        "session_cap_ms": 7200000
+    },
+    "token": {
+        "id": "01jbz8q4w6x0k3m5n7p9r2t4bb",
+        "secret": "Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4zAb7cDe0f",
+        "expires_in_s": 900,
+        "refresh_after_s": 675
+    },
+    "endpoints": {
+        "api": "http://127.0.0.1:8123/api/v1",
+        "media": null
+    },
+    "tracks": [
+        {
+            "track": "audio",
+            "video_id": "01jbz8q4w6x0k3m5n7p9r2t4cb",
+            "kind": "chunked",
+            "capture": {
+                "audio": {
+                    "bitrate_bps": 64000,
+                    "channels": 1
+                }
+            },
+            "segments": {
+                "target_ms": 5000,
+                "max_ms": 30000,
+                "part_size": 1048576,
+                "max_bytes": 1048576
+            },
+            "upload": {
+                "mode": "passthrough",
+                "url": "http://127.0.0.1:8123/api/v1/sessions/01jbz8q4w6x0k3m5n7p9r2t4aa/tracks/audio/segments",
+                "fallback_url": "http://127.0.0.1:8123/api/v1/sessions/01jbz8q4w6x0k3m5n7p9r2t4aa/tracks/audio/segments"
+            }
+        }
+    ],
+    "recording": {
+        "countdown_ms": 3000,
+        "min_duration_ms": 5000,
+        "max_duration_ms": 600000,
+        "extension_ms": 30000,
+        "warning_before_end_ms": 15000
+    },
+    "playback": {
+        "local": true,
+        "local_max_bytes": 100000000,
+        "in_status": false
+    },
+    "signals": {
+        "groups": ["device", "recorder", "net", "attention"]
+    },
+    "enforce": {},
+    "events": {
+        "batch_ms": 5000
+    },
+    "checks": {
+        "enabled": true,
+        "min_speech_s": 3,
+        "min_take_s": 2,
+        "min_coverage": 0.9,
+        "reject_below_coverage": 0.6,
+        "inline_transcribe_max_s": 120,
+        "reject_on": [
+            "no_speech",
+            "incoherent",
+            "off_topic",
+            "audio_incomplete"
+        ]
+    },
+    "queue": {
+        "abandon_after_ms": 600000,
+        "buffer_budget_bytes": 209715200
+    }
+}
