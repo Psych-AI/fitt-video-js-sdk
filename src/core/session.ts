@@ -26,6 +26,7 @@ import {
     type SessionApi,
     type TranscriptUpload,
 } from './api.ts';
+import { createAudioHooks, type FittAudio } from './audio-hooks.ts';
 import { backoffMs } from './backoff.ts';
 import { createBatcher, type Batcher } from './batcher.ts';
 import {
@@ -101,6 +102,11 @@ export interface FittSession {
     readonly audioLevel: number;
     /** The track the person watches (Plan 10): 'camera', 'audio' in an audio-only session, null for a file session. */
     readonly playbackTrack: 'camera' | 'audio' | null;
+    /**
+     * The host's audio levels on the SDK's one capture (spec 6.11, Plan 10). Null and 0 before
+     * prepare, after stop and after reset; 0 before the first gesture on the page.
+     */
+    readonly audio: FittAudio;
     readonly debug?: {
         dropNextSegment(track?: TrackName): void;
         /** Starts a second run on the open take, as a camera switch would (the playground's multi-run case, Plan 9). */
@@ -517,6 +523,15 @@ function invalidSession(detail: Record<string, unknown>): FittSession {
         devices: NO_DEVICES,
         audioLevel: 0,
         playbackTrack: null,
+        audio: {
+            getInputVolume: () => 0,
+            getOutputVolume: () => 0,
+            onFrame: none,
+            stream: null,
+            context: null,
+            createAnalyser: () => null,
+            onChange: none,
+        },
         prepare: refuse,
         attachPreview: () => undefined,
         detachPreview: () => undefined,
@@ -2094,7 +2109,20 @@ export function createSession(
             graph?.onLevel((level) => levelListeners.call(level)) ?? null;
     };
 
+    /** session.audio (Plan 10): every hook reads the engine's one graph. */
+    const hooks = createAudioHooks({
+        env,
+        graph: () => engine?.audio() ?? null,
+        doc: page?.doc ?? null,
+    });
+
     const onStream = (stream: MediaStream | null): void => {
+        notifyStream(stream);
+        // After a prepare, a re-acquire and a release: a host holding the stream or an analyser asks again.
+        hooks.changed();
+    };
+
+    const notifyStream = (stream: MediaStream | null): void => {
         for (const video of previews) {
             video.srcObject = stream;
         }
@@ -3368,6 +3396,7 @@ export function createSession(
             return engine?.audio()?.level() ?? 0;
         },
         playbackTrack,
+        audio: hooks.audio,
         ...(options.debug === true
             ? {
                   debug: {
@@ -3888,6 +3917,7 @@ export function createSession(
             playbackRound += 1;
             engine?.release();
             detachPage();
+            hooks.destroy();
         },
     };
 

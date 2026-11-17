@@ -153,6 +153,11 @@ export function fakeEnvironment(
         timeOrigin,
         dateNow: () => date,
         timers,
+        frames: {
+            request: (callback: (timeMs: number) => void): number =>
+                timers.setTimeout(() => callback(perf), 16),
+            cancel: (handle: number): void => timers.clearTimeout(handle),
+        },
         random: () => options.random ?? 0.5,
         randomBytes: (length: number) =>
             crypto.getRandomValues(new Uint8Array(length)),

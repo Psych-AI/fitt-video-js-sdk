@@ -8,6 +8,12 @@ export interface Timers {
     clearTimeout(handle: number): void;
 }
 
+/** requestAnimationFrame as a seam (Plan 10); absent in an older embedding, where 16 ms timers stand in. */
+export interface Frames {
+    request(callback: (timeMs: number) => void): number;
+    cancel(handle: number): void;
+}
+
 export interface Environment {
     perfNow(): number;
     readonly timeOrigin: number;
@@ -19,6 +25,8 @@ export interface Environment {
     online(): boolean;
     /** Fires 'online' and 'offline' (the window in a browser). */
     readonly onlineTarget: EventTarget | null;
+    /** requestAnimationFrame as a seam (Plan 10); absent in an older embedding, where 16 ms timers stand in. */
+    readonly frames?: Frames;
 }
 
 /** The only members a host may override (the playground's faults, author's call 14). */
@@ -47,6 +55,10 @@ export function browserEnvironment(
         },
         dateNow: () => Date.now(),
         timers,
+        frames: {
+            request: (callback) => window.requestAnimationFrame(callback),
+            cancel: (handle) => window.cancelAnimationFrame(handle),
+        },
         random: () => Math.random(),
         randomBytes(length: number): Uint8Array {
             const bytes = new Uint8Array(length);

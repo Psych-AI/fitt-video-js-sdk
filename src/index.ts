@@ -6,6 +6,11 @@ import { VERSION } from './version.ts';
 export const FittVideo = { session, resume, VERSION };
 
 export type { TranscriptUpload } from './core/api.ts';
+export type {
+    AudioAnalyserOptions,
+    AudioFrame,
+    FittAudio,
+} from './core/audio-hooks.ts';
 export type { ChecksResult } from './core/checks.ts';
 export type { Descriptor, TrackName } from './core/descriptor.ts';
 export { FittVideoError } from './core/errors.ts';

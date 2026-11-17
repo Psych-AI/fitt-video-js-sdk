@@ -283,6 +283,8 @@ export function sessionRig(
         channel?: SessionSeams['channel'];
         /** The review copy's object URLs; null (the default) holds no copy: off with unsupported. */
         objectUrls?: ObjectUrls | null;
+        /** The audio graph's context (Plan 10); null (the default): no graph. */
+        audioContext?: () => AudioContext;
     } = {},
 ) {
     const env = options.env ?? fakeEnvironment();
@@ -311,6 +313,7 @@ export function sessionRig(
             options.channel ?? null,
         ),
         objectUrls: options.objectUrls ?? null,
+        createAudioContext: options.audioContext ?? null,
     };
     const session = createSession(descriptor, options.options ?? {}, seams);
     const calls = (pattern: RegExp): FetchCall[] =>

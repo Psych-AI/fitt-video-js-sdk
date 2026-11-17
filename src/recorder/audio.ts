@@ -23,7 +23,53 @@ export interface AudioGraph {
      * so the interviewer and every later run keep it.
      */
     setMicrophone(microphone: MediaStream): void;
+    /**
+     * The microphone now (Plan 10, author's call 9): its RMS and the largest
+     * absolute sample of the last analyser window, both raw. The same
+     * analyser the meter and the dead microphone detector read, so a loud
+     * interviewer never lifts it. 0 and 0 while the context is not running
+     * or there is no microphone.
+     */
+    readInput(): { rms: number; peak: number };
+    /**
+     * The interviewer side's RMS now (author's call 9): a second analyser on
+     * the interviewer gain of the D20 mix. 0 with no mix (a mono session).
+     */
+    outputLevel(): number;
+    /**
+     * Fills `into` with BANDS values, 0 to 1, log spaced from 100 Hz to
+     * 8 kHz over the microphone analyser's byte frequency data (author's
+     * call 9). All 0 while the context is not running or there is no microphone.
+     */
+    bands(into: Float32Array): void;
+    /**
+     * A stream of the microphone only, no video track, made on first use
+     * (author's call 9). The same stream across setMicrophone(), so a host
+     * holding it keeps hearing the new device.
+     */
+    microphoneStream(): MediaStream;
+    /**
+     * A host analyser on this context, fed from the microphone and kept
+     * across setMicrophone() (author's call 9). null while there is no
+     * microphone source.
+     */
+    tap(options?: AudioTapOptions): AnalyserNode | null;
     close(): Promise<void>;
+}
+
+/** How many frequency bands bands() fills (Plan 10, author's call 9). */
+export const BANDS = 8;
+
+/** The lowest band's lower edge. */
+const BAND_LOW_HZ = 100;
+
+/** The highest band's upper edge. */
+const BAND_HIGH_HZ = 8000;
+
+/** A host analyser's settings; the defaults are the browser's own. */
+export interface AudioTapOptions {
+    fftSize?: number;
+    smoothingTimeConstant?: number;
 }
 
 export interface AudioGraphDeps {
@@ -111,6 +157,21 @@ function carrierFor(
     return carrier;
 }
 
+/** The largest absolute sample. */
+function peakOf(samples: Float32Array): number {
+    let peak = 0;
+
+    for (const sample of samples) {
+        const size = Math.abs(sample);
+
+        if (size > peak) {
+            peak = size;
+        }
+    }
+
+    return peak;
+}
+
 function rms(samples: Float32Array): number {
     let sum = 0;
 
@@ -157,10 +218,23 @@ export function createAudioGraph(deps: AudioGraphDeps): AudioGraph {
     let merger: ChannelMergerNode | null = null;
     let interviewer: GainNode | null = null;
     let destination: MediaStreamAudioDestinationNode | null = null;
+    /** The interviewer side's analyser, for outputLevel() (author's call 9). */
+    let outputAnalyser: AnalyserNode | null = null;
+    let outputBuffer: Float32Array<ArrayBuffer> | null = null;
+    /** The microphone-only stream for the host, made on first use. */
+    let micDestination: MediaStreamAudioDestinationNode | null = null;
+    /** The host's analysers, fed from the microphone. */
+    const taps = new Set<AnalyserNode>();
+    /** The microphone analyser's frequency bins, made on first use. */
+    let byteBins: Uint8Array<ArrayBuffer> | null = null;
 
     if (deps.stereo) {
         merger = context.createChannelMerger(2);
         interviewer = context.createGain();
+        outputAnalyser = context.createAnalyser();
+        outputAnalyser.fftSize = FFT_SIZE;
+        outputBuffer = new Float32Array(FFT_SIZE);
+        interviewer.connect(outputAnalyser);
         destination = context.createMediaStreamDestination();
         destination.channelCount = 2;
         destination.channelCountMode = 'explicit';
@@ -182,6 +256,15 @@ export function createAudioGraph(deps: AudioGraphDeps): AudioGraph {
 
         source = context.createMediaStreamSource(stream);
         source.connect(analyser);
+
+        // The host's stream and analysers follow a device switch.
+        if (micDestination !== null) {
+            source.connect(micDestination);
+        }
+
+        for (const each of taps) {
+            source.connect(each);
+        }
 
         if (merger !== null) {
             source.connect(merger, 0, 0);
@@ -373,6 +456,83 @@ export function createAudioGraph(deps: AudioGraphDeps): AudioGraph {
             attach(next);
         },
 
+        readInput(): { rms: number; peak: number } {
+            if (context.state !== 'running' || source === null) {
+                return { rms: 0, peak: 0 };
+            }
+
+            analyser.getFloatTimeDomainData(buffer);
+
+            return { rms: rms(buffer), peak: peakOf(buffer) };
+        },
+
+        outputLevel(): number {
+            if (
+                context.state !== 'running' ||
+                outputAnalyser === null ||
+                outputBuffer === null
+            ) {
+                return 0;
+            }
+
+            outputAnalyser.getFloatTimeDomainData(outputBuffer);
+
+            return rms(outputBuffer);
+        },
+
+        bands(into: Float32Array): void {
+            if (context.state !== 'running' || source === null) {
+                into.fill(0);
+
+                return;
+            }
+
+            byteBins ??= new Uint8Array(analyser.frequencyBinCount);
+            analyser.getByteFrequencyData(byteBins);
+            const binHz = context.sampleRate / analyser.fftSize;
+            const ratio = BAND_HIGH_HZ / BAND_LOW_HZ;
+
+            for (let band = 0; band < into.length && band < BANDS; band += 1) {
+                const low = BAND_LOW_HZ * ratio ** (band / BANDS);
+                const high = BAND_LOW_HZ * ratio ** ((band + 1) / BANDS);
+                const from = Math.floor(low / binHz);
+                const to = Math.min(
+                    byteBins.length,
+                    Math.max(from + 1, Math.floor(high / binHz)),
+                );
+                let sum = 0;
+
+                for (let bin = from; bin < to; bin += 1) {
+                    sum += byteBins[bin];
+                }
+
+                into[band] = to > from ? sum / (to - from) / 255 : 0;
+            }
+        },
+
+        microphoneStream(): MediaStream {
+            if (micDestination === null) {
+                micDestination = context.createMediaStreamDestination();
+                source?.connect(micDestination);
+            }
+
+            return micDestination.stream;
+        },
+
+        tap(options: AudioTapOptions = {}): AnalyserNode | null {
+            if (source === null || closed) {
+                return null;
+            }
+
+            const node = context.createAnalyser();
+            node.fftSize = options.fftSize ?? FFT_SIZE;
+            node.smoothingTimeConstant = options.smoothingTimeConstant ?? 0.8;
+            source.connect(node);
+            taps.add(node);
+
+            return node;
+        },
+
         async close(): Promise<void> {
             if (closed) {
                 return;
@@ -387,6 +547,16 @@ export function createAudioGraph(deps: AudioGraphDeps): AudioGraph {
 
             disarmGesture();
             listeners.clear();
+
+            for (const node of [...taps, micDestination, outputAnalyser]) {
+                try {
+                    node?.disconnect();
+                } catch {
+                    // Already gone.
+                }
+            }
+
+            taps.clear();
 
             for (const disconnect of bridges.splice(0)) {
                 try {
