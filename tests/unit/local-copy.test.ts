@@ -63,6 +63,7 @@ function copyRig(overrides: Partial<LocalCopyDeps> = {}) {
         objectUrls: urls,
         win: null,
         onChange: () => undefined,
+        track: 'camera',
         ...overrides,
     });
 
@@ -307,4 +308,21 @@ test('a take with an init and no media segment is never held', () => {
         [r.copy.view().state, r.copy.view().reason, r.copy.objectUrl()],
         ['off', 'unreadable', null],
     );
+});
+
+test('an audio-only copy holds its audio segments, and a camera copy still holds none', async () => {
+    const audio = copyRig({ track: 'audio' });
+    holdAll(
+        audio,
+        cameraRecords().map((record) => ({
+            ...record,
+            track: 'audio' as const,
+        })),
+    );
+
+    assert.deepEqual(
+        [audio.copy.view().state, audio.copy.view().bytes],
+        ['held', HELD],
+    );
+    assert.equal(audio.copy.objectUrl(), 'blob:fake/1');
 });

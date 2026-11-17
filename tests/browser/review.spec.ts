@@ -9,11 +9,11 @@ const base64 = (bytes: Uint8Array): string =>
     Buffer.from(bytes).toString('base64');
 
 /** A fixture set cut as a run cuts it, as the page receives it. */
-function cut(name: string) {
+function cut(name: string, audioOnly = false) {
     const set = readSet(name);
     const cutter = createCutter(
         set.mimeType,
-        { targetMs: 5000, maxMs: 30_000 },
+        { targetMs: 5000, maxMs: 30_000, audioOnly },
         () => undefined,
     );
     const segments: CutSegment[] = [];
@@ -30,6 +30,21 @@ function cut(name: string) {
             base64: base64(segment.bytes),
             startMs: segment.startMs,
             durationMs: segment.durationMs,
+        })),
+    };
+}
+
+/** A fixture set committed already cut (seq 0 the init, then one media segment each), as the page receives it. */
+function aligned(name: string) {
+    const set = readSet(name);
+
+    return {
+        mime: set.mimeType,
+        init: base64(set.blobs[0]),
+        media: set.blobs.slice(1).map((bytes, i) => ({
+            base64: base64(bytes),
+            startMs: set.fragments[i + 1].start_ms,
+            durationMs: set.fragments[i + 1].duration_ms,
         })),
     };
 }
@@ -517,3 +532,60 @@ test('switching controls to none during a review unbinds the element player, so 
         }),
     ).toEqual({ count: 1, src: null, display: 'block' });
 });
+
+const AUDIO_CASES = [
+    'chrome-opus-audio',
+    'firefox-opus-audio',
+    'webkit-aac-audio',
+];
+
+for (const set of AUDIO_CASES) {
+    test(`a local copy of ${set} has its duration and seeks`, async ({
+        page,
+        browserName,
+    }, testInfo) => {
+        // The same owed rule as the video sets above: WebKitGTK cannot demultiplex MediaRecorder WebM.
+        const owed =
+            browserName === 'webkit' &&
+            process.env.FITT_REVIEW_WEBKIT_ALL !== '1';
+        test.fixme(
+            owed && set !== 'webkit-aac-audio',
+            'webkit (WebKitGTK) cannot demultiplex MediaRecorder WebM, as for the video sets: the owner decides',
+        );
+        if (browserName === 'webkit') {
+            testInfo.annotations.push({
+                type: 'engine',
+                description:
+                    process.platform === 'darwin'
+                        ? 'WebKit on macOS, the engine Safari uses'
+                        : 'WebKitGTK on Linux, not Safari',
+            });
+        }
+        await installMedia(page, browserName);
+        await openHarness(page);
+        const fixture =
+            set === 'webkit-aac-audio' ? cut(set, true) : aligned(set);
+        const support = await page.evaluate(
+            (type) => document.createElement('audio').canPlayType(type),
+            fixture.mime,
+        );
+        test.skip(support === '', `${browserName} cannot play ${fixture.mime}`);
+        const last = fixture.media[fixture.media.length - 1];
+        const endS = (last.startMs + last.durationMs) / 1000;
+        const result = await page.evaluate(
+            (options) => window.internals.reviewFixture(options),
+            { ...fixture, seeks: SEEKS, kind: 'audio' as const },
+        );
+
+        expect(result.error).toBeNull();
+        expect(result.src.startsWith('blob:')).toBe(true);
+        expect(Math.abs(result.duration - endS)).toBeLessThanOrEqual(0.15);
+        for (const seek of result.seeks) {
+            expect(
+                Math.abs(seek.currentTime - seek.at),
+                `seek to ${seek.at}`,
+            ).toBeLessThanOrEqual(0.25);
+        }
+        expect(result.played).toBeGreaterThan(0);
+    });
+}

@@ -6,7 +6,10 @@ import type { CutSegment } from '../../src/cut/types.ts';
 import { concat, readSet } from '../support/fixtures.ts';
 
 /** A fixture set cut as a run cuts it (5 s target, 30 s max), as its init and its media parts. */
-function cutSet(name: string): {
+function cutSet(
+    name: string,
+    audioOnly = false,
+): {
     mime: string;
     init: Uint8Array;
     media: SeekablePart[];
@@ -15,7 +18,7 @@ function cutSet(name: string): {
     let fellBack = false;
     const cutter = createCutter(
         set.mimeType,
-        { targetMs: 5000, maxMs: 30_000 },
+        { targetMs: 5000, maxMs: 30_000, audioOnly },
         () => {
             fellBack = true;
         },
@@ -404,19 +407,105 @@ test('a segment that does not start on a sync sample has no SAP', () => {
     );
 });
 
-test('an MP4 init with no moov, no mvex, no video track or no media gives null', () => {
+test('an MP4 init with no moov, no mvex, no video or audio track or no media gives null', () => {
     const { mime, init, media } = cutSet('webkit-mp4');
     // The positive control: this init does make a head (fails before this task).
     assert.notEqual(seekableHead(mime, init, media), null);
 
-    // Measured: ftyp 0 to 28; moov at 28 (1107 bytes); the video trak's hdlr at 712; mvex at 1063 (72 bytes, moov's last child).
+    // Measured: ftyp 0 to 28; moov at 28 (1107 bytes); the audio trak's hdlr at 284, the video trak's at 712; mvex at 1063 (72 bytes, moov's last child).
     const noMvex = init.slice(0, 1063);
     new DataView(noMvex.buffer).setUint32(28, 1107 - 72);
+    // With no vide trak the head falls back to the soun trak (Plan 10, author's call 6), so both handlers become 'text'.
     const noVideo = init.slice();
-    noVideo.set([0x73, 0x6f, 0x75, 0x6e], 712 + 16); // handler_type 'soun'
+    noVideo.set([0x74, 0x65, 0x78, 0x74], 712 + 16); // handler_type 'text'
+    noVideo.set([0x74, 0x65, 0x78, 0x74], 284 + 16); // handler_type 'text'
 
     assert.equal(seekableHead(mime, init.subarray(0, 28), media), null);
     assert.equal(seekableHead(mime, noMvex, media), null);
     assert.equal(seekableHead(mime, noVideo, media), null);
     assert.equal(seekableHead(mime, init, []), null);
+});
+
+/** An aligned fixture set as its parts: seq 0 the init, then each media segment with its manifest times. */
+function alignedSet(name: string): {
+    mime: string;
+    init: Uint8Array;
+    media: SeekablePart[];
+} {
+    const set = readSet(name);
+    const [init, ...media] = set.blobs;
+
+    return {
+        mime: set.mimeType,
+        init,
+        media: media.map((bytes, i) => ({
+            bytes,
+            startMs: set.fragments[i + 1].start_ms,
+            durationMs: set.fragments[i + 1].duration_ms,
+            nonKeyframeStart: false,
+        })),
+    };
+}
+
+test('an Opus-only WebM head cues the audio track on every segment, and every cue lands on its Cluster', () => {
+    const { mime, init, media } = alignedSet('chrome-opus-audio');
+    const head = seekableHead(mime, init, media);
+    assert.ok(head !== null);
+    const file = concat([head, ...media.map((part) => part.bytes)]);
+    const read = readWebm(file);
+    const last = media[media.length - 1];
+
+    assert.equal(read.segmentSize, null);
+    assert.equal(read.order.includes(CUES), true);
+    assert.equal(read.cues.length, media.length);
+    assert.equal(read.durationTicks, last.startMs + last.durationMs);
+    assert.equal(new Set(read.cues.map((cue) => cue.track)).size, 1);
+    assert.ok(read.cues[0].track >= 1);
+
+    for (const cue of read.cues) {
+        assert.equal(
+            clusterTime(file, read.segmentData + cue.position),
+            cue.time,
+        );
+    }
+});
+
+/** The top-level boxes of an MP4 head: type, start and size. */
+function topBoxes(
+    bytes: Uint8Array,
+): { type: string; at: number; size: number }[] {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const out: { type: string; at: number; size: number }[] = [];
+
+    for (let at = 0; at + 8 <= bytes.byteLength;) {
+        const size = view.getUint32(at);
+        out.push({
+            type: String.fromCharCode(...bytes.subarray(at + 4, at + 8)),
+            at,
+            size,
+        });
+        at += size;
+    }
+
+    return out;
+}
+
+test('an AAC-only MP4 head indexes the soun track with a sidx over every media segment', () => {
+    const { mime, init, media } = cutSet('webkit-aac-audio', true);
+    const head = seekableHead(mime, init, media);
+    assert.ok(head !== null);
+    const boxes = topBoxes(head);
+    const sidx = boxes.find((one) => one.type === 'sidx');
+    assert.ok(sidx !== undefined);
+    assert.equal(boxes[boxes.length - 1].type, 'sidx');
+    const view = new DataView(
+        head.buffer,
+        head.byteOffset + sidx.at,
+        sidx.size,
+    );
+
+    // Version 1: reference_ID at 12, timescale at 16, reference_count at 38.
+    assert.equal(view.getUint32(12), 1);
+    assert.equal(view.getUint32(16), 48_000);
+    assert.equal(view.getUint16(38), media.length);
 });

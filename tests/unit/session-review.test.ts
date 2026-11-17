@@ -6,7 +6,12 @@ import { fakeEnvironment, json, until } from '../support/fake-env.ts';
 import { fakeMedia } from '../support/fake-media.ts';
 import { fakeObjectUrls } from '../support/fake-video.ts';
 import { descriptorFixture } from '../support/records.ts';
-import { recordTake, rigSeams, sessionRig } from '../support/session-rig.ts';
+import {
+    recordTake,
+    rigSeams,
+    sessionRig,
+    statusBody,
+} from '../support/session-rig.ts';
 
 /** The first four chrome-vp8-kf blobs: a 571-byte head (5 cues) plus 958,475 media bytes. */
 const HELD = 959_046;
@@ -303,4 +308,66 @@ test('a stale_take that moves the take on clears the copy as a reset', async () 
         ],
         ['cleared', 'reset', 0],
     );
+});
+
+test('the playback track comes from the descriptor, and waitForReady() with no track waits for it', async () => {
+    assert.equal(
+        sessionRig({ recipe: 'answer' }).session.playbackTrack,
+        'camera',
+    );
+    assert.equal(
+        sessionRig({ recipe: 'conversation-audio' }).session.playbackTrack,
+        'audio',
+    );
+    assert.equal(sessionRig({ recipe: 'file' }).session.playbackTrack, null);
+
+    const r = sessionRig({ recipe: 'answer-audio' });
+    r.respond({
+        '/status': () =>
+            json(
+                200,
+                statusBody(
+                    { status: 'pending', verdict: null, take: 1, reasons: [] },
+                    {
+                        playback: {
+                            audio: {
+                                url: 'https://media.test/audio-1.webm',
+                                expires_at: '2026-11-17T10:02:00Z',
+                                mime_type: 'audio/webm',
+                            },
+                        },
+                    },
+                ),
+            ),
+    });
+    const ready = r.session.waitForReady();
+    await r.env.advance(100);
+    assert.equal(await ready, 'https://media.test/audio-1.webm');
+
+    const file = sessionRig({ recipe: 'file' });
+    await assert.rejects(
+        file.session.waitForReady(),
+        (error: unknown) =>
+            (error as { code?: string; detail?: { reason?: string } }).code ===
+                'invalid_state' &&
+            (error as { detail?: { reason?: string } }).detail?.reason ===
+                'no_playback_track',
+    );
+});
+
+test('an audio element as a preview is muted and never mirrored', () => {
+    const r = sessionRig({ recipe: 'answer-audio' });
+    const audio = Object.assign(new EventTarget(), {
+        srcObject: null as unknown,
+        muted: false,
+        playsInline: false,
+        autoplay: false,
+        isConnected: true,
+        style: { transform: '' },
+        play: async () => undefined,
+    });
+    r.session.attachPreview(audio as unknown as HTMLAudioElement);
+
+    assert.equal(audio.muted, true);
+    assert.equal(audio.style.transform, '');
 });

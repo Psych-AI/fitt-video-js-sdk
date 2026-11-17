@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createBmffCutter } from '../../src/cut/bmff.ts';
+import { createCutter } from '../../src/cut/select.ts';
 import { CutterError, type CutSegment } from '../../src/cut/types.ts';
 import {
     byteAtATime,
@@ -194,4 +195,40 @@ test('a box of size 0 is a CutterError', () => {
         );
         cutter.end();
     }, CutterError);
+});
+
+test('an audio-only fragmented MP4 is cut on moof boxes with no fallback, and init plus media join back to the recording', () => {
+    const set = readSet('webkit-aac-audio');
+    let fellBack = false;
+    const cutter = createCutter(
+        set.mimeType,
+        { targetMs: 5000, maxMs: 30_000, audioOnly: true },
+        () => {
+            fellBack = true;
+        },
+    );
+    const cut: CutSegment[] = [];
+    set.blobs.forEach((blob, index) =>
+        cut.push(...cutter.push(blob, index * 5000)),
+    );
+    cut.push(...cutter.end(set.blobs.length * 5000));
+    const [init, ...media] = cut;
+    const type = (bytes: Uint8Array): string =>
+        String.fromCharCode(...bytes.subarray(4, 8));
+
+    assert.equal(fellBack, false);
+    assert.equal(init.kind, 'init');
+    assert.equal(type(init.bytes), 'ftyp');
+    assert.ok(media.length > 0);
+    assert.deepEqual(
+        [...new Set(media.map((segment) => type(segment.bytes)))],
+        ['moof'],
+    );
+    assert.equal(
+        Buffer.compare(
+            Buffer.from(concat(cut.map((segment) => segment.bytes))),
+            Buffer.from(set.whole),
+        ),
+        0,
+    );
 });

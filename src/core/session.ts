@@ -35,6 +35,7 @@ import {
 } from './checks.ts';
 import { createClock, type Clock, type ClockJump } from './clock.ts';
 import {
+    playbackTrackOf,
     readDescriptor,
     startsDirect,
     type ChunkedTrack,
@@ -98,19 +99,28 @@ export interface FittSession {
     readonly stream: MediaStream | null;
     readonly devices: DevicesView;
     readonly audioLevel: number;
+    /** The track the person watches (Plan 10): 'camera', 'audio' in an audio-only session, null for a file session. */
+    readonly playbackTrack: 'camera' | 'audio' | null;
     readonly debug?: {
         dropNextSegment(track?: TrackName): void;
         /** Starts a second run on the open take, as a camera switch would (the playground's multi-run case, Plan 9). */
         restartRun(reason?: RunEndedReason): Promise<void>;
     };
     prepare(): Promise<void>;
-    /** srcObject = the capture stream, muted, playsInline, autoplay, mirrored unless mirror is false; followed on every re-acquire. */
+    /**
+     * srcObject = the capture stream, muted, playsInline, autoplay, mirrored unless mirror is
+     * false; followed on every re-acquire. An `<audio>` element is muted and played, never
+     * mirrored, and never watched for stalls (Plan 10).
+     */
     attachPreview(
-        video: HTMLVideoElement,
+        element: HTMLMediaElement,
         options?: { mirror?: boolean },
     ): void;
-    /** Stops following this element; when no connected preview is left, the session's own hidden element takes over the stall watch. */
-    detachPreview(video: HTMLVideoElement): void;
+    /**
+     * Stops following this element; when no connected video preview is left, the session's own
+     * hidden element takes over the stall watch. An `<audio>` element is never watched for stalls.
+     */
+    detachPreview(element: HTMLMediaElement): void;
     mixAudio(source: MixSource, options: { role: 'interviewer' }): void;
     onAudioLevel(listener: (level: number) => void): () => void;
     now(): number;
@@ -118,8 +128,12 @@ export interface FittSession {
     stop(options?: { sealTracks?: boolean }): Promise<void>;
     finalise(): Promise<void>;
     waitForChecks(options?: { timeoutMs?: number }): Promise<ChecksResult>;
-    waitForReady(options: {
-        track: TrackName;
+    /**
+     * The track's playback URL once the server file is ready. With no `track`, the playback
+     * track (Plan 10); with neither, `invalid_state` with reason `no_playback_track`.
+     */
+    waitForReady(options?: {
+        track?: TrackName;
         timeoutMs?: number;
     }): Promise<string>;
     /**
@@ -127,9 +141,11 @@ export interface FittSession {
      * local copy, else preparing until the server file is ready. Switches to the server file
      * only while the video is paused or ended. Never calls play(). A preview element (one
      * passed to attachPreview(), or any with a srcObject) is refused with `invalid_state`,
-     * reason `preview_element`: its srcObject would hide the review.
+     * reason `preview_element`: its srcObject would hide the review. It takes a `<video>`, or an
+     * `<audio>` element in an audio-only session (Plan 10): the playback track's file plays in
+     * it. A session with no playback track rejects `invalid_state`, reason `no_playback_track`.
      */
-    playback(video: HTMLVideoElement): Promise<'local' | 'server'>;
+    playback(element: HTMLMediaElement): Promise<'local' | 'server'>;
     reset(): Promise<void>;
     discard(): Promise<void>;
     event(type: string, payload?: Record<string, unknown> | unknown[]): boolean;
@@ -359,8 +375,15 @@ function rejectWith(
     return Promise.reject(new FittVideoError(code, detail));
 }
 
-function isConnected(video: HTMLVideoElement): boolean {
+function isConnected(video: HTMLMediaElement): boolean {
     return (video as { isConnected?: boolean }).isConnected !== false;
+}
+
+/** True for a `<video>` (or its fake): it has frames to mirror and to watch for stalls (Plan 10). */
+function isVideoElement(
+    element: HTMLMediaElement,
+): element is HTMLVideoElement {
+    return 'videoWidth' in element || 'requestVideoFrameCallback' in element;
 }
 
 function chunkedTracks(descriptor: Descriptor): ChunkedTrack[] {
@@ -493,6 +516,7 @@ function invalidSession(detail: Record<string, unknown>): FittSession {
         stream: null,
         devices: NO_DEVICES,
         audioLevel: 0,
+        playbackTrack: null,
         prepare: refuse,
         attachPreview: () => undefined,
         detachPreview: () => undefined,
@@ -612,9 +636,13 @@ export function createSession(
     const patchPlayback = (change: Partial<PlaybackState>): void =>
         state.patch({ playback: { ...state.get().playback, ...change } });
 
+    // The track the person watches, decided once from the descriptor (Plan 10, author's call 4).
+    const playbackTrack = playbackTrackOf(descriptor);
+
     // The review copy, in memory only (Plan 9, author's calls 1, 4 and 6).
     const copy: LocalCopy = createLocalCopy({
         sessionId,
+        track: playbackTrack ?? 'camera',
         off:
             descriptor.playback?.local !== true
                 ? 'not_allowed'
@@ -739,7 +767,7 @@ export function createSession(
     let attachWanted = false;
 
     // Previews and the stall watch (item 13).
-    const previews: HTMLVideoElement[] = [];
+    const previews: HTMLMediaElement[] = [];
     let own: HTMLVideoElement | null = null;
     let watched: HTMLVideoElement | null = null;
     let levelGraph: ReturnType<RecorderEngine['audio']> = null;
@@ -773,8 +801,8 @@ export function createSession(
     const emit = (type: string, payload?: Record<string, unknown>): void => {
         bus.emit(type, payload);
 
-        if (type === 'recorder.fallback' && payload?.track === 'camera') {
-            // A blob fallback on the camera turns the review copy off (Plan 9, author's call 5).
+        if (type === 'recorder.fallback' && payload?.track === playbackTrack) {
+            // A blob fallback on the playback track turns the review copy off (Plan 9, author's call 5).
             copy.fellBack(localTake);
         }
     };
@@ -2038,7 +2066,10 @@ export function createSession(
 
     /** The most recent connected preview, else the session's own element while capture is live. */
     const repick = (): void => {
-        const preview = [...previews].reverse().find(isConnected);
+        const preview = [...previews]
+            .reverse()
+            .filter(isVideoElement)
+            .find(isConnected);
 
         if (preview !== undefined) {
             dropOwn();
@@ -3336,6 +3367,7 @@ export function createSession(
         get audioLevel(): number {
             return engine?.audio()?.level() ?? 0;
         },
+        playbackTrack,
         ...(options.debug === true
             ? {
                   debug: {
@@ -3398,32 +3430,39 @@ export function createSession(
             return preparing;
         },
 
-        attachPreview(video, previewOptions = {}): void {
-            const at = previews.indexOf(video);
+        attachPreview(element, previewOptions = {}): void {
+            const at = previews.indexOf(element);
 
             if (at !== -1) {
                 previews.splice(at, 1);
             }
 
-            previews.push(video);
-            video.srcObject = engine?.stream ?? null;
-            video.muted = true;
-            video.playsInline = true;
-            video.autoplay = true;
+            previews.push(element);
+            element.srcObject = engine?.stream ?? null;
+            element.muted = true;
+            element.autoplay = true;
 
-            if (previewOptions.mirror !== false) {
-                video.style.transform = 'scaleX(-1)';
+            // An <audio> is muted and played only: no frames to mirror or to watch (Plan 10).
+            if (isVideoElement(element)) {
+                element.playsInline = true;
+
+                if (previewOptions.mirror !== false) {
+                    element.style.transform = 'scaleX(-1)';
+                }
             }
 
             void Promise.resolve()
-                .then(() => video.play())
+                .then(() => element.play())
                 .catch(() => undefined);
-            dropOwn();
-            watch(video);
+
+            if (isVideoElement(element)) {
+                dropOwn();
+                watch(element);
+            }
         },
 
-        detachPreview(video): void {
-            const at = previews.indexOf(video);
+        detachPreview(element): void {
+            const at = previews.indexOf(element);
 
             if (at === -1) {
                 return;
@@ -3431,7 +3470,7 @@ export function createSession(
 
             previews.splice(at, 1);
 
-            if (watched === video) {
+            if (watched === element) {
                 repick();
             }
         },
@@ -3602,21 +3641,36 @@ export function createSession(
             ).promise;
         },
 
-        async waitForReady(readyOptions): Promise<string> {
+        async waitForReady(readyOptions = {}): Promise<string> {
+            // With no track, the playback track (Plan 10, author's call 4).
+            const track = readyOptions.track ?? playbackTrack;
+
+            if (track === null) {
+                return rejectWith('invalid_state', {
+                    reason: 'no_playback_track',
+                });
+            }
+
             // Playback exists only once a finalised session was processed: a tombstone polls too.
             await whenReady();
 
             const url = await pollReady(
                 { env, status: () => api!.status() },
-                readyOptions.track,
+                track,
                 readyOptions.timeoutMs,
             );
-            readyListeners.call({ track: readyOptions.track, url });
+            readyListeners.call({ track, url });
 
             return url;
         },
 
         async playback(video): Promise<'local' | 'server'> {
+            if (playbackTrack === null) {
+                return rejectWith('invalid_state', {
+                    reason: 'no_playback_track',
+                });
+            }
+
             await whenReady();
 
             if (!owner) {
@@ -3655,7 +3709,7 @@ export function createSession(
                 waitServer: (timeoutMs, cancelled) =>
                     pollReady(
                         { env, status: () => api!.status() },
-                        'camera',
+                        playbackTrack,
                         timeoutMs,
                         cancelled,
                     ),

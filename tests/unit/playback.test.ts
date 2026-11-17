@@ -15,10 +15,12 @@ function reviewRig(
     options: {
         local?: boolean;
         inStatus?: boolean;
+        recipe?: string;
+        track?: 'camera' | 'audio';
         routes?: Parameters<ReturnType<typeof sessionRig>['respond']>[0];
     } = {},
 ) {
-    const descriptor = descriptorFixture('answer');
+    const descriptor = descriptorFixture(options.recipe ?? 'answer');
     descriptor.playback = {
         local: options.local ?? true,
         local_max_bytes: 100_000_000,
@@ -37,7 +39,7 @@ function reviewRig(
                         ? { playback: {} }
                         : {
                               playback: {
-                                  camera: {
+                                  [options.track ?? 'camera']: {
                                       url: server.url,
                                       expires_at: '2026-11-12T10:02:00Z',
                                       mime_type: 'video/webm',
@@ -522,4 +524,24 @@ test('a player replaced while its status answer is in flight never settles', asy
     assert.equal(settledFirst.value, false);
     assert.deepEqual([first.src, second.src], ['', SERVER]);
     assert.equal(r.session.state.playback.source, 'server');
+});
+
+test('an audio-only take reviews in an audio element: the local copy first, then the server audio file', async () => {
+    const r = reviewRig({ recipe: 'answer-audio', track: 'audio' });
+    assert.equal(r.session.playbackTrack, 'audio');
+    await recordTake(r, 6000);
+
+    const local = new FakeVideo();
+    const first = r.session.playback(local as unknown as HTMLAudioElement);
+    await r.env.advance(1500);
+    assert.equal(await first, 'local');
+    assert.equal(local.src, 'blob:fake/1');
+    assert.equal(r.session.state.playback.local, 'held');
+
+    r.server.url = SERVER;
+    const server = new FakeVideo();
+    const second = r.session.playback(server as unknown as HTMLAudioElement);
+    await r.env.advance(100);
+    assert.equal(await second, 'server');
+    assert.equal(server.src, SERVER);
 });

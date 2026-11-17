@@ -8,13 +8,15 @@
  *
  * WebM (author's call 2): the head carries an Info with Duration and a Cues element before the
  * first Cluster, with one CuePoint per media segment that starts on a keyframe Cluster
- * (`nonKeyframeStart` false). Any SeekHead is dropped and none is written. The Segment keeps an
+ * (`nonKeyframeStart` false). The cues point at the video track, else at the audio track of an
+ * audio-only take (Plan 10, author's call 6). Any SeekHead is dropped and none is written. The Segment keeps an
  * unknown size. Every element the writer makes has an 8-byte size field and every uint is 8
  * bytes, so the size of Cues is known before the cluster offsets and one pass is enough.
  *
  * Fragmented MP4 (author's call 3): an `mehd` with the duration in `mvex`, and a `sidx` after
  * `moov` with one reference per media segment (`starts_with_SAP` 1 and `SAP_type` 1 unless
- * `nonKeyframeStart`). No Media Source Extensions are needed in any engine.
+ * `nonKeyframeStart`), on the video track, else on the audio track of an audio-only take (Plan 10,
+ * author's call 6). No Media Source Extensions are needed in any engine.
  */
 
 /** One media segment of a run, as the cutter cut it. */
@@ -54,6 +56,7 @@ const CUES_HEADER_BYTES = 12;
 const UNKNOWN_SIZE = [0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
 const DEFAULT_TIMECODE_SCALE = 1_000_000;
 const TRACK_TYPE_VIDEO = 1;
+const TRACK_TYPE_AUDIO = 2;
 
 interface Element {
     id: number;
@@ -217,8 +220,14 @@ function element(id: number, ...body: Uint8Array[]): Uint8Array {
     return join([idBytes(id), sizeBytes(data.byteLength), data]);
 }
 
-/** The video track number of a Tracks element, or null when it has no video track. */
-function videoTrackNumber(bytes: Uint8Array, tracks: Element): number | null {
+/**
+ * The track number the cues point at (Plan 10, author's call 6): the first video track (TrackType
+ * 1), else the first audio track (TrackType 2), else null. Every audio segment starts a Cluster or
+ * a moof with no keyframe rule, so it is always cued (WebM) or SAP type 1 (MP4).
+ */
+function cueTrackNumber(bytes: Uint8Array, tracks: Element): number | null {
+    const numbers = new Map<number, number>();
+
     for (const entry of children(bytes, tracks) ?? []) {
         if (entry.id !== EBML_ID.TrackEntry) {
             continue;
@@ -228,16 +237,20 @@ function videoTrackNumber(bytes: Uint8Array, tracks: Element): number | null {
         const type = fields.find((field) => field.id === EBML_ID.TrackType);
         const number = fields.find((field) => field.id === EBML_ID.TrackNumber);
 
-        if (
-            type !== undefined &&
-            number !== undefined &&
-            readUint(bytes, type) === TRACK_TYPE_VIDEO
-        ) {
-            return readUint(bytes, number);
+        if (type === undefined || number === undefined) {
+            continue;
+        }
+
+        const kind = readUint(bytes, type);
+
+        if (!numbers.has(kind)) {
+            numbers.set(kind, readUint(bytes, number));
         }
     }
 
-    return null;
+    return (
+        numbers.get(TRACK_TYPE_VIDEO) ?? numbers.get(TRACK_TYPE_AUDIO) ?? null
+    );
 }
 
 /** The WebM head: Duration and one cue per keyframe-led segment (author's call 2); null when the init cannot be read. */
@@ -260,7 +273,7 @@ export function seekableWebmHead(
     let infoChildren: Uint8Array[] | null = null;
     let scale = DEFAULT_TIMECODE_SCALE;
     let tracks: Uint8Array | null = null;
-    let videoTrack: number | null = null;
+    let cueTrack: number | null = null;
     const kept: Uint8Array[] = [];
 
     for (let at = segment.data; at < init.length;) {
@@ -306,7 +319,7 @@ export function seekableWebmHead(
 
         if (child.id === EBML_ID.Tracks) {
             tracks = init.subarray(child.at, child.end);
-            videoTrack = videoTrackNumber(init, child);
+            cueTrack = cueTrackNumber(init, child);
 
             continue;
         }
@@ -314,7 +327,7 @@ export function seekableWebmHead(
         kept.push(init.subarray(child.at, child.end));
     }
 
-    if (infoChildren === null || tracks === null || videoTrack === null) {
+    if (infoChildren === null || tracks === null || cueTrack === null) {
         return null;
     }
 
@@ -347,7 +360,7 @@ export function seekableWebmHead(
                     ),
                     element(
                         EBML_ID.CueTrackPositions,
-                        element(EBML_ID.CueTrack, uint64(videoTrack)),
+                        element(EBML_ID.CueTrack, uint64(cueTrack)),
                         element(EBML_ID.CueClusterPosition, uint64(position)),
                     ),
                 ),
@@ -465,10 +478,26 @@ function child(bytes: Uint8Array, parent: Box, type: string): Box | null {
     );
 }
 
-/** The video track's track_ID and media timescale, or null when the moov has no readable video track. */
-function videoTrack(
+/**
+ * The reference track's track_ID and media timescale (Plan 10, author's call 6): the first trak
+ * whose hdlr is `vide`, else the first whose hdlr is `soun`, or null when neither reads. Every
+ * audio segment starts a moof with no keyframe rule, so it is always SAP type 1.
+ */
+function referenceTrack(
     bytes: Uint8Array,
     moovKids: readonly Box[],
+): { trackId: number; scale: number } | null {
+    return (
+        handlerTrack(bytes, moovKids, 'vide') ??
+        handlerTrack(bytes, moovKids, 'soun')
+    );
+}
+
+/** The first trak whose hdlr is `handler`: its track_ID and media timescale, or null when it does not read. */
+function handlerTrack(
+    bytes: Uint8Array,
+    moovKids: readonly Box[],
+    handler: string,
 ): { trackId: number; scale: number } | null {
     for (const trak of moovKids) {
         if (trak.type !== 'trak') {
@@ -485,7 +514,7 @@ function videoTrack(
         if (
             String.fromCharCode(
                 ...bytes.subarray(hdlr.at + 16, hdlr.at + 20),
-            ) !== 'vide'
+            ) !== handler
         ) {
             continue;
         }
@@ -544,13 +573,13 @@ export function seekableMp4Head(
         mvhd === undefined ? null : versioned(init, mvhd, 20, 28);
     const mvexKids =
         mvex === undefined ? null : boxList(init, mvex.at + 8, mvex.end);
-    const video = videoTrack(init, moovKids);
+    const reference = referenceTrack(init, moovKids);
 
     if (
         movieScale === null ||
         movieScale === 0 ||
         mvexKids === null ||
-        video === null
+        reference === null
     ) {
         return null;
     }
@@ -576,7 +605,8 @@ export function seekableMp4Head(
         ),
     );
 
-    const ticks = (ms: number): number => Math.round((ms * video.scale) / 1000);
+    const ticks = (ms: number): number =>
+        Math.round((ms * reference.scale) / 1000);
     const bounds = [...media.map((part) => ticks(part.startMs)), ticks(endMs)];
     const refs = media.map((part, i) =>
         join([
@@ -588,8 +618,8 @@ export function seekableMp4Head(
     const sidx = box(
         'sidx',
         [1, 0, 0, 0],
-        u32(video.trackId),
-        u32(video.scale),
+        u32(reference.trackId),
+        u32(reference.scale),
         uint64(bounds[0]),
         uint64(0),
         u16(0),

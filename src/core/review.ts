@@ -1,8 +1,9 @@
 /**
- * The review copy (Plan 9, spec 6.10): the camera segments of the current take, held in memory
- * only (author's calls 1, 5 and 6). It is never written to any store.
+ * The review copy (Plan 9, spec 6.10): the playback-track segments of the current take, held in
+ * memory only (author's calls 1, 5 and 6). It is never written to any store. The playback track
+ * is the camera, else the audio track of an audio-only session (Plan 10, author's call 4).
  *
- * The copy keeps a reference to each camera record's `data` buffer as the run adds it, and at
+ * The copy keeps a reference to each playback-track record's `data` buffer as the run adds it, and at
  * `complete()` builds one Blob: a seekable head (`seekableHead()`) followed by the media
  * segments unchanged. A second run, a blob fallback, more bytes than the budget or an init it
  * cannot read turn it off for the take. At most one copy per page holds bytes at a time.
@@ -39,6 +40,8 @@ export interface LocalCopyDeps {
     /** Where pagehide is heard; null outside a browser. */
     win: EventTarget | null;
     onChange(view: LocalView): void;
+    /** The playback track whose segments the copy holds (Plan 10, author's call 4). */
+    track: 'camera' | 'audio';
 }
 
 export interface LocalCopy {
@@ -169,7 +172,7 @@ export function createLocalCopy(deps: LocalCopyDeps): LocalCopy {
         view,
 
         add(segment: SegmentRecord, nonKeyframeStart = false): void {
-            if (deps.off !== null || retired || segment.track !== 'camera') {
+            if (deps.off !== null || retired || segment.track !== deps.track) {
                 return;
             }
 

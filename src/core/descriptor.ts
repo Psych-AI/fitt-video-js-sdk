@@ -483,6 +483,27 @@ export function startsDirect(descriptor: Descriptor): boolean {
     );
 }
 
+/**
+ * The track the person watches (Plan 10, author's call 4): the camera when a chunked camera
+ * track is listed, else the audio track when a chunked audio track is listed, else null (a file
+ * session). It is decided once from the descriptor, never from the first segment to arrive: in a
+ * camera and audio answer the audio segment often arrives first.
+ */
+export function playbackTrackOf(
+    descriptor: Descriptor,
+): 'camera' | 'audio' | null {
+    const chunked = (name: 'camera' | 'audio'): boolean =>
+        descriptor.tracks.some(
+            (track) => track.kind === 'chunked' && track.track === name,
+        );
+
+    if (chunked('camera')) {
+        return 'camera';
+    }
+
+    return chunked('audio') ? 'audio' : null;
+}
+
 /** Never throws. */
 export function readDescriptor(input: unknown): DescriptorResult {
     try {

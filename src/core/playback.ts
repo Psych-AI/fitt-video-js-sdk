@@ -14,6 +14,10 @@ import { FittVideoError } from './errors.ts';
 import type { LocalCopy } from './review.ts';
 import type { PlaybackSource } from './state.ts';
 
+/**
+ * The part of `HTMLMediaElement` the player uses, so `<audio>` and `<video>` both fit: an
+ * audio-only session reviews its audio track in an `<audio>` element (Plan 10).
+ */
 export type PlaybackElement = Pick<
     HTMLVideoElement,
     | 'src'

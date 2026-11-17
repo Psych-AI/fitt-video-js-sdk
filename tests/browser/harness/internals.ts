@@ -280,6 +280,8 @@ export async function reviewFixture(options: {
     init: string;
     media: { base64: string; startMs: number; durationMs: number }[];
     seeks: number[];
+    /** 'audio' plays the copy in an <audio> and reports luma -1 for each seek (Plan 10). */
+    kind?: 'video' | 'audio';
 }): Promise<{
     src: string;
     duration: number;
@@ -309,7 +311,10 @@ export async function reviewFixture(options: {
             { type: options.mime },
         ),
     );
-    const video = document.createElement('video');
+    const audioOnly = options.kind === 'audio';
+    const video: HTMLMediaElement = document.createElement(
+        audioOnly ? 'audio' : 'video',
+    );
     video.muted = true;
     video.preload = 'auto';
     video.src = src;
@@ -355,7 +360,8 @@ export async function reviewFixture(options: {
             seeks.push({
                 at,
                 currentTime: video.currentTime,
-                luma: frameLuma(video),
+                // An audio file has no frame to read.
+                luma: audioOnly ? -1 : frameLuma(video as HTMLVideoElement),
             });
         }
 
