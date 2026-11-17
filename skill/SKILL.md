@@ -367,8 +367,11 @@ speech.
 
 **The life of the hooks.**
 
-- Null and 0 before `prepare()`, after `stop()` and after `reset()`
-  (capture is released at stop).
+- Null and 0 before `prepare()` and after `stop()` (capture is released
+  at stop).
+- Live again once `reset()` resolves: reset acquires capture again and
+  fires `onChange`. A host holding `stream` or an analyser asks again in
+  `onChange`.
 - 0 before the first click or key press on the page: the browser keeps the
   audio context suspended until a gesture.
 - `onFrame` runs only while a listener is attached, and stops while the tab

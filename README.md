@@ -240,8 +240,10 @@ session.audio.onChange(() => {
   `bands` is 8 values from 100 Hz to 8 kHz, 0 to 1, in one reused
   `Float32Array`: copy it to keep it.
 - `session.audio.stream`, `context` and `createAnalyser()` are null before
-  `prepare()`, after `stop()` and after `reset()`, and every level is 0
-  then. Every level is also 0 before the first click or key press on the
+  `prepare()` and after `stop()` (capture is released at stop), and every
+  level is 0 then. They are live again once `reset()` resolves: reset
+  acquires capture again and fires `onChange`, so a host holding `stream`
+  or an analyser asks again there. Every level is also 0 before the first click or key press on the
   page (the browser keeps the context suspended).
 - The stream survives a device switch, not a new prepare: listen to
   `onChange`.

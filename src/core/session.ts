@@ -104,7 +104,8 @@ export interface FittSession {
     readonly playbackTrack: 'camera' | 'audio' | null;
     /**
      * The host's audio levels on the SDK's one capture (spec 6.11, Plan 10). Null and 0 before
-     * prepare, after stop and after reset; 0 before the first gesture on the page.
+     * prepare and after stop (capture is released at stop); live again once reset() resolves,
+     * since reset acquires capture again and fires onChange. 0 before the first gesture on the page.
      */
     readonly audio: FittAudio;
     readonly debug?: {

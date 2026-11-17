@@ -123,3 +123,23 @@ test("stream is the graph's microphone-only stream, kept across a device switch,
     assert.equal(r.session.audio.stream, null);
     assert.ok(changes >= 3);
 });
+
+test('reset() after stop acquires capture again: the stream is live and onChange fires once reset resolves', async () => {
+    const r = audioRig('answer-audio');
+    await r.session.prepare();
+    await recordTake(r, 6000);
+    assert.equal(r.session.state.phase, 'stopped');
+    assert.equal(r.session.audio.stream, null);
+    let changes = 0;
+    r.session.audio.onChange(() => {
+        changes += 1;
+    });
+
+    await r.session.reset();
+
+    assert.equal(r.session.state.phase, 'ready');
+    assert.ok(r.session.audio.stream !== null);
+    assert.equal(r.session.audio.context, r.audio.context);
+    assert.ok(r.session.audio.createAnalyser() !== null);
+    assert.ok(changes >= 1);
+});
