@@ -11,7 +11,7 @@ test('the IIFE sets FittVideo with the package version and touches no DOM while 
     vm.runInContext(hosted('fitt-video.iife.js'), context);
     const sdk = context.FittVideo as Record<string, unknown>;
 
-    assert.equal(sdk.VERSION, '1.4.0');
+    assert.equal(sdk.VERSION, '1.4.1');
     assert.equal(typeof sdk.session, 'function');
     assert.equal(typeof sdk.resume, 'function');
     assert.equal(typeof sdk.defineFittRecorder, 'function');
@@ -28,7 +28,7 @@ test('the ES build imports in Node and exports the version', async () => {
         new URL('../../dist/hosted/fitt-video.js', import.meta.url).href
     )) as { VERSION: string };
 
-    assert.equal(module.VERSION, '1.4.0');
+    assert.equal(module.VERSION, '1.4.1');
 });
 
 test('the package README names the public API, the audio-only path and the level hooks', () => {

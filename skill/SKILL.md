@@ -3,7 +3,7 @@ name: video-sdk-integration
 version: 1
 description: >-
   Use when wiring Fitt Video recording into a host (source) platform: loading
-  @fitt/video-sdk or /sdk/v1/fitt-video.js, the POST /api/v1/sessions
+  @fitt-ai/video-sdk or /sdk/v1/fitt-video.js, the POST /api/v1/sessions
   descriptor hand-off, FittVideo.session, FittVideo.resume, <fitt-recorder>,
   defineFittRecorder, Vue's isCustomElement, start / stop / reset / discard /
   finalise, waitForChecks, waitForReady, mixAudio for conversation takes,
@@ -27,7 +27,7 @@ description: >-
 How a host platform records with Fitt Video: its server creates a session
 with its API key, its page records with only the descriptor, and its
 server learns the outcome from the webhook. This file ships inside the
-`@fitt/video-sdk` package (`skill/SKILL.md`) and is the source; the
+`@fitt-ai/video-sdk` package (`skill/SKILL.md`) and is the source; the
 `.claude/skills/video-sdk-integration/` and
 `.agents/skills/video-sdk-integration/` copies in the Fitt Video repo are
 byte-for-byte mirrors of it. SDK version 1.x.
@@ -52,7 +52,7 @@ byte-for-byte mirrors of it. SDK version 1.x.
 
 | Task | Do this |
 |---|---|
-| Load the SDK | `<script type="module">import { FittVideo } from 'https://<fitt-video-host>/sdk/v1/fitt-video.js';</script>`, or the IIFE `/sdk/v1/fitt-video.iife.js` (sets `window.FittVideo`), or `npm i @fitt/video-sdk` (`import { FittVideo } from '@fitt/video-sdk'`, element from `@fitt/video-sdk/ui`). Pin `/sdk/1.x.y/` for an exact build |
+| Load the SDK | `<script type="module">import { FittVideo } from 'https://<fitt-video-host>/sdk/v1/fitt-video.js';</script>`, or the IIFE `/sdk/v1/fitt-video.iife.js` (sets `window.FittVideo`), or `npm i @fitt-ai/video-sdk` (`import { FittVideo } from '@fitt-ai/video-sdk'`, element from `@fitt-ai/video-sdk/ui`). Pin `/sdk/1.x.y/` for an exact build |
 | Start a take | Server: `POST /api/v1/sessions`. Page: `const s = FittVideo.session(descriptor); el.session = s;` then the element's record button, or `await s.prepare(); await s.start();` |
 | Stop and hand in | `await s.stop();` then `await s.finalise();` once the candidate is done with every take |
 | Record again | `await s.reset();` from `stopped` or `rejected`, then `start()` again |
@@ -96,7 +96,7 @@ byte-for-byte mirrors of it. SDK version 1.x.
   a year. Only the current build is served: an older pin answers 404.
 - **Hosted, classic script:** `/sdk/v1/fitt-video.iife.js` sets
   `window.FittVideo` (with `defineFittRecorder`).
-- **npm:** `@fitt/video-sdk` (`.`: `FittVideo`, `FittVideoError` and the
+- **npm:** `@fitt-ai/video-sdk` (`.`: `FittVideo`, `FittVideoError` and the
   types; `./ui`: `defineFittRecorder`). Call `defineFittRecorder()` once on
   the client. Nothing touches the DOM at import, so server-side rendering
   is safe.

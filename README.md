@@ -1,4 +1,4 @@
-# @fitt/video-sdk
+# @fitt-ai/video-sdk
 
 Records answers, conversations and proctoring sessions in the browser for
 Fitt Video. The host's server creates a session with its API key and hands
@@ -13,12 +13,12 @@ The full integration guide, with every error code and the webhook rules, is
 ## Install
 
 ```bash
-npm i @fitt/video-sdk
+npm i @fitt-ai/video-sdk
 ```
 
 ```js
-import { FittVideo } from '@fitt/video-sdk';
-import { defineFittRecorder } from '@fitt/video-sdk/ui';
+import { FittVideo } from '@fitt-ai/video-sdk';
+import { defineFittRecorder } from '@fitt-ai/video-sdk/ui';
 
 defineFittRecorder(); // once, on the client
 ```
