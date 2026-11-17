@@ -30,3 +30,35 @@ test('the ES build imports in Node and exports the version', async () => {
 
     assert.equal(module.VERSION, '1.4.0');
 });
+
+test('the package README names the public API, the audio-only path and the level hooks', () => {
+    const readme = readFileSync(
+        new URL('../../README.md', import.meta.url),
+        'utf8',
+    );
+
+    for (const name of [
+        'FittVideo.session(',
+        'FittVideo.resume(',
+        'defineFittRecorder(',
+        'session.prepare(',
+        'session.start(',
+        'session.stop(',
+        'session.finalise(',
+        'session.waitForChecks(',
+        'session.waitForReady(',
+        'session.playback(',
+        'session.playbackTrack',
+        'session.mixAudio(',
+        'session.audio.getInputVolume',
+        'session.audio.onFrame(',
+        'session.audio.stream',
+        '--fitt-level',
+        'data-speaking',
+        '"tracks": ["audio"]',
+    ]) {
+        assert.ok(readme.includes(name), `README names ${name}`);
+    }
+
+    assert.equal(/[\u2013\u2014]/.test(readme), false);
+});

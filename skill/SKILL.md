@@ -13,7 +13,13 @@ description: >-
   network_blocked, token_expired, token_refresh_blocked, manifests_blocked,
   permission_denied, too_short; review right after recording with
   session.playback(video), <fitt-recorder review>, data-review, the review
-  slot, playback.source, state.playback and playback_in_status (SDK 1.3.0).
+  slot, playback.source, state.playback and playback_in_status (SDK 1.3.0);
+  audio-only recording ("tracks": ["audio"], Recipe::answer()->audioOnly(),
+  session.playbackTrack, an <audio> review, no_microphone) and the host's
+  audio visualizers (session.audio, getInputVolume, getOutputVolume, onFrame,
+  session.audio.stream, createAnalyser, --fitt-level, data-speaking,
+  data-media, the level slot, the ElevenLabs UI Orb, BarVisualizer and
+  LiveWaveform) (SDK 1.4.0).
 ---
 
 # Fitt Video SDK integration (version 1)
@@ -54,9 +60,11 @@ byte-for-byte mirrors of it. SDK version 1.x.
 | Retake after finalise | A new session from your server (`POST /api/v1/sessions` again), then `FittVideo.session(newDescriptor)` |
 | Throw the session away | `await s.discard();` |
 | Wait for the verdict | `const checks = await s.waitForChecks({ timeoutMs: 60000 });` `checks.verdict` is `accept`, `reject`, `unknown` or null. Act on the webhook, not on this |
-| Get a playback URL | `const url = await s.waitForReady({ track: 'camera' });` Needs `playback_in_status: true` on `POST /api/v1/sessions`. Rejects `playback_not_enabled` with an empty `detail` when the session has no `playback_in_status`, and with `detail.reason: 'timeout'` when no URL came in time. Rejects `track_failed` with `detail.reason` (the track's `failure_reason`, for example `no_decodable_run`) as soon as the status shows the track failed |
+| Get a playback URL | `const url = await s.waitForReady();` (the playback track, `s.playbackTrack`) or `await s.waitForReady({ track: 'camera' });` Needs `playback_in_status: true` on `POST /api/v1/sessions`. Rejects `playback_not_enabled` with an empty `detail` when the session has no `playback_in_status`, and with `detail.reason: 'timeout'` when no URL came in time. Rejects `track_failed` with `detail.reason` (the track's `failure_reason`, for example `no_decodable_run`) as soon as the status shows the track failed |
 | Get a playback URL on your server | `GET /api/v1/videos/{id}/playback` with the API key: `200 {url, expires_at, mime_type}`, valid for the space's `playback_url_lifetime_s`; `409 not_ready`, `410 expired` |
 | Get a still frame on your server | `GET /api/v1/videos/{id}/frame?t_ms=` with the API key: `200 image/jpeg` at session time `t_ms`; `409 not_ready`, `409 no_video`, `422 out_of_range`, `410 expired`, `409 discarded`, `503 frame_failed` (ffmpeg gave no frame; retry later) |
+| Record audio only | Server: `{"recipe": "answer", "tracks": ["audio"]}` (or `conversation`), or `Recipe::answer()->audioOnly()`. Page: unchanged; review with `s.playback(audioEl)`. See "Audio only" |
+| Draw a level ring, bars or an Orb | Use `--fitt-level` and `data-speaking` on the element, or `s.audio` (`getInputVolume`, `getOutputVolume`, `onFrame`, `stream`, `createAnalyser`). Never call `getUserMedia`. See "Visualizers" |
 | Mix interviewer audio | `s.mixAudio(remoteStreamOrTrackOrAudioElement, { role: 'interviewer' });` after `prepare()`, and again after each `reset()` |
 | Reload safety | On page load: `const entries = await FittVideo.resume();` and handle each entry (below) before creating anything new |
 | Handle an error | Read `s.state.error?.code` (or listen to `fitt-error`) and show the row in the error table below |
@@ -229,7 +237,8 @@ Phases: `idle`, `preparing`, `ready`, `countdown`, `recording`,
 
 ## Review right after recording (SDK 1.3.0)
 
-In the `answer` recipe the person can watch the take at once after stop,
+In the `answer` recipe (and in `conversation`, since SDK 1.4.0, when the
+take fits the budget) the person can watch the take at once after stop,
 even while segments still upload.
 
 - **Create the session with `playback_in_status: true`.** Without it the
@@ -264,13 +273,117 @@ even while segments still upload.
 - To keep a page server-only, pass `{ playback: { local: false } }` to
   `FittVideo.session()`.
 
+## Audio only (SDK 1.4.0)
+
+The `answer` and `conversation` recipes can record one audio track and no
+camera.
+
+- **The host's server creates it:** `Recipe::answer()->audioOnly()` in the
+  PHP SDK, or `POST /api/v1/sessions` with
+  `{"recipe": "answer", "tracks": ["audio"]}`. `conversation` works the same
+  way, with the interviewer on the right channel through `mixAudio()`. The
+  one track is recorded at 64 kbps (mono for answer, stereo for
+  conversation), and it is the playable file and the checks input.
+- **The page changes nothing.** The same calls, the same events.
+  `session.playbackTrack` is `'audio'`, so `waitForReady()` with no track
+  waits for the audio file, and `session.playback(audioEl)` takes an
+  `<audio controls>`.
+- **The element** becomes a strip: `data-media="audio"`, height
+  `--fitt-recorder-audio-height` (160 px by default), no camera list in the
+  picker. With `review` it plays the take in its own `<audio part="review">`.
+- **A lower bitrate:** `capture.audio.audio_bitrate_bps` in the session
+  options. Never `capture.camera`: there is no camera track.
+- **Errors:** a missing device is `no_microphone`, never `no_camera`.
+  `device.permission_granted` reports `camera: 'unknown'`.
+- **On your server:** `GET /api/v1/videos/{id}/frame` answers
+  `409 no_video` for the audio track. The `video.ready` webhook names
+  `track: audio`, and that file is the playable one.
+
+## Visualizers: the SDK draws nothing, the host draws
+
+**Never call getUserMedia again: a second capture can mute the first on iOS. Everything below hangs off the SDK's one capture.**
+
+```html
+<!-- 1. A mic ring in plain CSS: it inherits --fitt-level (0 to 1) from the recorder. -->
+<fitt-recorder controls="full"><span slot="level" class="mic-ring"></span></fitt-recorder>
+<style>
+  .mic-ring { display: block; width: 56px; height: 56px; border-radius: 50%; border: 2px solid #5fd39a;
+    transform: scale(calc(1 + var(--fitt-level, 0) * 0.5)); transition: transform 100ms linear; }
+  fitt-recorder[data-speaking] .mic-ring { border-color: #e93544; }
+</style>
+```
+
+```tsx
+// 2. The ElevenLabs UI Orb: the two functions are closures, safe to pass unbound.
+// volumeMode must be 'manual': in the default 'auto' the Orb ignores the getters.
+<Orb volumeMode="manual" getInputVolume={session.audio.getInputVolume} getOutputVolume={session.audio.getOutputVolume} />
+```
+
+```js
+// 3. Bars from onFrame: 8 bands, 0 to 1, from 100 Hz to 8 kHz. The array is reused: copy it to keep it.
+const bars = [...document.querySelectorAll('.bar')];
+const stop = session.audio.onFrame(({ bands }) => {
+  bands.forEach((value, i) => { bars[i].style.height = `${Math.max(2, value * 48)}px`; });
+});
+// stop() when the visual goes away.
+```
+
+```tsx
+// 4. ElevenLabs UI BarVisualizer (or useMultibandVolume): give it the SDK's microphone stream.
+const [stream, setStream] = useState(session.audio.stream);
+useEffect(() => session.audio.onChange(() => setStream(session.audio.stream)), [session]);
+return <BarVisualizer mediaStream={stream} />;
+```
+
+5. **LiveWaveform must not be used as is**: it calls `getUserMedia` itself
+   when `active` and takes no stream (research note
+   `docs/superpowers/research/2026-11-17-elevenlabs-ui-hooks.txt` in the
+   Fitt Video repo). Draw a waveform from `onFrame` or from
+   `session.audio.createAnalyser()` instead.
+
+In the Orb, `manualInput` and `inputVolumeRef` win over `getInputVolume`
+in manual mode, so do not pass them beside the getters.
+
+**The frame's scales.** `level` is on the meter's curve (0 to 1, the same
+curve as `--fitt-level` and `getInputVolume()`). `peak` is the raw largest
+absolute sample of the last analyser window (0 to 1, not on the level
+curve), so a host that draws both sees `peak` below `level` for quiet
+speech.
+
+**The hooks.**
+
+| Hook | What it is |
+|---|---|
+| `--fitt-level` | A CSS custom property on the element, 0 to 1, updated at 10 Hz in `ready`, `countdown` and `recording`; 0 otherwise. Slotted children inherit it |
+| `data-speaking` | On the element while the level is 0.2 or more; off after it stays under 0.1 for 300 ms |
+| `level` slot | A host visual: centred in the strip in audio only, over the view's bottom left corner in a video session |
+| `session.audio.getInputVolume()` | The microphone now, 0 to 1. A closure |
+| `session.audio.getOutputVolume()` | The interviewer side of the D20 mix now, 0 to 1; 0 without a mix. A closure |
+| `session.audio.onFrame(cb)` | `{level, peak, bands}` on every animation frame while a listener is attached; returns the unsubscribe |
+| `session.audio.stream` | The SDK's microphone-only `MediaStream` (no video track) |
+| `session.audio.createAnalyser({fftSize, smoothingTimeConstant})` | A host `AnalyserNode` on the SDK's own context, fed from the microphone |
+| `session.audio.context` | The SDK's `AudioContext` |
+| `session.audio.onChange(cb)` | Fires after every acquire and release: ask again for `stream` or an analyser |
+
+**The life of the hooks.**
+
+- Null and 0 before `prepare()`, after `stop()` and after `reset()`
+  (capture is released at stop).
+- 0 before the first click or key press on the page: the browser keeps the
+  audio context suspended until a gesture.
+- `onFrame` runs only while a listener is attached, and stops while the tab
+  is hidden; it starts again when the tab is visible.
+- `stream` survives a device switch, not a prepare: listen to `onChange`.
+- `getOutputVolume()` is 0 without a conversation mix.
+- It all works in video sessions too, and in `ready` before recording.
+
 ## Conversation: `mixAudio()`
 
 For the `conversation` recipe, pass the interviewer's audio
 (`MediaStreamTrack`, `MediaStream`, `AudioNode` or `HTMLMediaElement`) to
 `session.mixAudio(source, { role: 'interviewer' })` after `prepare()`.
-The camera track then records the candidate on the left channel and the
-interviewer on the right. Call it again after every `reset()`, because the
+The camera track (or the audio track, in an audio-only conversation) then
+records the candidate on the left channel and the interviewer on the right. Call it again after every `reset()`, because the
 SDK builds a new audio graph with each capture. **Recommend headphones to
 the candidate:** interviewer audio played through speakers echoes into the
 microphone, and browser echo cancellation is not reliable outside
@@ -317,7 +430,7 @@ never on a message.
 |---|---|---|---|
 | `permission_denied` | yes | Camera or microphone permission refused or revoked | How to allow the camera and microphone in this browser, then `prepare()` again |
 | `device_busy` | yes | Another app holds the camera | Close other apps that use the camera |
-| `no_camera` | yes | No camera found | Connect a camera |
+| `no_camera` | yes | No camera found (never in an audio-only session) | Connect a camera |
 | `no_microphone` | yes | No microphone found | Connect a microphone |
 | `recorder_unsupported` | yes | This browser cannot record | Ask for a current Chrome, Edge, Firefox or Safari |
 | `config_invalid` | yes | The descriptor could not be read | A bug in the host: log it |
@@ -378,7 +491,10 @@ above or `too_short`, `countdown_cancelled`, `invalid_state`,
 - Mirror the recording: only the preview is mirrored.
 - Play a take back from your own local blobs or `session.stream`
   recordings: MediaRecorder output has no duration header and seeks badly.
-  Use `session.playback(video)`, which builds a seekable copy, or the URL
+  Use `session.playback(video)` (or an `<audio>` in an audio-only
+  session), which builds a seekable copy, or the URL
   from `waitForReady()` or from `GET /api/v1/videos/{id}/playback` on your
   server, or after the `video.ready` webhook.
 - Treat the page's verdict as final: the webhook decides.
+- Call `getUserMedia` for a visualizer: use `session.audio` or
+  `--fitt-level`.
