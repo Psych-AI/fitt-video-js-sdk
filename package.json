@@ -4,6 +4,10 @@
     "description": "Records answers and proctoring sessions in the browser for Fitt Video.",
     "type": "module",
     "license": "UNLICENSED",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/Psych-AI/fitt-video-js-sdk.git"
+    },
     "sideEffects": false,
     "files": [
         "dist",
