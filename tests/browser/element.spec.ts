@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
 import { openHarness } from './support/measure.ts';
 import { installMedia } from './support/media.ts';
 
@@ -428,4 +428,95 @@ test('when the session cap stops the take, the remaining time and the bar run to
         'session_cap_reached',
         { timeout: 5000 },
     );
+});
+
+/** The host's --fitt-level, as a number. */
+async function fittLevel(page: Page): Promise<number> {
+    return page
+        .locator('fitt-recorder')
+        .evaluate((element) =>
+            Number(
+                getComputedStyle(element).getPropertyValue('--fitt-level') ||
+                    '0',
+            ),
+        );
+}
+
+test('an audio-only session hides the camera view, lists only microphones, drives --fitt-level and data-speaking, and reviews in an audio element', async ({
+    page,
+    browserName,
+}) => {
+    await installMedia(page, browserName, { prefer: 'synthetic' });
+    await openHarness(page, '/tests/browser/harness/element.html');
+    await page.evaluate(
+        (recording) =>
+            window.mount({
+                recording,
+                controls: 'full',
+                audioOnly: true,
+                review: true,
+                slots: ['level'],
+            }),
+        SHORT,
+    );
+    const recorder = page.locator('fitt-recorder');
+    await expect(recorder).toHaveAttribute('data-media', 'audio');
+    await expect(recorder.locator('[part=view]')).toBeHidden();
+    await expect(recorder.locator('[slot=level]')).toBeVisible();
+
+    await page.click('#gesture');
+    // The synthetic tone (gain 0.08, about 0.057 RMS) reads about 0.48 on the curve.
+    await expect.poll(() => fittLevel(page)).toBeGreaterThan(0.2);
+    await expect(recorder).toHaveAttribute('data-speaking', '');
+    await page.evaluate(() => window.__fakeMicGain?.(0));
+    await expect(recorder).not.toHaveAttribute('data-speaking', {
+        timeout: 2000,
+    });
+    await page.evaluate(() => window.__fakeMicGain?.(0.08));
+
+    await recorder.locator('[part=picker-toggle]').click();
+    await expect(
+        recorder.locator('[part=picker-list][aria-label=Cameras]'),
+    ).toBeHidden();
+    await expect(
+        recorder.locator('[part=picker-list][aria-label=Microphones]'),
+    ).toBeVisible();
+    await recorder.locator('[part=picker-toggle]').click();
+
+    await recorder.locator('[part=record]').click();
+    await expect(recorder).toHaveAttribute('data-phase', 'recording');
+    await expect(recorder.locator('[part=stop]')).toBeEnabled({
+        timeout: 6000,
+    });
+    await recorder.locator('[part=stop]').click();
+    await expect(recorder).toHaveAttribute('data-phase', 'stopped');
+
+    expect(
+        await recorder.evaluate(
+            (element) =>
+                element.shadowRoot?.querySelector('[part=review]')?.tagName,
+        ),
+    ).toBe('AUDIO');
+    // The review player is the one audio element the element makes (spec 6.4 as Plan 10 amends it).
+    expect(await page.evaluate(() => window.__audioElements)).toBe(1);
+    expect(await fittLevel(page)).toBe(0);
+    await expect(recorder).not.toHaveAttribute('data-speaking');
+});
+
+test('a video session sets --fitt-level too and shows the level slot over the view', async ({
+    page,
+    browserName,
+}) => {
+    await installMedia(page, browserName, { prefer: 'synthetic' });
+    await openHarness(page, '/tests/browser/harness/element.html');
+    await page.evaluate(() =>
+        window.mount({ controls: 'full', slots: ['level'] }),
+    );
+    const recorder = page.locator('fitt-recorder');
+    await expect(recorder).toHaveAttribute('data-media', 'video');
+    await expect(recorder.locator('[part=view]')).toBeVisible();
+    await expect(recorder.locator('[slot=level]')).toBeVisible();
+
+    await page.click('#gesture');
+    await expect.poll(() => fittLevel(page)).toBeGreaterThan(0.2);
 });

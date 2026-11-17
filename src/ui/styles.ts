@@ -29,6 +29,8 @@ export const STYLES = `
     --fitt-recorder-review-bar: 56px;
     --fitt-recorder-button-size: 44px;
     --fitt-recorder-countdown-size: 88px;
+    /* Plan 10: the strip of an audio-only session. */
+    --fitt-recorder-audio-height: 160px;
     --fitt-recorder-font: Inter, 'Helvetica Neue', Arial, sans-serif;
     --fitt-recorder-display-font: 'Neue Haas Grotesk Text Pro', 'Helvetica Neue', Helvetica, Arial, sans-serif;
     --fitt-recorder-mono-font: 'JetBrains Mono', ui-monospace, Menlo, monospace;
@@ -45,6 +47,11 @@ export const STYLES = `
     line-height: 1.4;
     box-sizing: border-box;
     contain: content;
+}
+
+:host([data-media='audio']) {
+    aspect-ratio: auto;
+    min-height: var(--fitt-recorder-audio-height);
 }
 
 :host([data-phase='idle']),
@@ -93,6 +100,11 @@ button:focus-visible {
     transform: none;
 }
 
+/* Plan 10: an audio-only session has no camera view, only the strip. */
+:host([data-media='audio']) [part='view'] {
+    display: none;
+}
+
 /* The review video (Plan 9), placed as the view is, never mirrored. */
 [part='review'] {
     position: absolute;
@@ -107,6 +119,18 @@ button:focus-visible {
 :host([data-review='local']:not([controls='none'])) [part='review'],
 :host([data-review='server']:not([controls='none'])) [part='review'] {
     display: block;
+}
+
+/* The audio review player (Plan 10) takes the strip's width, centred under the review slot. */
+:host([data-media='audio']) [part='review'] {
+    left: 16px;
+    right: 16px;
+    top: 50%;
+    bottom: auto;
+    width: auto;
+    height: auto;
+    transform: translateY(-50%);
+    background: transparent;
 }
 
 :host([data-review='local']:not([controls='none'])) [part='view'],
@@ -386,6 +410,10 @@ button:focus-visible {
     pointer-events: auto;
 }
 
+:host([data-media='audio']) [part='picker'] .panel {
+    grid-template-columns: minmax(0, 1fr);
+}
+
 [part='picker-list'] {
     display: flex;
     flex-direction: column;
@@ -459,6 +487,22 @@ button:focus-visible {
     right: var(--fitt-recorder-inset);
     top: 50%;
     transform: translateY(-50%);
+}
+
+/* Plan 10: a host visual that inherits --fitt-level, shown in every phase like the controls slot. */
+.slot-level {
+    position: absolute;
+    display: block;
+    left: var(--fitt-recorder-inset);
+    bottom: calc(var(--fitt-recorder-inset) * 2 + var(--fitt-recorder-button-size));
+    pointer-events: none;
+}
+
+:host([data-media='audio']) .slot-level {
+    left: 50%;
+    top: 50%;
+    bottom: auto;
+    transform: translate(-50%, -50%);
 }
 
 .slot-controls {

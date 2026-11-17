@@ -23,7 +23,7 @@
             window.__events = [];
             window.__audioElements = 0;
 
-            // The element must create no audio element (spec 6.4): count both ways of making one.
+            // The element creates no audio element except the audio-only review player (Plan 10): count both ways of making one.
             const RealAudio = window.Audio;
             window.Audio = function (...args) {
                 window.__audioElements += 1;
@@ -116,10 +116,22 @@
                 statusBody,
                 startLabel,
                 review,
+                audioOnly = false,
                 slots = [],
             } = {}) => {
+                const tracks = audioOnly
+                    ? base.tracks
+                          .filter((track) => track.track === 'audio')
+                          .map((track) => ({
+                              ...track,
+                              capture: {
+                                  audio: { bitrate_bps: 64000, channels: 1 },
+                              },
+                          }))
+                    : base.tracks;
                 const descriptor = {
                     ...base,
+                    tracks,
                     recording: { ...base.recording, ...(recording ?? {}) },
                     clock: { ...base.clock, ...(clock ?? {}) },
                     playback: { ...base.playback, ...(playback ?? {}) },

@@ -4,6 +4,7 @@ import type { SdkEvent } from '../core/events.ts';
 import type { Milestone } from '../core/lifecycle.ts';
 import { takeView, type FittSession } from '../core/session.ts';
 import type { Phase, SessionState } from '../core/state.ts';
+import { createSpeakingGate, normalisedLevel } from '../recorder/level.ts';
 import { STYLES } from './styles.ts';
 import { uploadAttribute } from './upload-state.ts';
 
@@ -18,6 +19,8 @@ const SLOTS = [
     'no-audio',
     'rejected',
     'review',
+    // Plan 10: a host visual that inherits --fitt-level.
+    'level',
 ] as const;
 
 /** How often the timers, the progress bar and the stop rule are drawn again. */
@@ -28,12 +31,6 @@ const START_LABEL_MS = 1000;
 
 const METER_BARS = 6;
 const METER_HEIGHTS = [6, 10, 14, 9, 7, 5];
-
-/** A level at or below this lights no bar. */
-const METER_FLOOR = 0.002;
-
-/** The level that lights every bar; bars follow the square root, so speech moves the meter. */
-const METER_FULL = 0.25;
 
 const CAMERA_ICON =
     '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M23 7l-7 5 7 5V7z"></path><rect x="1" y="5" width="15" height="14" rx="2"></rect></svg>';
@@ -193,6 +190,25 @@ function makeReviewVideo(): HTMLVideoElement {
     return review;
 }
 
+/** The review player of an audio-only session (Plan 10): the browser's own controls, never played by the element. */
+function makeReviewAudio(): HTMLAudioElement {
+    const review = make('audio', {
+        part: 'review',
+        // auto, never metadata: Safari 18.6 fails a metadata-only blob: URL on its first ranged read.
+        preload: 'auto',
+        controls: '',
+        controlslist: 'nodownload noremoteplayback',
+    });
+    review.controls = true;
+
+    return review;
+}
+
+/** The phases in which --fitt-level and data-speaking follow the microphone. */
+function isLevelPhase(phase: Phase | null): boolean {
+    return phase === 'ready' || phase === 'countdown' || phase === 'recording';
+}
+
 function createRecorderClass(): CustomElementConstructor {
     return class FittRecorderElement extends HTMLElement {
         static get observedAttributes(): string[] {
@@ -207,12 +223,13 @@ function createRecorderClass(): CustomElementConstructor {
         #root: ShadowRoot;
         #view: HTMLVideoElement;
         /**
-         * The review video (Plan 9), bound once per stop with session.playback(),
+         * The review player (Plan 9; an audio element in an audio-only session,
+         * Plan 10), bound once per stop with session.playback(),
          * and the pulse drawn over the view while the review is preparing. Both
          * are made the first time the review attribute is in use, so an element
          * without it draws exactly the parts it drew before.
          */
-        #review: HTMLVideoElement | null = null;
+        #review: HTMLMediaElement | null = null;
         /** True once this stop's review video is bound. */
         #reviewing = false;
         #firstSlot: HTMLElement;
@@ -226,6 +243,8 @@ function createRecorderClass(): CustomElementConstructor {
         #startedAtMs: number | null = null;
         #elapsedMs = 0;
         #countdownText = '';
+        /** Whether the person is speaking, for data-speaking (Plan 10). */
+        #speaking = createSpeakingGate();
 
         constructor() {
             super();
@@ -281,9 +300,14 @@ function createRecorderClass(): CustomElementConstructor {
                     'audio',
                     'error',
                     'review',
+                    'media',
                 ]) {
                     delete this.dataset[name];
                 }
+
+                this.style.removeProperty('--fitt-level');
+                this.removeAttribute('data-speaking');
+                this.#speaking.reset();
 
                 this.#draw();
 
@@ -400,6 +424,21 @@ function createRecorderClass(): CustomElementConstructor {
             this.dataset.phase = state.phase;
             this.dataset.upload = uploadAttribute(state);
             this.dataset.audio = state.audio;
+            this.dataset.media =
+                session.playbackTrack === 'audio' ? 'audio' : 'video';
+            // Here, not in #drawPicker(): the closed toggle is read out too.
+            this.#pieces.toggle?.setAttribute(
+                'aria-label',
+                session.playbackTrack === 'audio'
+                    ? 'Choose a microphone'
+                    : 'Choose camera and microphone',
+            );
+
+            if (!isLevelPhase(state.phase)) {
+                this.style.setProperty('--fitt-level', '0');
+                this.removeAttribute('data-speaking');
+                this.#speaking.reset();
+            }
 
             if (state.checks === null) {
                 delete this.dataset.checks;
@@ -468,7 +507,7 @@ function createRecorderClass(): CustomElementConstructor {
                 return;
             }
 
-            const review = this.#reviewVideo();
+            const review = this.#reviewMedia();
             this.dataset.review = state.playback.source;
             const none = controlsOf(this.getAttribute('controls')) === 'none';
 
@@ -485,13 +524,31 @@ function createRecorderClass(): CustomElementConstructor {
             }
         }
 
-        /** The review video and the skeleton, made once and placed right after the view. */
-        #reviewVideo(): HTMLVideoElement {
-            if (this.#review !== null) {
+        /** A fresh review player of the session's kind: audio in an audio-only session. */
+        #makeReview(): HTMLMediaElement {
+            return this.dataset.media === 'audio'
+                ? makeReviewAudio()
+                : makeReviewVideo();
+        }
+
+        /** The review player and the skeleton, made once and placed right after the view. */
+        #reviewMedia(): HTMLMediaElement {
+            const kind = this.dataset.media === 'audio' ? 'AUDIO' : 'VIDEO';
+
+            if (this.#review !== null && this.#review.tagName === kind) {
                 return this.#review;
             }
 
-            const review = makeReviewVideo();
+            if (this.#review !== null) {
+                // A session of the other kind: swap the idle player for one of this kind.
+                const swapped = this.#makeReview();
+                this.#review.replaceWith(swapped);
+                this.#review = swapped;
+
+                return swapped;
+            }
+
+            const review = this.#makeReview();
             const skeleton = make('div', {
                 class: 'review-skeleton',
                 'aria-hidden': 'true',
@@ -516,7 +573,10 @@ function createRecorderClass(): CustomElementConstructor {
 
             this.#reviewing = false;
             const bound = this.#review;
-            const fresh = makeReviewVideo();
+            const fresh =
+                bound.tagName === 'AUDIO'
+                    ? makeReviewAudio()
+                    : makeReviewVideo();
             bound.replaceWith(fresh);
             this.#review = fresh;
             bound.removeAttribute('src');
@@ -572,19 +632,32 @@ function createRecorderClass(): CustomElementConstructor {
             }
         }
 
-        #level(level: number): void {
+        /**
+         * The meter's bars, --fitt-level and data-speaking, all on the one
+         * normalised curve (Plan 10, author's call 8). The two host hooks
+         * follow the microphone only in ready, countdown and recording.
+         */
+        #level(rms: number): void {
+            const level = normalisedLevel(rms);
             const bars = this.#pieces.bars;
             const lit =
-                level <= METER_FLOOR
+                level === 0
                     ? 0
-                    : Math.min(
-                          METER_BARS,
-                          Math.ceil(Math.sqrt(level / METER_FULL) * METER_BARS),
-                      );
+                    : Math.min(METER_BARS, Math.ceil(level * METER_BARS));
 
             bars.forEach((bar, index) => {
                 bar.toggleAttribute('data-on', index < lit);
             });
+
+            if (!isLevelPhase(this.#lastPhase)) {
+                return;
+            }
+
+            this.style.setProperty('--fitt-level', level.toFixed(3));
+            this.toggleAttribute(
+                'data-speaking',
+                this.#speaking.update(level, this.#session?.now() ?? 0),
+            );
         }
 
         /** Builds the pieces of the current controls level, between the view and the slots. */
@@ -665,7 +738,10 @@ function createRecorderClass(): CustomElementConstructor {
                     {
                         part: 'picker-toggle',
                         type: 'button',
-                        'aria-label': 'Choose camera and microphone',
+                        'aria-label':
+                            this.dataset.media === 'audio'
+                                ? 'Choose a microphone'
+                                : 'Choose camera and microphone',
                         'aria-expanded': 'false',
                         'aria-haspopup': 'listbox',
                     },
@@ -763,6 +839,9 @@ function createRecorderClass(): CustomElementConstructor {
                 return;
             }
 
+            const audioOnly = session.playbackTrack === 'audio';
+            // An audio-only session lists only microphones (Plan 10).
+            cameraList.hidden = audioOnly;
             const { cameras, microphones, selected } = session.devices;
             const key = JSON.stringify([
                 cameras.map((device) => [device.deviceId, device.label]),

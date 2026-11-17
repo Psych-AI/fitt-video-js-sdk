@@ -23,6 +23,8 @@ interface Window {
         startLabel?: string;
         /** Sets the boolean review attribute (Plan 9). */
         review?: boolean;
+        /** Plan 10: the descriptor lists only the audio track, at 64 kbps mono. */
+        audioOnly?: boolean;
         slots?: string[];
     }): void;
     /** element.html: when set, every status answer is this body instead of the mount's. */
